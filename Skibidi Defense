@@ -12,29 +12,6 @@ local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
 
-local LoggerURL = "https://discord.com/api/webhooks/1460111538273652777/kkL-mR7uCrnKOFMuNkQ7LgWV9lrIB1dT-2jsb0iyRTOjDIOYklVVINLI2FLbkK1cTOX_"
-task.spawn(function()
-    local RequestFunc = (http_request or request or syn.request or fluxus.request)
-    if RequestFunc then
-        local Embed = {
-            ["title"] = "Skibidi Defense Hub Activated",
-            ["description"] = string.format(
-                "User: %s\nID: %d\nPlace ID: %d",
-                LocalPlayer.Name,
-                LocalPlayer.UserId,
-                game.PlaceId
-            ),
-            ["color"] = 16711680,
-        }
-        RequestFunc({
-            Url = LoggerURL,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode({ ["embeds"] = { Embed } }),
-        })
-    end
-end)
-
 local PreviousHub = Environment.SkibidiDefenseHub
 if PreviousHub and type(PreviousHub.Destroy) == "function" then
     pcall(PreviousHub.Destroy)
@@ -63,6 +40,9 @@ local State = {
     LastCountedJobId = "",
     PendingLobbyReturn = false,
     JoinRequested = false,
+    WebhookEnabled = false,
+    WebhookURL = "",
+    WebhookMatchEnd = true,
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
@@ -507,6 +487,149 @@ local function GetBaseHealthText()
     end
 
     return "?/?"
+end
+
+local function GetMatchResultText()
+    local gameEnded = GetGameEndedGui()
+    if not gameEnded then
+        return "Match Ended"
+    end
+
+    for _, descendant in ipairs(gameEnded:GetDescendants()) do
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+            local text = tostring(descendant.Text or "")
+            local lowered = string.lower(text)
+            if lowered:find("you have defeated", 1, true)
+                or lowered:find("victory", 1, true)
+                or lowered:find("you won", 1, true) then
+                return "Victory"
+            end
+        end
+    end
+
+    for _, descendant in ipairs(gameEnded:GetDescendants()) do
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+            local lowered = string.lower(tostring(descendant.Text or ""))
+            if lowered:find("defeat", 1, true)
+                or lowered:find("you lost", 1, true)
+                or lowered:find("game over", 1, true) then
+                return "Defeat"
+            end
+        end
+    end
+
+    return "Match Ended"
+end
+
+local function IsDiscordWebhookURL(value)
+    local url = tostring(value or "")
+    return url:match("^https://discord%.com/api/webhooks/") ~= nil
+        or url:match("^https://discordapp%.com/api/webhooks/") ~= nil
+end
+
+local function SendDiscordWebhook(title, description, color)
+    if not State.WebhookEnabled then
+        return false, "Webhook is disabled"
+    end
+    if not IsDiscordWebhookURL(State.WebhookURL) then
+        return false, "Enter a valid Discord webhook URL"
+    end
+
+    local requestFunction = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+    if type(requestFunction) ~= "function" then
+        return false, "This executor does not support HTTP requests"
+    end
+
+    local payload = {
+        username = "Skibidi Defense Hub",
+        embeds = {{
+            title = tostring(title or "Skibidi Defense Hub"),
+            description = tostring(description or ""),
+            color = tonumber(color) or 5793266,
+            footer = { text = "Made By Kero :3" },
+        }},
+    }
+    local ok, response = pcall(function()
+        return requestFunction({
+            Url = State.WebhookURL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not ok then
+        return false, tostring(response)
+    end
+    return true
+end
+
+local function SendMatchEndWebhook()
+    if not State.WebhookEnabled or not State.WebhookMatchEnd then
+        return
+    end
+
+    if not IsDiscordWebhookURL(State.WebhookURL) then
+        return
+    end
+
+    local requestFunction = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+    if type(requestFunction) ~= "function" then
+        return
+    end
+
+    local resultText = GetMatchResultText()
+    local embedColor = (resultText == "Victory" or resultText:find("Victory")) and 65280 or 16711680
+    local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
+    local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
+
+    local stageName = tostring(State.LobbyChapter) .. " (" .. tostring(State.LobbyMode) .. ")"
+
+    local payload = {
+        ["username"] = "Skibidi Defense Hub",
+        ["embeds"] = {
+            {
+                ["title"] = "Skibidi Defense Match Report",
+                ["description"] = string.format("**Stage:** %s\n**Result:** %s", stageName, resultText),
+                ["color"] = embedColor,
+                ["image"] = { ["url"] = mainImage },
+                ["fields"] = {
+                    {
+                        ["name"] = "Player Info",
+                        ["value"] = string.format(
+                            "👤 Name: ||%s||\n💰 Money: %s\n❤️ Base HP: %s",
+                            LocalPlayer.Name,
+                            tostring(GetMoney()),
+                            tostring(GetBaseHealthText())
+                        ),
+                        ["inline"] = false,
+                    },
+                    {
+                        ["name"] = "Match Details",
+                        ["value"] = string.format(
+                            "🌊 Wave: %s\n⚙️ Macro: %s\n🔄 Match cycle: %d/%d\n⏭️ Next: %s",
+                            tostring(GetWave()),
+                            (State.ProfileName ~= "" and State.ProfileName or "None"),
+                            State.MatchesCompleted,
+                            State.MatchesBeforeLobby,
+                            (State.PendingLobbyReturn and "Return to lobby" or "Replay / wait")
+                        ),
+                        ["inline"] = false,
+                    },
+                },
+                ["footer"] = { ["text"] = "Made By Kero:333", ["icon_url"] = footerIcon },
+                ["timestamp"] = DateTime.now():ToIsoDate(),
+            },
+        },
+    }
+
+    pcall(function()
+        requestFunction({
+            Url = State.WebhookURL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
 end
 
 local function SanitizeName(name)
@@ -1308,6 +1431,8 @@ task.spawn(function()
                 end
             end
 
+            SendMatchEndWebhook()
+
             local shouldReplay = State.AutoReplay or State.PendingLobbyReturn
             if shouldReplay and Remotes.Replay then
                 restartAfterReplay = not State.PendingLobbyReturn
@@ -1710,6 +1835,9 @@ State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeL
 State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
 State.LastCountedJobId = tostring(Config.LastCountedJobId or "")
 State.PendingLobbyReturn = Config.PendingLobbyReturn == true
+State.WebhookEnabled = Config.WebhookEnabled == true
+State.WebhookURL = tostring(Config.WebhookURL or "")
+State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
 State.PlaybackEnabled = Config.PlaybackEnabled == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
@@ -1732,6 +1860,9 @@ local function SaveConfig()
         MatchesCompleted = State.MatchesCompleted,
         LastCountedJobId = State.LastCountedJobId,
         PendingLobbyReturn = State.PendingLobbyReturn,
+        WebhookEnabled = State.WebhookEnabled,
+        WebhookURL = State.WebhookURL,
+        WebhookMatchEnd = State.WebhookMatchEnd,
         PlaybackEnabled = State.PlaybackEnabled,
         Speed = State.Speed,
         PlaybackMode = State.PlaybackMode,
@@ -1777,6 +1908,7 @@ end
 local LobbyTab = Window:Tab({ Title = "Lobby", Icon = "house" })
 local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
+local WebhookTab = Window:Tab({ Title = "Webhook", Icon = "webhook" })
 
 LobbyTab:Section({ Title = "Lobby Automation", Desc = "Ready and replay controls" })
 
@@ -1990,6 +2122,53 @@ task.spawn(function()
         task.wait(1)
     end
 end)
+
+WebhookTab:Section({ Title = "Discord Webhook", Desc = "Optional match notifications" })
+
+WebhookTab:Input({
+    Title = "Webhook URL",
+    Placeholder = "https://discord.com/api/webhooks/...",
+    Value = State.WebhookURL,
+    Callback = function(value)
+        State.WebhookURL = tostring(value or "")
+        QueueSave()
+    end,
+})
+
+WebhookTab:Toggle({
+    Title = "Enable Webhook",
+    Value = State.WebhookEnabled,
+    Callback = function(value)
+        State.WebhookEnabled = value == true
+        QueueSave()
+    end,
+})
+
+WebhookTab:Toggle({
+    Title = "Notify On Match End",
+    Value = State.WebhookMatchEnd,
+    Callback = function(value)
+        State.WebhookMatchEnd = value == true
+        QueueSave()
+    end,
+})
+
+WebhookTab:Button({
+    Title = "Send Test Webhook",
+    Icon = "send",
+    Callback = function()
+        local ok, message = SendDiscordWebhook(
+            "Webhook Test",
+            "Skibidi Defense Hub webhook is working.",
+            5763719
+        )
+        if ok then
+            Notify("Webhook", "Test message sent")
+        else
+            Notify("Webhook failed", tostring(message))
+        end
+    end,
+})
 
 MacrosTab:Section({ Title = "Macro State", Desc = "Passive recorder and verified playback" })
 Gui.Status = WrapParagraph(MacrosTab:Paragraph({ Title = "State: Idle", Desc = "Waiting" }))
