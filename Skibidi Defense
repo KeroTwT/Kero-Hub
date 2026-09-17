@@ -899,13 +899,13 @@ end
 
 local function ApplySpeed(speed)
     speed = tonumber(speed) or 1
-    if speed < 1 or speed > 5 then
+    if speed < 1 or speed > 6 then
         speed = 1
     end
 
     State.Speed = speed
     pcall(function()
-        Remotes.Speed:FireServer(speed == 1 and 6 or speed)
+        Remotes.Speed:FireServer(speed)
     end)
     if Gui.Runtime then
         Gui.Runtime:SetDesc(string.format("Wave %d | Money %d | %s | Base %s | Speed x%d", GetWave(), GetMoney(), GetUnitCountText(), GetBaseHealthText(), speed))
@@ -1129,7 +1129,7 @@ local speedLabel = MakeLabel(left, "Speed: x1", UDim2.fromOffset(150, 198), UDim
 speedLabel.TextXAlignment = Enum.TextXAlignment.Center
 Gui.SpeedLabel = speedLabel
 
-for speed = 1, 5 do
+for speed = 1, 6 do
     local button = MakeButton(
         left,
         "x" .. speed,
@@ -1359,7 +1359,7 @@ State.AutoReady = Config.AutoReady == true
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
 State.PlaybackEnabled = Config.PlaybackEnabled == true
-State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 5)
+State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
 State.ProfileName = SanitizeName(Config.SelectedProfile or "")
 
@@ -1608,12 +1608,12 @@ MiscTab:Toggle({
 })
 MiscTab:Dropdown({
     Title = "Speed Scale",
-    Values = { "x1", "x2", "x3", "x4", "x5" },
+    Values = { "x1", "x2", "x3", "x4", "x5", "x6" },
     Value = "x" .. tostring(State.Speed),
     Multi = false,
     Callback = function(value)
         local speed = tonumber(tostring(value):match("%d+")) or 1
-        State.Speed = math.clamp(speed, 1, 5)
+        State.Speed = math.clamp(speed, 1, 6)
         if State.AutoSpeed then ApplySpeed(State.Speed) end
         QueueSave()
     end,
