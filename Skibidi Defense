@@ -282,6 +282,24 @@ local function StopCharacterMovement()
     end
 end
 
+local function ForceCharacterJump(humanoid)
+    if not humanoid or humanoid.Health <= 0 then return end
+    pcall(function()
+        humanoid.Jump = true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end)
+end
+
+local function RunMovingJumpLoop(session)
+    while State.Running and State.MovingAround and session == MovingSession do
+        local _, humanoid = GetCharacterRoot()
+        if humanoid then
+            ForceCharacterJump(humanoid)
+        end
+        task.wait(0.65)
+    end
+end
+
 local function WalkToPoint(session, destination)
     local root, humanoid = GetCharacterRoot()
     if not root or not humanoid then return false end
@@ -314,7 +332,7 @@ local function WalkToPoint(session, destination)
         if waypoint.Action == Enum.PathWaypointAction.Jump
             or waypoint.Position.Y > root.Position.Y + 1.5
         then
-            humanoid.Jump = true
+            ForceCharacterJump(humanoid)
         end
 
         local moveFinished = nil
@@ -345,7 +363,7 @@ local function WalkToPoint(session, destination)
             then
                 -- Some maps have short ledges that PathfindingService does not
                 -- mark as jump waypoints. Jump when movement stalls.
-                humanoid.Jump = true
+                ForceCharacterJump(humanoid)
                 lastJumpAt = os.clock()
             end
 
@@ -421,6 +439,9 @@ local function SetMovingAround(enabled)
         task.spawn(function()
             RunMovingAround(session)
         end)
+        task.spawn(function()
+            RunMovingJumpLoop(session)
+        end)
     end
 end
 
@@ -431,7 +452,10 @@ AddConnection(State.Connections, LocalPlayer.CharacterAdded:Connect(function()
     local session = MovingSession
     task.delay(0.6, function()
         if State.MovingAround and session == MovingSession then
-            RunMovingAround(session)
+            task.spawn(function()
+                RunMovingAround(session)
+            end)
+            RunMovingJumpLoop(session)
         end
     end)
 end))
