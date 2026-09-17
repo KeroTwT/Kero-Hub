@@ -1183,11 +1183,11 @@ end
 -- Background automation. These use visible replicated state and rate-limited RemoteEvents.
 task.spawn(function()
     local lastReady = 0
+    local lastSkip = 0
     local lastRefresh = 0
     local readyAttempts = 0
     local readyComplete = false
     local wasMatchReady = false
-    local skipVoteLatched = false
     local lastDisplayedSpeed = nil
     local speedSentWithoutState = false
     local replayLatched = false
@@ -1246,10 +1246,12 @@ task.spawn(function()
         local gui = GetPlayerGui()
         local skipGui = gui and gui:FindFirstChild("skipWave")
         local skipWindowOpen = skipGui and skipGui.Enabled == true
-        if not skipWindowOpen then
-            skipVoteLatched = false
-        elseif State.AutoSkip and not ended and Remotes.Skip and not skipVoteLatched then
-            skipVoteLatched = true
+        if State.AutoSkip
+            and not ended
+            and Remotes.Skip
+            and skipWindowOpen
+            and now - lastSkip >= 0.35 then
+            lastSkip = now
             pcall(function() Remotes.Skip:FireServer(true) end)
         end
 
