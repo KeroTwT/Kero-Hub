@@ -1292,7 +1292,6 @@ task.spawn(function()
 
                 if State.MatchesCompleted >= State.MatchesBeforeLobby then
                     State.PendingLobbyReturn = true
-                    State.AutoJoinMap = false
                     SetStatus("Match cycle complete", "Returning to lobby after the replay teleport")
                 else
                     SetStatus(
