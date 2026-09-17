@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
+local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
@@ -53,6 +54,15 @@ local State = {
     AutoReplay = false,
     AutoSpeed = false,
     MovingAround = false,
+    AutoJoinMap = false,
+    LobbyMode = "Story",
+    LobbyChapter = "Chapter 1",
+    AutoBackLobby = false,
+    MatchesBeforeLobby = 5,
+    MatchesCompleted = 0,
+    LastCountedJobId = "",
+    PendingLobbyReturn = false,
+    JoinRequested = false,
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
@@ -95,6 +105,7 @@ if HasFilesystem and type(listfiles) == "function" and isfolder(LegacyMacroFolde
 end
 
 local Remotes = {}
+local LobbyPlaceId = 14279693118
 local Scripted
 local TowerDataFolder
 local TowersFolder
@@ -103,6 +114,7 @@ local function RefreshGameObjects()
     local eventFolder = ReplicatedStorage:FindFirstChild("Event")
     local gameFolder = ReplicatedStorage:FindFirstChild("Game")
     local gameStartFolder = ReplicatedStorage:FindFirstChild("GAME_START")
+    local eventsFolder = ReplicatedStorage:FindFirstChild("Events")
     local speedFolder = gameFolder and gameFolder:FindFirstChild("Speed")
 
     Remotes.Place = eventFolder and eventFolder:FindFirstChild("placeTower")
@@ -113,6 +125,8 @@ local function RefreshGameObjects()
     Remotes.Replay = eventFolder and eventFolder:FindFirstChild("ReplayCore")
     Remotes.Ready = gameStartFolder and gameStartFolder:FindFirstChild("readyButton")
     Remotes.Speed = speedFolder and speedFolder:FindFirstChild("Change")
+    Remotes.CreateServer = eventsFolder and eventsFolder:FindFirstChild("createServer")
+    Remotes.StartServer = eventsFolder and eventsFolder:FindFirstChild("start")
 
     Scripted = Workspace:FindFirstChild("Scripted")
     TowerDataFolder = Scripted and Scripted:FindFirstChild("TowerData")
@@ -1270,11 +1284,38 @@ task.spawn(function()
             end
         end
 
-        if State.AutoReplay and Remotes.Replay and ended and not replayLatched then
+        if ended and not replayLatched then
             replayLatched = true
-            restartAfterReplay = State.PlaybackEnabled and #State.Actions > 0
-            SetStatus("Match ended", "Requesting replay")
-            pcall(function() Remotes.Replay:FireServer() end)
+            if State.AutoBackLobby and State.LastCountedJobId ~= game.JobId then
+                State.LastCountedJobId = game.JobId
+                State.MatchesCompleted = State.MatchesCompleted + 1
+
+                if State.MatchesCompleted >= State.MatchesBeforeLobby then
+                    State.PendingLobbyReturn = true
+                    State.AutoJoinMap = false
+                    SetStatus("Match cycle complete", "Returning to lobby after the replay teleport")
+                else
+                    SetStatus(
+                        "Match counted",
+                        string.format("%d/%d matches before lobby", State.MatchesCompleted, State.MatchesBeforeLobby)
+                    )
+                end
+
+                if Gui.UpdateMatchCounter then Gui.UpdateMatchCounter() end
+                if Gui.SaveConfigNow then
+                    Gui.SaveConfigNow()
+                elseif Gui.QueueSave then
+                    Gui.QueueSave()
+                end
+            end
+
+            local shouldReplay = State.AutoReplay or State.PendingLobbyReturn
+            if shouldReplay and Remotes.Replay then
+                restartAfterReplay = not State.PendingLobbyReturn
+                    and State.PlaybackEnabled
+                    and #State.Actions > 0
+                pcall(function() Remotes.Replay:FireServer() end)
+            end
         elseif not ended then
             replayLatched = false
 
@@ -1662,6 +1703,14 @@ State.AutoReady = Config.AutoReady == true
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
 State.MovingAround = Config.MovingAround == true
+State.AutoJoinMap = Config.AutoJoinMap == true
+State.LobbyMode = tostring(Config.LobbyMode or "Story")
+State.LobbyChapter = tostring(Config.LobbyChapter or "Chapter 1")
+State.AutoBackLobby = Config.AutoBackLobby == true
+State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeLobby) or 5))
+State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
+State.LastCountedJobId = tostring(Config.LastCountedJobId or "")
+State.PendingLobbyReturn = Config.PendingLobbyReturn == true
 State.PlaybackEnabled = Config.PlaybackEnabled == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
@@ -1676,6 +1725,14 @@ local function SaveConfig()
         AutoSkip = State.AutoSkip,
         AutoSpeed = State.AutoSpeed,
         MovingAround = State.MovingAround,
+        AutoJoinMap = State.AutoJoinMap,
+        LobbyMode = State.LobbyMode,
+        LobbyChapter = State.LobbyChapter,
+        AutoBackLobby = State.AutoBackLobby,
+        MatchesBeforeLobby = State.MatchesBeforeLobby,
+        MatchesCompleted = State.MatchesCompleted,
+        LastCountedJobId = State.LastCountedJobId,
+        PendingLobbyReturn = State.PendingLobbyReturn,
         PlaybackEnabled = State.PlaybackEnabled,
         Speed = State.Speed,
         PlaybackMode = State.PlaybackMode,
@@ -1696,12 +1753,176 @@ local function QueueSave()
     end)
 end
 Gui.QueueSave = QueueSave
+Gui.SaveConfigNow = SaveConfig
+
+if State.PendingLobbyReturn then
+    if game.PlaceId == LobbyPlaceId then
+        State.PendingLobbyReturn = false
+        State.MatchesCompleted = 0
+        State.LastCountedJobId = ""
+        SaveConfig()
+    else
+        task.delay(1, function()
+            if State.Running and State.PendingLobbyReturn then
+                local ok, message = pcall(function()
+                    TeleportService:Teleport(LobbyPlaceId, LocalPlayer)
+                end)
+                if not ok then
+                    Notify("Lobby teleport failed", tostring(message))
+                end
+            end
+        end)
+    end
+end
 
 local LobbyTab = Window:Tab({ Title = "Lobby", Icon = "house" })
 local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
 
 LobbyTab:Section({ Title = "Lobby Automation", Desc = "Ready and replay controls" })
+
+local ModeChapters = {
+    Story = {
+        "Chapter 1", "Chapter 1.5", "Chapter 2", "Chapter 3", "Chapter 4",
+        "Chapter 5", "Chapter 6", "Chapter 7", "Chapter 8", "Chapter 9",
+    },
+    Multiverse = { "Multiverse Chapter 1", "Multiverse Chapter 2", "Multiverse Chapter 3" },
+    Nightmare = { "Void", "Suspicious Detections", "Spreaded Corruption", "Rise Of The Corruption" },
+    Event = { "Partner Takeover", "Skibi Trials" },
+    Versus = { "Versus 1v1", "Versus 2v2", "Versus 3v3", "Versus 4v4" },
+    Endless = { "Normal", "Roguelite" },
+    Episodes = {
+        "Episode 79", "A Fight From the Past", "Civil War", "Land Of Creation",
+        "The Final Showdown", "The Last Base",
+    },
+    Raid = { "WorldRaid" },
+}
+
+local function GetModeChapters(mode)
+    if mode ~= "All" then
+        return table.clone(ModeChapters[mode] or {})
+    end
+
+    local result = {}
+    for _, chapters in pairs(ModeChapters) do
+        for _, chapter in ipairs(chapters) do
+            if not table.find(result, chapter) then
+                table.insert(result, chapter)
+            end
+        end
+    end
+    local replicatedServers = ReplicatedStorage:FindFirstChild("Servers")
+    if replicatedServers then
+        for _, entry in ipairs(replicatedServers:GetChildren()) do
+            if not table.find(result, entry.Name) then
+                table.insert(result, entry.Name)
+            end
+        end
+    end
+    table.sort(result)
+    return result
+end
+
+if not ModeChapters[State.LobbyMode] and State.LobbyMode ~= "All" then
+    State.LobbyMode = "Story"
+end
+local initialChapters = GetModeChapters(State.LobbyMode)
+if not table.find(initialChapters, State.LobbyChapter) then
+    State.LobbyChapter = initialChapters[1] or "Chapter 1"
+end
+
+local chapterDropdown
+LobbyTab:Dropdown({
+    Title = "Mode",
+    Values = { "Story", "Multiverse", "Nightmare", "Event", "Versus", "Endless", "Episodes", "Raid", "All" },
+    Value = State.LobbyMode,
+    Multi = false,
+    Callback = function(value)
+        State.LobbyMode = value
+        local chapters = GetModeChapters(value)
+        if not table.find(chapters, State.LobbyChapter) then
+            State.LobbyChapter = chapters[1] or ""
+        end
+        if chapterDropdown then
+            pcall(function() chapterDropdown:Refresh(chapters) end)
+            pcall(function() chapterDropdown:Select(State.LobbyChapter) end)
+        end
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+chapterDropdown = LobbyTab:Dropdown({
+    Title = "Chapter",
+    Values = initialChapters,
+    Value = State.LobbyChapter,
+    Multi = false,
+    Callback = function(value)
+        State.LobbyChapter = value
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+LobbyTab:Toggle({
+    Title = "Auto Join Map",
+    Value = State.AutoJoinMap,
+    Callback = function(value)
+        State.AutoJoinMap = value == true
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+LobbyTab:Section({ Title = "Match Cycle", Desc = "Persisted across replay teleports" })
+local matchCounterParagraph = WrapParagraph(LobbyTab:Paragraph({ Title = "Match Counter", Desc = "Loading..." }))
+local function UpdateMatchCounter()
+    matchCounterParagraph:SetDesc(string.format(
+        "%d/%d completed | %s",
+        State.MatchesCompleted,
+        State.MatchesBeforeLobby,
+        State.PendingLobbyReturn and "returning to lobby" or "running"
+    ))
+end
+Gui.UpdateMatchCounter = UpdateMatchCounter
+UpdateMatchCounter()
+
+LobbyTab:Toggle({
+    Title = "Auto Back Lobby After X Matches",
+    Value = State.AutoBackLobby,
+    Callback = function(value)
+        State.AutoBackLobby = value == true
+        QueueSave()
+        UpdateMatchCounter()
+    end,
+})
+
+LobbyTab:Input({
+    Title = "Matches Before Lobby",
+    Placeholder = "5",
+    Value = tostring(State.MatchesBeforeLobby),
+    Callback = function(value)
+        local amount = tonumber(tostring(value):match("%d+"))
+        if amount then
+            State.MatchesBeforeLobby = math.max(1, math.floor(amount))
+            QueueSave()
+            UpdateMatchCounter()
+        end
+    end,
+})
+
+LobbyTab:Button({
+    Title = "Reset Match Counter",
+    Icon = "rotate-ccw",
+    Callback = function()
+        State.MatchesCompleted = 0
+        State.LastCountedJobId = ""
+        State.PendingLobbyReturn = false
+        QueueSave()
+        UpdateMatchCounter()
+    end,
+})
+
 LobbyTab:Toggle({
     Title = "Auto Replay",
     Value = State.AutoReplay,
@@ -1721,6 +1942,55 @@ LobbyTab:Toggle({
         QueueSave()
     end,
 })
+
+task.spawn(function()
+    while State.Running do
+        if game.PlaceId == LobbyPlaceId
+            and State.AutoJoinMap
+            and not State.JoinRequested
+            and State.LobbyChapter ~= "" then
+            RefreshGameObjects()
+            if Remotes.CreateServer then
+                State.JoinRequested = true
+                SetStatus("Auto Join", "Creating " .. State.LobbyChapter)
+                task.spawn(function()
+                    local ok, result = pcall(function()
+                        return Remotes.CreateServer:InvokeServer(State.LobbyChapter)
+                    end)
+                    if not ok then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", tostring(result))
+                        return
+                    end
+
+                    SetStatus("Auto Join", "Starting " .. State.LobbyChapter)
+                    local startRemote = Remotes.StartServer
+                    for _ = 1, 20 do
+                        if startRemote then break end
+                        task.wait(0.25)
+                        RefreshGameObjects()
+                        startRemote = Remotes.StartServer
+                    end
+
+                    if not startRemote then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", "Events.start was not found")
+                        return
+                    end
+
+                    local started, startError = pcall(function()
+                        startRemote:FireServer(false)
+                    end)
+                    if not started then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", tostring(startError))
+                    end
+                end)
+            end
+        end
+        task.wait(1)
+    end
+end)
 
 MacrosTab:Section({ Title = "Macro State", Desc = "Passive recorder and verified playback" })
 Gui.Status = WrapParagraph(MacrosTab:Paragraph({ Title = "State: Idle", Desc = "Waiting" }))
