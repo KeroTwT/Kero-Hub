@@ -196,6 +196,45 @@ local function IsGameEnded()
     return gameEnded and gameEnded.Enabled == true or false
 end
 
+local function TriggerBackLobbyButton()
+    local gameEnded = GetGameEndedGui()
+    local frame = gameEnded and gameEnded:FindFirstChild("Frame")
+    local backButton = frame and frame:FindFirstChild("back")
+    if not backButton or not backButton:IsA("GuiButton") then
+        return false, "GameEnded.Frame.back was not found"
+    end
+
+    if type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, backButton.MouseButton1Click)
+        if ok and type(connections) == "table" then
+            for _, connection in ipairs(connections) do
+                local fired = pcall(function()
+                    if type(connection.Fire) == "function" then
+                        connection:Fire()
+                    elseif type(connection.Function) == "function" then
+                        connection.Function()
+                    else
+                        error("Connection cannot be invoked")
+                    end
+                end)
+                if fired then
+                    return true
+                end
+            end
+        end
+    end
+
+    if type(firesignal) == "function" then
+        local ok, message = pcall(firesignal, backButton.MouseButton1Click)
+        if ok then
+            return true
+        end
+        return false, tostring(message)
+    end
+
+    return false, "Executor cannot invoke MouseButton1Click"
+end
+
 local function GetMoney()
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
     local money = leaderstats and leaderstats:FindFirstChild("Money")
@@ -1438,7 +1477,7 @@ task.spawn(function()
 
                 if State.MatchesCompleted >= State.MatchesBeforeLobby then
                     State.PendingLobbyReturn = true
-                    SetStatus("Match cycle complete", "Returning to lobby after the replay teleport")
+                    SetStatus("Match cycle complete", "Using the game's Return to Lobby button")
                 else
                     SetStatus(
                         "Match counted",
@@ -1456,7 +1495,32 @@ task.spawn(function()
 
             SendMatchEndWebhook()
 
-            local shouldReplay = State.AutoReplay or State.PendingLobbyReturn
+            local lobbyReturnTriggered = false
+            if State.PendingLobbyReturn then
+                local message
+                lobbyReturnTriggered, message = TriggerBackLobbyButton()
+                if not lobbyReturnTriggered then
+                    SetStatus("Lobby button waiting", tostring(message) .. " | retrying")
+                    task.spawn(function()
+                        local retryMessage = message
+                        for _ = 1, 20 do
+                            if not State.Running or not State.PendingLobbyReturn then
+                                return
+                            end
+                            task.wait(0.5)
+                            local triggered
+                            triggered, retryMessage = TriggerBackLobbyButton()
+                            if triggered then
+                                SetStatus("Returning to lobby", "Game back button triggered")
+                                return
+                            end
+                        end
+                        SetStatus("Lobby button failed", tostring(retryMessage))
+                    end)
+                end
+            end
+
+            local shouldReplay = State.AutoReplay and not State.PendingLobbyReturn
             if shouldReplay and Remotes.Replay then
                 restartAfterReplay = not State.PendingLobbyReturn
                     and State.PlaybackEnabled
@@ -1917,11 +1981,17 @@ if State.PendingLobbyReturn then
     else
         task.delay(1, function()
             if State.Running and State.PendingLobbyReturn then
-                local ok, message = pcall(function()
-                    TeleportService:Teleport(LobbyPlaceId, LocalPlayer)
-                end)
-                if not ok then
-                    Notify("Lobby teleport failed", tostring(message))
+                local triggered, buttonMessage = TriggerBackLobbyButton()
+                if not triggered then
+                    local ok, teleportMessage = pcall(function()
+                        TeleportService:Teleport(LobbyPlaceId, LocalPlayer)
+                    end)
+                    if not ok then
+                        Notify(
+                            "Lobby return failed",
+                            tostring(buttonMessage) .. " | " .. tostring(teleportMessage)
+                        )
+                    end
                 end
             end
         end)
