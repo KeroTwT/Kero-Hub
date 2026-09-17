@@ -1924,7 +1924,7 @@ MiscTab:Dropdown({
 
 MiscTab:Section({ Title = "Movement", Desc = "Character movement" })
 MiscTab:Toggle({
-    Title = "Moving Around",
+    Title = "Moving Around (AntiKick)",
     Value = State.MovingAround,
     Callback = function(value)
         SetMovingAround(value)
