@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
@@ -51,6 +52,7 @@ local State = {
     AutoSkip = false,
     AutoReplay = false,
     AutoSpeed = false,
+    MovingAround = false,
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
@@ -200,6 +202,248 @@ local function GetUnitCountText()
     local frame = placement and placement:FindFirstChild("Frame")
     local label = frame and frame:FindFirstChild("TextLabel")
     return label and label.Text or "Units: ?/?"
+end
+
+local MovingPointCount = 16
+local MovingSession = 0
+
+local function GetCharacterRoot()
+    local character = LocalPlayer.Character
+    if not character then return nil, nil end
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        return nil, nil
+    end
+    return root, humanoid
+end
+
+local function GetMapBounds()
+    local map = Workspace:FindFirstChild("Map")
+    if not map then return nil, nil end
+
+    if map:IsA("Model") then
+        local ok, boundsCFrame, boundsSize = pcall(function()
+            return map:GetBoundingBox()
+        end)
+        if ok and boundsSize.X > 0 and boundsSize.Z > 0 then
+            return boundsCFrame.Position, boundsSize, map
+        end
+    end
+
+    local minimum = Vector3.new(math.huge, math.huge, math.huge)
+    local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
+    local foundPart = false
+    for _, item in ipairs(map:GetDescendants()) do
+        if item:IsA("BasePart") then
+            local halfSize = item.Size * 0.5
+            minimum = Vector3.new(
+                math.min(minimum.X, item.Position.X - halfSize.X),
+                math.min(minimum.Y, item.Position.Y - halfSize.Y),
+                math.min(minimum.Z, item.Position.Z - halfSize.Z)
+            )
+            maximum = Vector3.new(
+                math.max(maximum.X, item.Position.X + halfSize.X),
+                math.max(maximum.Y, item.Position.Y + halfSize.Y),
+                math.max(maximum.Z, item.Position.Z + halfSize.Z)
+            )
+            foundPart = true
+        end
+    end
+
+    if not foundPart then return nil, nil end
+    return (minimum + maximum) * 0.5, maximum - minimum, map
+end
+
+local function GetGroundPoint(map, center, size, x, z)
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Include
+    raycastParams.FilterDescendantsInstances = { map }
+    raycastParams.IgnoreWater = true
+
+    local originY = center.Y + (size.Y * 0.5) + 100
+    local result = Workspace:Raycast(
+        Vector3.new(x, originY, z),
+        Vector3.new(0, -(size.Y + 300), 0),
+        raycastParams
+    )
+    if not result or result.Normal.Y < 0.6 then
+        return nil
+    end
+    return result.Position
+end
+
+local function StopCharacterMovement()
+    local root, humanoid = GetCharacterRoot()
+    if root and humanoid then
+        humanoid.AutoRotate = true
+        humanoid:MoveTo(root.Position)
+    end
+end
+
+local function WalkToPoint(session, destination)
+    local root, humanoid = GetCharacterRoot()
+    if not root or not humanoid then return false end
+
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 8,
+    })
+    local computed = pcall(function()
+        path:ComputeAsync(root.Position, destination)
+    end)
+
+    if not computed or path.Status ~= Enum.PathStatus.Success then
+        return false
+    end
+
+    local waypoints = path:GetWaypoints()
+    if #waypoints < 2 then return false end
+
+    for _, waypoint in ipairs(waypoints) do
+        if not State.Running or not State.MovingAround or session ~= MovingSession then
+            return false
+        end
+
+        root, humanoid = GetCharacterRoot()
+        if not root or not humanoid then return false end
+        if waypoint.Action == Enum.PathWaypointAction.Jump
+            or waypoint.Position.Y > root.Position.Y + 1.5
+        then
+            humanoid.Jump = true
+        end
+
+        local moveFinished = nil
+        local moveConnection = humanoid.MoveToFinished:Connect(function(reached)
+            moveFinished = reached == true
+        end)
+        humanoid:MoveTo(waypoint.Position)
+
+        local startedAt = os.clock()
+        local lastProgressAt = startedAt
+        local lastJumpAt = 0
+        local bestDistance = (root.Position - waypoint.Position).Magnitude
+        while moveFinished == nil
+            and State.Running
+            and State.MovingAround
+            and session == MovingSession
+        do
+            task.wait(0.1)
+            root, humanoid = GetCharacterRoot()
+            if not root or not humanoid then break end
+
+            local currentDistance = (root.Position - waypoint.Position).Magnitude
+            if currentDistance <= bestDistance - 0.5 then
+                bestDistance = currentDistance
+                lastProgressAt = os.clock()
+            elseif os.clock() - lastProgressAt >= 0.8
+                and os.clock() - lastJumpAt >= 0.8
+            then
+                -- Some maps have short ledges that PathfindingService does not
+                -- mark as jump waypoints. Jump when movement stalls.
+                humanoid.Jump = true
+                lastJumpAt = os.clock()
+            end
+
+            if os.clock() - startedAt >= 8 then
+                break
+            end
+        end
+
+        moveConnection:Disconnect()
+        if not root or (root.Position - waypoint.Position).Magnitude > 4 then
+            return false
+        end
+    end
+    return true
+end
+
+local function RunMovingAround(session)
+    while State.Running and State.MovingAround and session == MovingSession do
+        local root, humanoid = GetCharacterRoot()
+        local center, size, map = GetMapBounds()
+        if not root or not humanoid or not center or not size or not map then
+            task.wait(1)
+        else
+            humanoid.AutoRotate = true
+
+            -- Prefer the outer edge, then move inward until Roblox finds a
+            -- genuinely walkable route. Never force a direct walk into walls.
+            local radiusScales = { 0.42, 0.34, 0.26, 0.18, 0.10 }
+            local baseRadiusX = math.max(size.X, 25)
+            local baseRadiusZ = math.max(size.Z, 25)
+            local relative = root.Position - center
+            local startAngle = math.atan2(relative.Z / baseRadiusZ, relative.X / baseRadiusX)
+
+            for pointIndex = 1, MovingPointCount do
+                if not State.Running or not State.MovingAround or session ~= MovingSession then
+                    break
+                end
+
+                root, humanoid = GetCharacterRoot()
+                if not root or not humanoid then break end
+
+                local angle = startAngle + ((math.pi * 2 * pointIndex) / MovingPointCount)
+                local walked = false
+                for _, radiusScale in ipairs(radiusScales) do
+                    local target = GetGroundPoint(
+                        map,
+                        center,
+                        size,
+                        center.X + math.cos(angle) * baseRadiusX * radiusScale,
+                        center.Z + math.sin(angle) * baseRadiusZ * radiusScale
+                    )
+                    if target and WalkToPoint(session, target) then
+                        walked = true
+                        break
+                    end
+                end
+
+                if not walked then
+                    task.wait(0.25)
+                end
+            end
+        end
+    end
+end
+
+local function SetMovingAround(enabled)
+    MovingSession = MovingSession + 1
+    StopCharacterMovement()
+
+    State.MovingAround = enabled == true
+    if State.MovingAround then
+        local session = MovingSession
+        task.spawn(function()
+            RunMovingAround(session)
+        end)
+    end
+end
+
+AddConnection(State.Connections, LocalPlayer.CharacterAdded:Connect(function()
+    if not State.MovingAround then return end
+
+    MovingSession = MovingSession + 1
+    local session = MovingSession
+    task.delay(0.6, function()
+        if State.MovingAround and session == MovingSession then
+            RunMovingAround(session)
+        end
+    end)
+end))
+
+local function GetDisplayedSpeed()
+    local gui = GetPlayerGui()
+    local towers = gui and gui:FindFirstChild("Towers")
+    local speedButton = towers and towers:FindFirstChild("speedButton")
+    local inner = speedButton and speedButton:FindFirstChild("inner")
+    local multiplier = inner and inner:FindFirstChild("mult")
+    local text = multiplier and multiplier.Text or ""
+    return tonumber(text:match("(%d+)%s*[xX]"))
 end
 
 local CachedBaseHealthLabel
@@ -915,9 +1159,13 @@ end
 -- Background automation. These use visible replicated state and rate-limited RemoteEvents.
 task.spawn(function()
     local lastReady = 0
-    local lastSkip = 0
-    local lastSpeed = 0
     local lastRefresh = 0
+    local readyAttempts = 0
+    local readyComplete = false
+    local wasMatchReady = false
+    local skipVoteLatched = false
+    local lastDisplayedSpeed = nil
+    local speedSentWithoutState = false
     local replayLatched = false
     local restartAfterReplay = false
 
@@ -932,6 +1180,17 @@ task.spawn(function()
 
         if not matchReady or ended then
             State.AutoPlaybackStarted = false
+            readyAttempts = 0
+            readyComplete = false
+            wasMatchReady = false
+            lastDisplayedSpeed = nil
+            speedSentWithoutState = false
+        elseif not wasMatchReady then
+            wasMatchReady = true
+            readyAttempts = 0
+            readyComplete = false
+            lastDisplayedSpeed = nil
+            speedSentWithoutState = false
         elseif State.PlaybackEnabled
             and not State.AutoPlaybackStarted
             and not State.Playing
@@ -941,27 +1200,48 @@ task.spawn(function()
             Gui.StartEnabledPlayback()
         end
 
-        -- Wave text can be stale for a short time after teleport. Do not use it
-        -- as a ready gate; the server safely ignores ready requests outside the
-        -- ready phase. Repeating also covers the case where config loads before
-        -- the new match's ready handler has finished initializing.
-        if State.AutoReady and Remotes.Ready and now - lastReady >= 1 then
+        -- Send a small, bounded number of ready requests at match initialization.
+        -- This tolerates stale wave text after teleport without spamming for the
+        -- full duration of every match.
+        if readyAttempts >= 3 and GetWave() >= 2 then
+            readyComplete = true
+        elseif readyAttempts >= 12 then
+            readyComplete = true
+        end
+        if State.AutoReady
+            and matchReady
+            and not ended
+            and not readyComplete
+            and Remotes.Ready
+            and now - lastReady >= 1 then
             lastReady = now
+            readyAttempts = readyAttempts + 1
             pcall(function() Remotes.Ready:FireServer(true) end)
         end
 
-        if State.AutoSkip and not ended and now - lastSkip >= 0.35 then
-            local gui = GetPlayerGui()
-            local skipGui = gui and gui:FindFirstChild("skipWave")
-            if Remotes.Skip and skipGui and skipGui.Enabled then
-                lastSkip = now
-                pcall(function() Remotes.Skip:FireServer(true) end)
-            end
+        local gui = GetPlayerGui()
+        local skipGui = gui and gui:FindFirstChild("skipWave")
+        local skipWindowOpen = skipGui and skipGui.Enabled == true
+        if not skipWindowOpen then
+            skipVoteLatched = false
+        elseif State.AutoSkip and not ended and Remotes.Skip and not skipVoteLatched then
+            skipVoteLatched = true
+            pcall(function() Remotes.Skip:FireServer(true) end)
         end
 
-        if State.AutoSpeed and Remotes.Speed and not ended and now - lastSpeed >= 3 then
-            lastSpeed = now
-            ApplySpeed(State.Speed)
+        if State.AutoSpeed and matchReady and Remotes.Speed and not ended then
+            local displayedSpeed = GetDisplayedSpeed()
+            if displayedSpeed then
+                if displayedSpeed ~= lastDisplayedSpeed then
+                    lastDisplayedSpeed = displayedSpeed
+                    if displayedSpeed ~= State.Speed then
+                        ApplySpeed(State.Speed)
+                    end
+                end
+            elseif not speedSentWithoutState then
+                speedSentWithoutState = true
+                ApplySpeed(State.Speed)
+            end
         end
 
         if State.AutoReplay and Remotes.Replay and ended and not replayLatched then
@@ -974,9 +1254,6 @@ task.spawn(function()
 
             if restartAfterReplay and not State.Playing then
                 restartAfterReplay = false
-                if State.AutoSpeed then
-                    ApplySpeed(State.Speed)
-                end
                 local started, message = StartPlayback()
                 if started and Gui.SetPlaybackToggle then
                     Gui.SetPlaybackToggle(true)
@@ -1358,6 +1635,7 @@ State.AutoReplay = Config.AutoReplay == true
 State.AutoReady = Config.AutoReady == true
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
+State.MovingAround = Config.MovingAround == true
 State.PlaybackEnabled = Config.PlaybackEnabled == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
@@ -1371,6 +1649,7 @@ local function SaveConfig()
         AutoReady = State.AutoReady,
         AutoSkip = State.AutoSkip,
         AutoSpeed = State.AutoSpeed,
+        MovingAround = State.MovingAround,
         PlaybackEnabled = State.PlaybackEnabled,
         Speed = State.Speed,
         PlaybackMode = State.PlaybackMode,
@@ -1619,6 +1898,22 @@ MiscTab:Dropdown({
     end,
 })
 
+MiscTab:Section({ Title = "Movement", Desc = "Character movement" })
+MiscTab:Toggle({
+    Title = "Moving Around",
+    Value = State.MovingAround,
+    Callback = function(value)
+        SetMovingAround(value)
+        QueueSave()
+    end,
+})
+
+if State.MovingAround then
+    task.defer(function()
+        SetMovingAround(true)
+    end)
+end
+
 if State.ProfileName ~= "" then
     local ok = LoadProfile(State.ProfileName)
     if not ok then State.ProfileName = "" end
@@ -1642,6 +1937,8 @@ task.spawn(function()
 end)
 
 function Hub.Destroy()
+    MovingSession = MovingSession + 1
+    StopCharacterMovement()
     State.Running = false
     State.Recording = false
     State.Playing = false
