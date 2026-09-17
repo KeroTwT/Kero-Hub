@@ -54,6 +54,7 @@ local State = {
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
+    ProfileVersion = 2,
     Actions = {},
     RecordStartedAt = 0,
     NextHandle = 1,
@@ -257,7 +258,7 @@ local function SaveProfile(name)
     end
 
     local payload = {
-        Version = 1,
+        Version = 2,
         PlaceId = game.PlaceId,
         Name = name,
         RecordedAt = os.time(),
@@ -271,6 +272,7 @@ local function SaveProfile(name)
 
     writefile(ProfilePath(name), encoded)
     State.ProfileName = name
+    State.ProfileVersion = 2
     return true
 end
 
@@ -289,6 +291,7 @@ local function LoadProfile(name)
     end
 
     State.ProfileName = name
+    State.ProfileVersion = tonumber(decoded.Version) or 1
     State.Actions = decoded.Actions
     return true
 end
@@ -385,6 +388,14 @@ local function GetPlacementCFrame(tower)
     return nil
 end
 
+local function IsUnavailableTargetMode(mode)
+    if mode == nil then
+        return true
+    end
+    local normalized = tostring(mode):upper():gsub("%s+", "")
+    return normalized == "" or normalized == "N/A" or normalized == "NA" or normalized == "NONE"
+end
+
 local function AttachTowerRecorder(tower, handle)
     if State.TowerMeta[tower] then
         return
@@ -396,6 +407,7 @@ local function AttachTowerRecorder(tower, handle)
         SellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0,
         PendingUpgradeCost = nil,
         TargetMode = tower:GetAttribute("TargetMode"),
+        LastUpgradeAt = -math.huge,
     }
     State.TowerMeta[tower] = meta
 
@@ -403,6 +415,7 @@ local function AttachTowerRecorder(tower, handle)
         local newPrice = tonumber(tower:GetAttribute("SellPrice")) or meta.SellPrice
         if newPrice > meta.SellPrice then
             meta.PendingUpgradeCost = math.max(0, (newPrice - meta.SellPrice) * 2)
+            meta.LastUpgradeAt = os.clock()
         end
         meta.SellPrice = newPrice
     end))
@@ -410,6 +423,7 @@ local function AttachTowerRecorder(tower, handle)
     AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("Upgrade"):Connect(function()
         local newLevel = tonumber(tower:GetAttribute("Upgrade")) or meta.Level
         if State.Recording and newLevel > meta.Level then
+            meta.LastUpgradeAt = os.clock()
             AddAction({
                 Type = "Upgrade",
                 Handle = meta.Handle,
@@ -424,7 +438,11 @@ local function AttachTowerRecorder(tower, handle)
 
     AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("TargetMode"):Connect(function()
         local newMode = tower:GetAttribute("TargetMode")
-        if State.Recording and newMode and newMode ~= meta.TargetMode then
+        local oldMode = meta.TargetMode
+        local automaticUpgradeTransition = IsUnavailableTargetMode(oldMode)
+            and os.clock() - meta.LastUpgradeAt <= 0.5
+
+        if State.Recording and newMode and newMode ~= oldMode and not automaticUpgradeTransition then
             AddAction({
                 Type = "Target",
                 Handle = meta.Handle,
@@ -453,6 +471,7 @@ local function StartRecording(profileName)
     DisconnectAll(State.RecorderConnections)
     State.Actions = {}
     State.ProfileName = profileName
+    State.ProfileVersion = 2
     State.RecordStartedAt = os.clock()
     State.NextHandle = 1
     State.TowerMeta = setmetatable({}, { __mode = "k" })
@@ -685,6 +704,7 @@ local function PlayUpgrade(action)
     local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
     local estimatedCost = tonumber(action.EstimatedCost) or 0
     local deadline = os.clock() + 180
+    local fundsUnlocked = estimatedCost <= 0
 
     while State.Playing and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
         local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
@@ -692,21 +712,58 @@ local function PlayUpgrade(action)
             return true
         end
 
-        if GetMoney() >= estimatedCost then
-            Remotes.Upgrade:FireServer(tostring(tower.Name))
-            local upgraded = WaitUntil(function()
-                return tower.Parent ~= TowerDataFolder
-                    or (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel
-            end, 3, 0.1)
-            if upgraded and tower.Parent == TowerDataFolder then
-                return true
-            end
+        -- Upgrade All can replicate a multi-level jump (for example 0 -> 4)
+        -- as one recorded action. The server remote still upgrades one level
+        -- per call, so confirm each intermediate level and immediately send the
+        -- next request instead of waiting for the final level for three seconds.
+        if not fundsUnlocked and GetMoney() >= estimatedCost then
+            fundsUnlocked = true
         end
 
-        task.wait(1.5)
+        if fundsUnlocked then
+            local levelBeforeRequest = currentLevel
+            Remotes.Upgrade:FireServer(tostring(tower.Name))
+            local progressed = WaitUntil(function()
+                return tower.Parent ~= TowerDataFolder
+                    or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
+            end, 1, 0.03)
+
+            if tower.Parent ~= TowerDataFolder then
+                return false, "Tower disappeared during upgrade"
+            end
+            if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
+                return true
+            end
+
+            -- A confirmed level can be followed almost immediately. If the
+            -- request was dropped, use a small retry delay without stalling the
+            -- entire macro action.
+            task.wait(progressed and 0.03 or 0.2)
+        else
+            task.wait(0.1)
+        end
     end
 
     return false, "Upgrade timed out"
+end
+
+local function IsAutomaticRecordedTarget(index, action)
+    if State.ProfileVersion >= 2 then
+        return false
+    end
+    local previous = State.Actions[index - 1]
+    if not previous
+        or previous.Type ~= "Upgrade"
+        or previous.Handle ~= action.Handle then
+        return false
+    end
+
+    local targetTime = tonumber(action.RecordedAt)
+    local upgradeTime = tonumber(previous.RecordedAt)
+    return targetTime ~= nil
+        and upgradeTime ~= nil
+        and targetTime >= upgradeTime
+        and targetTime - upgradeTime <= 0.5
 end
 
 local function PlaySell(action)
@@ -813,7 +870,14 @@ local function StartPlayback()
             elseif action.Type == "Sell" then
                 success, message = PlaySell(action)
             elseif action.Type == "Target" then
-                success, message = PlayTarget(action)
+                if IsAutomaticRecordedTarget(index, action) then
+                    -- Older profiles may contain the game's automatic N/A ->
+                    -- First transition immediately after an upgrade. It is not
+                    -- a player target command and must not block playback.
+                    success = true
+                else
+                    success, message = PlayTarget(action)
+                end
             else
                 success, message = false, "Unknown action type: " .. tostring(action.Type)
             end
