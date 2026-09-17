@@ -23,6 +23,7 @@ local State = {
     Recording = false,
     Playing = false,
     PlaybackEnabled = false,
+    AutoPlaybackStarted = false,
     AutoReady = false,
     AutoSkip = false,
     AutoReplay = false,
@@ -67,24 +68,42 @@ if HasFilesystem and type(listfiles) == "function" and isfolder(LegacyMacroFolde
     end
 end
 
-local EventFolder = ReplicatedStorage:WaitForChild("Event")
-local GameFolder = ReplicatedStorage:WaitForChild("Game")
-local GameStartFolder = ReplicatedStorage:WaitForChild("GAME_START")
+local Remotes = {}
+local Scripted
+local TowerDataFolder
+local TowersFolder
 
-local Remotes = {
-    Place = EventFolder:WaitForChild("placeTower"),
-    Upgrade = EventFolder:WaitForChild("UpgradeTower"),
-    Sell = EventFolder:WaitForChild("RemoveTower"),
-    Target = EventFolder:WaitForChild("ChangeTowerTargetMode"),
-    Skip = EventFolder:WaitForChild("waveSkip"),
-    Replay = EventFolder:WaitForChild("ReplayCore"),
-    Ready = GameStartFolder:WaitForChild("readyButton"),
-    Speed = GameFolder:WaitForChild("Speed"):WaitForChild("Change"),
-}
+local function RefreshGameObjects()
+    local eventFolder = ReplicatedStorage:FindFirstChild("Event")
+    local gameFolder = ReplicatedStorage:FindFirstChild("Game")
+    local gameStartFolder = ReplicatedStorage:FindFirstChild("GAME_START")
+    local speedFolder = gameFolder and gameFolder:FindFirstChild("Speed")
 
-local Scripted = Workspace:WaitForChild("Scripted")
-local TowerDataFolder = Scripted:WaitForChild("TowerData")
-local TowersFolder = Scripted:WaitForChild("Towers")
+    Remotes.Place = eventFolder and eventFolder:FindFirstChild("placeTower")
+    Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
+    Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
+    Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    Remotes.Skip = eventFolder and eventFolder:FindFirstChild("waveSkip")
+    Remotes.Replay = eventFolder and eventFolder:FindFirstChild("ReplayCore")
+    Remotes.Ready = gameStartFolder and gameStartFolder:FindFirstChild("readyButton")
+    Remotes.Speed = speedFolder and speedFolder:FindFirstChild("Change")
+
+    Scripted = Workspace:FindFirstChild("Scripted")
+    TowerDataFolder = Scripted and Scripted:FindFirstChild("TowerData")
+    TowersFolder = Scripted and Scripted:FindFirstChild("Towers")
+end
+
+local function MatchObjectsReady()
+    RefreshGameObjects()
+    return TowerDataFolder ~= nil
+        and TowersFolder ~= nil
+        and Remotes.Place ~= nil
+        and Remotes.Upgrade ~= nil
+        and Remotes.Sell ~= nil
+        and Remotes.Target ~= nil
+end
+
+RefreshGameObjects()
 
 local function AddConnection(bucket, connection)
     table.insert(bucket or State.Connections, connection)
@@ -305,6 +324,9 @@ local function IsOwnTower(tower)
 end
 
 local function FindTowerModel(towerId, timeout)
+    if not TowersFolder then
+        return nil
+    end
     local model
     WaitUntil(function()
         model = TowersFolder:FindFirstChild(tostring(towerId))
@@ -395,6 +417,9 @@ local StopRecording
 local function StartRecording(profileName)
     if State.Playing then
         return false, "Stop playback first"
+    end
+    if not MatchObjectsReady() then
+        return false, "Recording is only available after entering a match"
     end
 
     profileName = SanitizeName(profileName)
@@ -522,6 +547,9 @@ local function HorizontalDistance(a, b)
 end
 
 local function FindMatchingRuntimeTower(action)
+    if not TowerDataFolder then
+        return nil
+    end
     local placement = ArrayToCFrame(action.CFrame)
     if not placement then
         return nil
@@ -714,6 +742,9 @@ local function StartPlayback()
     if State.Recording then
         return false, "Stop recording first"
     end
+    if not MatchObjectsReady() then
+        return false, "Playback is armed and will start after entering a match"
+    end
     if State.Playing then
         return false, "Playback is already running"
     end
@@ -722,6 +753,7 @@ local function StartPlayback()
     end
 
     State.Playing = true
+    State.AutoPlaybackStarted = true
     State.RuntimeHandles = {}
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
 
@@ -798,18 +830,35 @@ task.spawn(function()
     local lastReady = 0
     local lastSkip = 0
     local lastSpeed = 0
+    local lastRefresh = 0
     local replayLatched = false
     local restartAfterReplay = false
 
     while State.Running do
         local now = os.clock()
+        if now - lastRefresh >= 1 then
+            lastRefresh = now
+            RefreshGameObjects()
+        end
         local ended = IsGameEnded()
+        local matchReady = TowerDataFolder ~= nil and TowersFolder ~= nil and Remotes.Place ~= nil
+
+        if not matchReady or ended then
+            State.AutoPlaybackStarted = false
+        elseif State.PlaybackEnabled
+            and not State.AutoPlaybackStarted
+            and not State.Playing
+            and not State.Recording
+            and #State.Actions > 0
+            and Gui.StartEnabledPlayback then
+            Gui.StartEnabledPlayback()
+        end
 
         -- Wave text can be stale for a short time after teleport. Do not use it
         -- as a ready gate; the server safely ignores ready requests outside the
         -- ready phase. Repeating also covers the case where config loads before
         -- the new match's ready handler has finished initializing.
-        if State.AutoReady and now - lastReady >= 1 then
+        if State.AutoReady and Remotes.Ready and now - lastReady >= 1 then
             lastReady = now
             pcall(function() Remotes.Ready:FireServer(true) end)
         end
@@ -817,18 +866,18 @@ task.spawn(function()
         if State.AutoSkip and not ended and now - lastSkip >= 0.35 then
             local gui = GetPlayerGui()
             local skipGui = gui and gui:FindFirstChild("skipWave")
-            if skipGui and skipGui.Enabled then
+            if Remotes.Skip and skipGui and skipGui.Enabled then
                 lastSkip = now
                 pcall(function() Remotes.Skip:FireServer(true) end)
             end
         end
 
-        if State.AutoSpeed and not ended and now - lastSpeed >= 3 then
+        if State.AutoSpeed and Remotes.Speed and not ended and now - lastSpeed >= 3 then
             lastSpeed = now
             ApplySpeed(State.Speed)
         end
 
-        if State.AutoReplay and ended and not replayLatched then
+        if State.AutoReplay and Remotes.Replay and ended and not replayLatched then
             replayLatched = true
             restartAfterReplay = State.PlaybackEnabled and #State.Actions > 0
             SetStatus("Match ended", "Requesting replay")
@@ -1318,10 +1367,13 @@ local function StartEnabledPlayback()
         return
     end
     local ok, message = StartPlayback()
-    if not ok then
+    if ok then
+        State.AutoPlaybackStarted = true
+    else
         SetStatus("Auto playback", tostring(message))
     end
 end
+Gui.StartEnabledPlayback = StartEnabledPlayback
 
 MacrosTab:Button({
     Title = "Create New Macro",
