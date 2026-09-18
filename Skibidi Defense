@@ -49,6 +49,7 @@ local State = {
     Playing = false,
     PlaybackEnabled = false,
     AutoPlaybackStarted = false,
+    PlaybackFirstActionDone = false,
     AutoReady = false,
     AutoSkip = false,
     AutoReplay = false,
@@ -1301,6 +1302,7 @@ local function StartPlayback()
 
     State.Playing = true
     State.AutoPlaybackStarted = true
+    State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
 
@@ -1353,6 +1355,10 @@ local function StartPlayback()
                 StopPlayback(string.format("Action %d failed: %s", index, message or "unknown error"))
                 return
             end
+
+            if index == 1 then
+                State.PlaybackFirstActionDone = true
+            end
         end
 
         if State.Playing then
@@ -1389,6 +1395,7 @@ task.spawn(function()
     local wasMatchReady = false
     local lastDisplayedSpeed = nil
     local speedSentWithoutState = false
+    local startupSpeedReset = false
     local replayLatched = false
     local restartAfterReplay = false
 
@@ -1400,20 +1407,27 @@ task.spawn(function()
         end
         local ended = IsGameEnded()
         local matchReady = TowerDataFolder ~= nil and TowersFolder ~= nil and Remotes.Place ~= nil
+        local macroConfigured = State.PlaybackEnabled and State.ProfileName ~= ""
+        local macroProfilePrepared = not macroConfigured or #State.Actions > 0
+        local macroAutomationReady = macroProfilePrepared
+            and (not macroConfigured or State.PlaybackFirstActionDone)
 
         if not matchReady or ended then
             State.AutoPlaybackStarted = false
+            State.PlaybackFirstActionDone = false
             readyAttempts = 0
             readyComplete = false
             wasMatchReady = false
             lastDisplayedSpeed = nil
             speedSentWithoutState = false
+            startupSpeedReset = false
         elseif not wasMatchReady then
             wasMatchReady = true
             readyAttempts = 0
             readyComplete = false
             lastDisplayedSpeed = nil
             speedSentWithoutState = false
+            startupSpeedReset = false
         elseif State.PlaybackEnabled
             and not State.AutoPlaybackStarted
             and not State.Playing
@@ -1432,6 +1446,7 @@ task.spawn(function()
             readyComplete = true
         end
         if State.AutoReady
+            and macroProfilePrepared
             and matchReady
             and not ended
             and not readyComplete
@@ -1442,10 +1457,24 @@ task.spawn(function()
             pcall(function() Remotes.Ready:FireServer(true) end)
         end
 
+        -- Config is restored before WindUI finishes loading the selected macro.
+        -- Keep the opening at x1 and suppress skip until action 1 is confirmed,
+        -- otherwise a slow client can lose several seconds of the wave.
+        if matchReady
+            and macroProfilePrepared
+            and not macroAutomationReady
+            and (State.AutoSpeed or State.AutoSkip)
+            and Remotes.Speed
+            and not startupSpeedReset then
+            startupSpeedReset = true
+            pcall(function() Remotes.Speed:FireServer(1) end)
+        end
+
         local gui = GetPlayerGui()
         local skipGui = gui and gui:FindFirstChild("skipWave")
         local skipWindowOpen = skipGui and skipGui.Enabled == true
         if State.AutoSkip
+            and macroAutomationReady
             and not ended
             and Remotes.Skip
             and skipWindowOpen
@@ -1454,7 +1483,11 @@ task.spawn(function()
             pcall(function() Remotes.Skip:FireServer(true) end)
         end
 
-        if State.AutoSpeed and matchReady and Remotes.Speed and not ended then
+        if State.AutoSpeed
+            and macroAutomationReady
+            and matchReady
+            and Remotes.Speed
+            and not ended then
             local displayedSpeed = GetDisplayedSpeed()
             if displayedSpeed then
                 if displayedSpeed ~= lastDisplayedSpeed then
