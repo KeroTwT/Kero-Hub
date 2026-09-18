@@ -1,0 +1,2555 @@
+-- Skibidi Defense Hub
+-- Passive recorder + state-verified playback for place/upgrade/sell/target actions.
+-- This script intentionally does not hook __namecall, InvokeServer, functions, or GC.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
+local TeleportService = game:GetService("TeleportService")
+
+local LocalPlayer = Players.LocalPlayer
+local Environment = getgenv()
+
+local PreviousHub = Environment.SkibidiDefenseHub
+if PreviousHub and type(PreviousHub.Destroy) == "function" then
+    pcall(PreviousHub.Destroy)
+end
+
+local Hub = {}
+Environment.SkibidiDefenseHub = Hub
+
+local State = {
+    Running = true,
+    Recording = false,
+    Playing = false,
+    PlaybackEnabled = false,
+    AutoPlaybackStarted = false,
+    PlaybackFirstActionArmed = false,
+    PlaybackFirstActionDone = false,
+    AutoReady = false,
+    AutoSkip = false,
+    AutoReplay = false,
+    AutoSpeed = false,
+    MovingAround = false,
+    AutoJoinMap = false,
+    LobbyMode = "Story",
+    LobbyChapter = "Chapter 1",
+    AutoBackLobby = false,
+    MatchesBeforeLobby = 5,
+    MatchesCompleted = 0,
+    LastCountedJobId = "",
+    PendingLobbyReturn = false,
+    JoinRequested = false,
+    WebhookEnabled = false,
+    WebhookURL = "",
+    WebhookMatchEnd = true,
+    Speed = 1,
+    PlaybackMode = "Hybrid",
+    ProfileName = "",
+    ProfileVersion = 2,
+    Actions = {},
+    RecordStartedAt = 0,
+    NextHandle = 1,
+    Connections = {},
+    RecorderConnections = {},
+    TowerMeta = setmetatable({}, { __mode = "k" }),
+    RuntimeHandles = {},
+    UsedRuntimeTowers = setmetatable({}, { __mode = "k" }),
+}
+
+local MacroFolder = "SkibidiDefense_Macros"
+local ConfigFile = MacroFolder .. "/HubConfig.json"
+local LegacyMacroFolder = "Kero" .. "TTD_Macros"
+local HasFilesystem = type(isfolder) == "function"
+    and type(makefolder) == "function"
+    and type(isfile) == "function"
+    and type(readfile) == "function"
+    and type(writefile) == "function"
+
+if HasFilesystem and not isfolder(MacroFolder) then
+    makefolder(MacroFolder)
+end
+
+-- One-time compatibility migration so renaming the hub does not discard the
+-- user's existing macros or saved settings.
+if HasFilesystem and type(listfiles) == "function" and isfolder(LegacyMacroFolder) then
+    for _, oldPath in ipairs(listfiles(LegacyMacroFolder)) do
+        local fileName = oldPath:match("([^\\/]+%.json)$")
+        local newPath = fileName and (MacroFolder .. "/" .. fileName)
+        if newPath and not isfile(newPath) then
+            pcall(function()
+                writefile(newPath, readfile(oldPath))
+            end)
+        end
+    end
+end
+
+local Remotes = {}
+local LobbyPlaceId = 14279693118
+local Scripted
+local TowerDataFolder
+local TowersFolder
+
+local function RefreshGameObjects()
+    local eventFolder = ReplicatedStorage:FindFirstChild("Event")
+    local gameFolder = ReplicatedStorage:FindFirstChild("Game")
+    local gameStartFolder = ReplicatedStorage:FindFirstChild("GAME_START")
+    local eventsFolder = ReplicatedStorage:FindFirstChild("Events")
+    local speedFolder = gameFolder and gameFolder:FindFirstChild("Speed")
+
+    Remotes.Place = eventFolder and eventFolder:FindFirstChild("placeTower")
+    Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
+    Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
+    Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    Remotes.Skip = eventFolder and eventFolder:FindFirstChild("waveSkip")
+    Remotes.Replay = eventFolder and eventFolder:FindFirstChild("ReplayCore")
+    Remotes.Ready = gameStartFolder and gameStartFolder:FindFirstChild("readyButton")
+    Remotes.Speed = speedFolder and speedFolder:FindFirstChild("Change")
+    Remotes.CreateServer = eventsFolder and eventsFolder:FindFirstChild("createServer")
+    Remotes.StartServer = eventsFolder and eventsFolder:FindFirstChild("start")
+
+    Scripted = Workspace:FindFirstChild("Scripted")
+    TowerDataFolder = Scripted and Scripted:FindFirstChild("TowerData")
+    TowersFolder = Scripted and Scripted:FindFirstChild("Towers")
+end
+
+local function MatchObjectsReady()
+    RefreshGameObjects()
+    return TowerDataFolder ~= nil
+        and TowersFolder ~= nil
+        and Remotes.Place ~= nil
+        and Remotes.Upgrade ~= nil
+        and Remotes.Sell ~= nil
+        and Remotes.Target ~= nil
+end
+
+RefreshGameObjects()
+
+local function AddConnection(bucket, connection)
+    table.insert(bucket or State.Connections, connection)
+    return connection
+end
+
+local function DisconnectAll(bucket)
+    for _, connection in ipairs(bucket) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(bucket)
+end
+
+local function WaitUntil(condition, timeout, interval)
+    local deadline = os.clock() + (timeout or 5)
+    interval = interval or 0.1
+
+    repeat
+        if not State.Running then
+            return false
+        end
+
+        local success, result = pcall(condition)
+        if success and result then
+            return true, result
+        end
+
+        task.wait(interval)
+    until os.clock() >= deadline
+
+    return false
+end
+
+local function GetPlayerGui()
+    return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+end
+
+local function GetGameEndedGui()
+    local gui = GetPlayerGui()
+    return gui and gui:FindFirstChild("GameEnded")
+end
+
+local function IsGameEnded()
+    local gameEnded = GetGameEndedGui()
+    return gameEnded and gameEnded.Enabled == true or false
+end
+
+local function TriggerBackLobbyButton()
+    local gameEnded = GetGameEndedGui()
+    local frame = gameEnded and gameEnded:FindFirstChild("Frame")
+    local backButton = frame and frame:FindFirstChild("back")
+    if not backButton or not backButton:IsA("GuiButton") then
+        return false, "GameEnded.Frame.back was not found"
+    end
+
+    if type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, backButton.MouseButton1Click)
+        if ok and type(connections) == "table" then
+            for _, connection in ipairs(connections) do
+                local fired = pcall(function()
+                    if type(connection.Fire) == "function" then
+                        connection:Fire()
+                    elseif type(connection.Function) == "function" then
+                        connection.Function()
+                    else
+                        error("Connection cannot be invoked")
+                    end
+                end)
+                if fired then
+                    return true
+                end
+            end
+        end
+    end
+
+    if type(firesignal) == "function" then
+        local ok, message = pcall(firesignal, backButton.MouseButton1Click)
+        if ok then
+            return true
+        end
+        return false, tostring(message)
+    end
+
+    return false, "Executor cannot invoke MouseButton1Click"
+end
+
+local function GetMoney()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    local money = leaderstats and leaderstats:FindFirstChild("Money")
+    return money and tonumber(money.Value) or 0
+end
+
+local function GetWave()
+    local gui = GetPlayerGui()
+    local data = gui and gui:FindFirstChild("Data")
+    local wave = data and data:FindFirstChild("Wave")
+    local frame = wave and wave:FindFirstChild("Frame")
+    local label = frame and frame:FindFirstChild("TextLabel")
+    local text = label and label.Text or ""
+    return tonumber(text:match("[Ww][Aa][Vv][Ee]%s*(%d+)")) or 0
+end
+
+local function GetUnitCountText()
+    local gui = GetPlayerGui()
+    local towers = gui and gui:FindFirstChild("Towers")
+    local placement = towers and towers:FindFirstChild("Placement")
+    local frame = placement and placement:FindFirstChild("Frame")
+    local label = frame and frame:FindFirstChild("TextLabel")
+    return label and label.Text or "Units: ?/?"
+end
+
+local MovingPointCount = 16
+local MovingSession = 0
+
+local function GetCharacterRoot()
+    local character = LocalPlayer.Character
+    if not character then return nil, nil end
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then
+        return nil, nil
+    end
+    return root, humanoid
+end
+
+local function GetMapBounds()
+    local map = Workspace:FindFirstChild("Map")
+    if not map then return nil, nil end
+
+    if map:IsA("Model") then
+        local ok, boundsCFrame, boundsSize = pcall(function()
+            return map:GetBoundingBox()
+        end)
+        if ok and boundsSize.X > 0 and boundsSize.Z > 0 then
+            return boundsCFrame.Position, boundsSize, map
+        end
+    end
+
+    local minimum = Vector3.new(math.huge, math.huge, math.huge)
+    local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
+    local foundPart = false
+    for _, item in ipairs(map:GetDescendants()) do
+        if item:IsA("BasePart") then
+            local halfSize = item.Size * 0.5
+            minimum = Vector3.new(
+                math.min(minimum.X, item.Position.X - halfSize.X),
+                math.min(minimum.Y, item.Position.Y - halfSize.Y),
+                math.min(minimum.Z, item.Position.Z - halfSize.Z)
+            )
+            maximum = Vector3.new(
+                math.max(maximum.X, item.Position.X + halfSize.X),
+                math.max(maximum.Y, item.Position.Y + halfSize.Y),
+                math.max(maximum.Z, item.Position.Z + halfSize.Z)
+            )
+            foundPart = true
+        end
+    end
+
+    if not foundPart then return nil, nil end
+    return (minimum + maximum) * 0.5, maximum - minimum, map
+end
+
+local function GetGroundPoint(map, center, size, x, z)
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Include
+    raycastParams.FilterDescendantsInstances = { map }
+    raycastParams.IgnoreWater = true
+
+    local originY = center.Y + (size.Y * 0.5) + 100
+    local result = Workspace:Raycast(
+        Vector3.new(x, originY, z),
+        Vector3.new(0, -(size.Y + 300), 0),
+        raycastParams
+    )
+    if not result or result.Normal.Y < 0.6 then
+        return nil
+    end
+    return result.Position
+end
+
+local function StopCharacterMovement()
+    local root, humanoid = GetCharacterRoot()
+    if root and humanoid then
+        humanoid.AutoRotate = true
+        humanoid:MoveTo(root.Position)
+    end
+end
+
+local function ForceCharacterJump(humanoid)
+    if not humanoid or humanoid.Health <= 0 then return end
+    pcall(function()
+        humanoid.Jump = true
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end)
+end
+
+local function RunMovingJumpLoop(session)
+    while State.Running and State.MovingAround and session == MovingSession do
+        local _, humanoid = GetCharacterRoot()
+        if humanoid then
+            ForceCharacterJump(humanoid)
+        end
+        task.wait(0.65)
+    end
+end
+
+local function WalkToPoint(session, destination)
+    local root, humanoid = GetCharacterRoot()
+    if not root or not humanoid then return false end
+
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 8,
+    })
+    local computed = pcall(function()
+        path:ComputeAsync(root.Position, destination)
+    end)
+
+    if not computed or path.Status ~= Enum.PathStatus.Success then
+        return false
+    end
+
+    local waypoints = path:GetWaypoints()
+    if #waypoints < 2 then return false end
+
+    for _, waypoint in ipairs(waypoints) do
+        if not State.Running or not State.MovingAround or session ~= MovingSession then
+            return false
+        end
+
+        root, humanoid = GetCharacterRoot()
+        if not root or not humanoid then return false end
+        if waypoint.Action == Enum.PathWaypointAction.Jump
+            or waypoint.Position.Y > root.Position.Y + 1.5
+        then
+            ForceCharacterJump(humanoid)
+        end
+
+        local moveFinished = nil
+        local moveConnection = humanoid.MoveToFinished:Connect(function(reached)
+            moveFinished = reached == true
+        end)
+        humanoid:MoveTo(waypoint.Position)
+
+        local startedAt = os.clock()
+        local lastProgressAt = startedAt
+        local lastJumpAt = 0
+        local bestDistance = (root.Position - waypoint.Position).Magnitude
+        while moveFinished == nil
+            and State.Running
+            and State.MovingAround
+            and session == MovingSession
+        do
+            task.wait(0.1)
+            root, humanoid = GetCharacterRoot()
+            if not root or not humanoid then break end
+
+            local currentDistance = (root.Position - waypoint.Position).Magnitude
+            if currentDistance <= bestDistance - 0.5 then
+                bestDistance = currentDistance
+                lastProgressAt = os.clock()
+            elseif os.clock() - lastProgressAt >= 0.8
+                and os.clock() - lastJumpAt >= 0.8
+            then
+                -- Some maps have short ledges that PathfindingService does not
+                -- mark as jump waypoints. Jump when movement stalls.
+                ForceCharacterJump(humanoid)
+                lastJumpAt = os.clock()
+            end
+
+            if os.clock() - startedAt >= 8 then
+                break
+            end
+        end
+
+        moveConnection:Disconnect()
+        if not root or (root.Position - waypoint.Position).Magnitude > 4 then
+            return false
+        end
+    end
+    return true
+end
+
+local function RunMovingAround(session)
+    while State.Running and State.MovingAround and session == MovingSession do
+        local root, humanoid = GetCharacterRoot()
+        local center, size, map = GetMapBounds()
+        if not root or not humanoid or not center or not size or not map then
+            task.wait(1)
+        else
+            humanoid.AutoRotate = true
+
+            -- Prefer the outer edge, then move inward until Roblox finds a
+            -- genuinely walkable route. Never force a direct walk into walls.
+            local radiusScales = { 0.42, 0.34, 0.26, 0.18, 0.10 }
+            local baseRadiusX = math.max(size.X, 25)
+            local baseRadiusZ = math.max(size.Z, 25)
+            local relative = root.Position - center
+            local startAngle = math.atan2(relative.Z / baseRadiusZ, relative.X / baseRadiusX)
+
+            for pointIndex = 1, MovingPointCount do
+                if not State.Running or not State.MovingAround or session ~= MovingSession then
+                    break
+                end
+
+                root, humanoid = GetCharacterRoot()
+                if not root or not humanoid then break end
+
+                local angle = startAngle + ((math.pi * 2 * pointIndex) / MovingPointCount)
+                local walked = false
+                for _, radiusScale in ipairs(radiusScales) do
+                    local target = GetGroundPoint(
+                        map,
+                        center,
+                        size,
+                        center.X + math.cos(angle) * baseRadiusX * radiusScale,
+                        center.Z + math.sin(angle) * baseRadiusZ * radiusScale
+                    )
+                    if target and WalkToPoint(session, target) then
+                        walked = true
+                        break
+                    end
+                end
+
+                if not walked then
+                    task.wait(0.25)
+                end
+            end
+        end
+    end
+end
+
+local function SetMovingAround(enabled)
+    MovingSession = MovingSession + 1
+    StopCharacterMovement()
+
+    State.MovingAround = enabled == true
+    if State.MovingAround then
+        local session = MovingSession
+        task.spawn(function()
+            RunMovingAround(session)
+        end)
+        task.spawn(function()
+            RunMovingJumpLoop(session)
+        end)
+    end
+end
+
+AddConnection(State.Connections, LocalPlayer.CharacterAdded:Connect(function()
+    if not State.MovingAround then return end
+
+    MovingSession = MovingSession + 1
+    local session = MovingSession
+    task.delay(0.6, function()
+        if State.MovingAround and session == MovingSession then
+            task.spawn(function()
+                RunMovingAround(session)
+            end)
+            RunMovingJumpLoop(session)
+        end
+    end)
+end))
+
+local function GetDisplayedSpeed()
+    local gui = GetPlayerGui()
+    local towers = gui and gui:FindFirstChild("Towers")
+    local speedButton = towers and towers:FindFirstChild("speedButton")
+    local inner = speedButton and speedButton:FindFirstChild("inner")
+    local multiplier = inner and inner:FindFirstChild("mult")
+    local text = multiplier and multiplier.Text or ""
+    return tonumber(text:match("(%d+)%s*[xX]"))
+end
+
+local CachedBaseHealthLabel
+
+local function GetBaseHealthText()
+    if CachedBaseHealthLabel and CachedBaseHealthLabel.Parent then
+        return CachedBaseHealthLabel.Text
+    end
+
+    local map = Workspace:FindFirstChild("Map")
+    if not map then
+        return "?/?"
+    end
+
+    for _, descendant in ipairs(map:GetDescendants()) do
+        if descendant:IsA("TextLabel")
+            and descendant.Name == "hp"
+            and descendant.Parent
+            and descendant.Parent.Name == "Frame" then
+            CachedBaseHealthLabel = descendant
+            return descendant.Text
+        end
+    end
+
+    return "?/?"
+end
+
+local function GetMatchResultText()
+    local gameEnded = GetGameEndedGui()
+    if not gameEnded then
+        return "Match Ended"
+    end
+
+    for _, descendant in ipairs(gameEnded:GetDescendants()) do
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+            local text = tostring(descendant.Text or "")
+            local lowered = string.lower(text)
+            if lowered:find("you have defeated", 1, true)
+                or lowered:find("victory", 1, true)
+                or lowered:find("you won", 1, true) then
+                return "Victory"
+            end
+        end
+    end
+
+    for _, descendant in ipairs(gameEnded:GetDescendants()) do
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+            local lowered = string.lower(tostring(descendant.Text or ""))
+            if lowered:find("defeat", 1, true)
+                or lowered:find("you lost", 1, true)
+                or lowered:find("game over", 1, true) then
+                return "Defeat"
+            end
+        end
+    end
+
+    return "Match Ended"
+end
+
+local function IsDiscordWebhookURL(value)
+    local url = tostring(value or "")
+    return url:match("^https://discord%.com/api/webhooks/") ~= nil
+        or url:match("^https://discordapp%.com/api/webhooks/") ~= nil
+end
+
+local function SendDiscordWebhook(title, description, color)
+    if not State.WebhookEnabled then
+        return false, "Webhook is disabled"
+    end
+    if not IsDiscordWebhookURL(State.WebhookURL) then
+        return false, "Enter a valid Discord webhook URL"
+    end
+
+    local requestFunction = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+    if type(requestFunction) ~= "function" then
+        return false, "This executor does not support HTTP requests"
+    end
+
+    local payload = {
+        username = "Skibidi Defense Hub",
+        embeds = {{
+            title = tostring(title or "Skibidi Defense Hub"),
+            description = tostring(description or ""),
+            color = tonumber(color) or 5793266,
+            footer = { text = "Made By Kero :3" },
+        }},
+    }
+    local ok, response = pcall(function()
+        return requestFunction({
+            Url = State.WebhookURL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not ok then
+        return false, tostring(response)
+    end
+    return true
+end
+
+local function SendMatchEndWebhook()
+    if not State.WebhookEnabled or not State.WebhookMatchEnd then
+        return
+    end
+
+    if not IsDiscordWebhookURL(State.WebhookURL) then
+        return
+    end
+
+    local requestFunction = http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+    if type(requestFunction) ~= "function" then
+        return
+    end
+
+    local resultText = GetMatchResultText()
+    local embedColor = (resultText == "Victory" or resultText:find("Victory")) and 65280 or 16711680
+    local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
+    local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
+
+    local stageName = tostring(State.LobbyChapter) .. " (" .. tostring(State.LobbyMode) .. ")"
+
+    local payload = {
+        ["username"] = "Skibidi Defense Hub",
+        ["embeds"] = {
+            {
+                ["title"] = "Skibidi Defense Match Report",
+                ["description"] = string.format("**Stage:** %s\n**Result:** %s", stageName, resultText),
+                ["color"] = embedColor,
+                ["image"] = { ["url"] = mainImage },
+                ["fields"] = {
+                    {
+                        ["name"] = "Player Info",
+                        ["value"] = string.format(
+                            "👤 Name: ||%s||\n💰 Money: %s\n❤️ Base HP: %s",
+                            LocalPlayer.Name,
+                            tostring(GetMoney()),
+                            tostring(GetBaseHealthText())
+                        ),
+                        ["inline"] = false,
+                    },
+                    {
+                        ["name"] = "Match Details",
+                        ["value"] = string.format(
+                            "🌊 Wave: %s\n⚙️ Macro: %s\n🔄 Match cycle: %d/%d\n⏭️ Next: %s",
+                            tostring(GetWave()),
+                            (State.ProfileName ~= "" and State.ProfileName or "None"),
+                            State.MatchesCompleted,
+                            State.MatchesBeforeLobby,
+                            (State.PendingLobbyReturn and "Return to lobby" or "Replay / wait")
+                        ),
+                        ["inline"] = false,
+                    },
+                },
+                ["footer"] = { ["text"] = "Made By Kero:333", ["icon_url"] = footerIcon },
+                ["timestamp"] = DateTime.now():ToIsoDate(),
+            },
+        },
+    }
+
+    pcall(function()
+        requestFunction({
+            Url = State.WebhookURL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+end
+
+local function SanitizeName(name)
+    name = tostring(name or ""):gsub("[^%w%-%_]", "_")
+    name = name:gsub("_+", "_")
+    return name:sub(1, 48)
+end
+
+local function CFrameToArray(value)
+    return { value:GetComponents() }
+end
+
+local function ArrayToCFrame(value)
+    if type(value) ~= "table" or #value < 12 then
+        return nil
+    end
+    return CFrame.new(table.unpack(value, 1, 12))
+end
+
+local function ProfilePath(name)
+    return MacroFolder .. "/" .. SanitizeName(name) .. ".json"
+end
+
+local function SaveProfile(name)
+    name = SanitizeName(name)
+    if name == "" then
+        return false, "Profile name is empty"
+    end
+    if not HasFilesystem then
+        return false, "Executor filesystem APIs are unavailable"
+    end
+
+    local payload = {
+        Version = 2,
+        PlaceId = game.PlaceId,
+        Name = name,
+        RecordedAt = os.time(),
+        Actions = State.Actions,
+    }
+
+    local success, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not success then
+        return false, encoded
+    end
+
+    writefile(ProfilePath(name), encoded)
+    State.ProfileName = name
+    State.ProfileVersion = 2
+    return true
+end
+
+local function LoadProfile(name)
+    name = SanitizeName(name)
+    if name == "" or not HasFilesystem or not isfile(ProfilePath(name)) then
+        return false, "Profile not found"
+    end
+
+    local success, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(ProfilePath(name)))
+    end)
+
+    if not success or type(decoded) ~= "table" or type(decoded.Actions) ~= "table" then
+        return false, "Invalid profile file"
+    end
+
+    State.ProfileName = name
+    State.ProfileVersion = tonumber(decoded.Version) or 1
+    State.Actions = decoded.Actions
+    return true
+end
+
+local function ListProfiles()
+    if not HasFilesystem or type(listfiles) ~= "function" then
+        return {}
+    end
+
+    local result = {}
+    for _, path in ipairs(listfiles(MacroFolder)) do
+        local name = path:match("([^\\/]+)%.json$")
+        if name and name ~= "HubConfig" then
+            table.insert(result, name)
+        end
+    end
+    table.sort(result)
+    return result
+end
+
+local Gui = {}
+
+local function SetStatus(title, detail)
+    if Gui.Status then
+        Gui.Status:SetTitle("State: " .. tostring(title))
+        Gui.Status:SetDesc(detail or "")
+    end
+end
+
+local function RefreshActionList()
+    if not Gui.ActionSummary then
+        return
+    end
+    local lines = {}
+    local first = math.max(1, #State.Actions - 7)
+    for index = first, #State.Actions do
+        local action = State.Actions[index]
+        table.insert(lines, string.format("%02d | W%s | %s | %s", index, action.Wave or 0, action.Type or "?", action.Unit or action.Handle or ""))
+    end
+    Gui.ActionSummary:SetTitle(string.format("Recorded actions: %d", #State.Actions))
+    Gui.ActionSummary:SetDesc(#lines > 0 and table.concat(lines, "\n") or "No actions loaded")
+end
+
+local function AddAction(action)
+    action.Wave = action.Wave or GetWave()
+    action.RecordedAt = os.clock() - State.RecordStartedAt
+    table.insert(State.Actions, action)
+    RefreshActionList()
+    SetStatus("Recording", string.format("Captured %s at wave %d", action.Type, action.Wave))
+end
+
+local function IsOwnTower(tower)
+    return tower
+        and tower.Parent == TowerDataFolder
+        and tower:GetAttribute("Creator") == LocalPlayer.Name
+end
+
+local function FindTowerModel(towerId, timeout)
+    if not TowersFolder then
+        return nil
+    end
+    local model
+    WaitUntil(function()
+        model = TowersFolder:FindFirstChild(tostring(towerId))
+        return model
+    end, timeout or 2, 0.05)
+    return model
+end
+
+local function GetPlacementCFrame(tower)
+    local model = FindTowerModel(tower.Name, 2)
+    local boostPosition = tower:GetAttribute("BoostPos")
+    if typeof(boostPosition) == "Vector3" then
+        local rotation = CFrame.identity
+        if model and model:IsA("Model") then
+            local success, pivot = pcall(model.GetPivot, model)
+            if success then
+                rotation = pivot.Rotation
+            end
+        end
+
+        -- The replicated BoostPos is the ground position. The placement remote
+        -- observed for this game uses a pivot 4.7 studs above it.
+        return CFrame.new(boostPosition + Vector3.new(0, 4.7, 0)) * rotation
+    end
+
+    if model and model:IsA("Model") then
+        local success, pivot = pcall(model.GetPivot, model)
+        if success then
+            return pivot
+        end
+    end
+
+    return nil
+end
+
+local function IsUnavailableTargetMode(mode)
+    if mode == nil then
+        return true
+    end
+    local normalized = tostring(mode):upper():gsub("%s+", "")
+    return normalized == "" or normalized == "N/A" or normalized == "NA" or normalized == "NONE"
+end
+
+local function AttachTowerRecorder(tower, handle)
+    if State.TowerMeta[tower] then
+        return
+    end
+
+    local meta = {
+        Handle = handle,
+        Level = tonumber(tower:GetAttribute("Upgrade")) or 0,
+        SellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0,
+        PendingUpgradeCost = nil,
+        TargetMode = tower:GetAttribute("TargetMode"),
+        LastUpgradeAt = -math.huge,
+    }
+    State.TowerMeta[tower] = meta
+
+    AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("SellPrice"):Connect(function()
+        local newPrice = tonumber(tower:GetAttribute("SellPrice")) or meta.SellPrice
+        if newPrice > meta.SellPrice then
+            meta.PendingUpgradeCost = math.max(0, (newPrice - meta.SellPrice) * 2)
+            meta.LastUpgradeAt = os.clock()
+        end
+        meta.SellPrice = newPrice
+    end))
+
+    AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("Upgrade"):Connect(function()
+        local newLevel = tonumber(tower:GetAttribute("Upgrade")) or meta.Level
+        if State.Recording and newLevel > meta.Level then
+            meta.LastUpgradeAt = os.clock()
+            AddAction({
+                Type = "Upgrade",
+                Handle = meta.Handle,
+                FromLevel = meta.Level,
+                ToLevel = newLevel,
+                EstimatedCost = meta.PendingUpgradeCost or 0,
+            })
+        end
+        meta.Level = newLevel
+        meta.PendingUpgradeCost = nil
+    end))
+
+    AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("TargetMode"):Connect(function()
+        local newMode = tower:GetAttribute("TargetMode")
+        local oldMode = meta.TargetMode
+        local automaticUpgradeTransition = IsUnavailableTargetMode(oldMode)
+            and os.clock() - meta.LastUpgradeAt <= 0.5
+
+        if State.Recording and newMode and newMode ~= oldMode and not automaticUpgradeTransition then
+            AddAction({
+                Type = "Target",
+                Handle = meta.Handle,
+                Mode = newMode,
+            })
+        end
+        meta.TargetMode = newMode
+    end))
+end
+
+local StopRecording
+
+local function StartRecording(profileName)
+    if State.Playing then
+        return false, "Stop playback first"
+    end
+    if not MatchObjectsReady() then
+        return false, "Recording is only available after entering a match"
+    end
+
+    profileName = SanitizeName(profileName)
+    if profileName == "" then
+        return false, "Enter a profile name"
+    end
+
+    DisconnectAll(State.RecorderConnections)
+    State.Actions = {}
+    State.ProfileName = profileName
+    State.ProfileVersion = 2
+    State.RecordStartedAt = os.clock()
+    State.NextHandle = 1
+    State.TowerMeta = setmetatable({}, { __mode = "k" })
+    State.Recording = true
+
+    local existingOwnTowers = 0
+    for _, tower in ipairs(TowerDataFolder:GetChildren()) do
+        if IsOwnTower(tower) then
+            existingOwnTowers = existingOwnTowers + 1
+        end
+    end
+
+    AddConnection(State.RecorderConnections, TowerDataFolder.ChildAdded:Connect(function(tower)
+        task.spawn(function()
+            local ready = WaitUntil(function()
+                return IsOwnTower(tower) and tower:GetAttribute("ID") ~= nil
+            end, 5, 0.05)
+
+            if not ready or not State.Recording then
+                return
+            end
+
+            local handle = "T" .. State.NextHandle
+            State.NextHandle = State.NextHandle + 1
+            AttachTowerRecorder(tower, handle)
+
+            local placement = GetPlacementCFrame(tower)
+            if not placement then
+                SetStatus("Record warning", "Could not read placement CFrame for tower " .. tower.Name)
+                return
+            end
+
+            local sellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0
+            AddAction({
+                Type = "Place",
+                Handle = handle,
+                Unit = tostring(tower:GetAttribute("ID")),
+                CFrame = CFrameToArray(placement),
+                EstimatedCost = sellPrice * 2,
+            })
+        end)
+    end))
+
+    AddConnection(State.RecorderConnections, TowerDataFolder.ChildRemoved:Connect(function(tower)
+        local meta = State.TowerMeta[tower]
+        if not meta then
+            return
+        end
+
+        task.delay(0.15, function()
+            if State.Recording and not IsGameEnded() then
+                AddAction({
+                    Type = "Sell",
+                    Handle = meta.Handle,
+                })
+            end
+        end)
+    end))
+
+    local gameEnded = GetGameEndedGui()
+    if gameEnded then
+        AddConnection(State.RecorderConnections, gameEnded:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if State.Recording and gameEnded.Enabled then
+                task.defer(function()
+                    if State.Recording then
+                        StopRecording(true)
+                    end
+                end)
+            end
+        end))
+    end
+
+    RefreshActionList()
+    if existingOwnTowers > 0 then
+        SetStatus("Recording", string.format("Started with %d existing tower(s); new actions only", existingOwnTowers))
+    else
+        SetStatus("Recording", "Play normally; actions are captured automatically")
+    end
+    return true
+end
+
+StopRecording = function(save)
+    if not State.Recording then
+        return false, "Recorder is not running"
+    end
+
+    State.Recording = false
+    if Gui.SetRecordToggle then
+        Gui.SetRecordToggle(false)
+    end
+    DisconnectAll(State.RecorderConnections)
+
+    if save then
+        local success, message = SaveProfile(State.ProfileName)
+        if not success then
+            SetStatus("Save failed", message)
+            return false, message
+        end
+        SetStatus("Saved", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
+        if Gui.RefreshProfiles then
+            Gui.RefreshProfiles(State.ProfileName)
+        end
+        if Gui.QueueSave then
+            Gui.QueueSave()
+        end
+    else
+        SetStatus("Recorder stopped", string.format("%d unsaved actions", #State.Actions))
+    end
+
+    return true
+end
+
+local function HorizontalDistance(a, b)
+    return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+end
+
+local function FindMatchingRuntimeTower(action)
+    if not TowerDataFolder then
+        return nil
+    end
+    local placement = ArrayToCFrame(action.CFrame)
+    if not placement then
+        return nil
+    end
+
+    for _, tower in ipairs(TowerDataFolder:GetChildren()) do
+        if IsOwnTower(tower)
+            and not State.UsedRuntimeTowers[tower]
+            and tostring(tower:GetAttribute("ID")) == tostring(action.Unit) then
+            local boostPosition = tower:GetAttribute("BoostPos")
+            if typeof(boostPosition) ~= "Vector3"
+                or HorizontalDistance(boostPosition, placement.Position) <= 8 then
+                return tower
+            end
+        end
+    end
+
+    return nil
+end
+
+local function WaitForActionGate(action, playbackStartedAt)
+    local recordedAt = tonumber(action.RecordedAt) or 0
+    local cost = tonumber(action.EstimatedCost) or 0
+    local targetWave = tonumber(action.Wave) or 0
+
+    return WaitUntil(function()
+        if not State.Playing or IsGameEnded() then
+            return true
+        end
+
+        local elapsed = os.clock() - playbackStartedAt
+        local hasTime = elapsed >= recordedAt
+        local hasMoney = cost <= 0 or GetMoney() >= cost
+        local hasWave = targetWave <= 0 or GetWave() >= targetWave
+
+        if State.PlaybackMode == "Time" then
+            return hasTime
+        elseif State.PlaybackMode == "Money" then
+            return hasMoney
+        end
+
+        -- Hybrid normally requires both recorded timing and cash. If the game
+        -- has already passed the recorded wave, timing is released so a late
+        -- start cannot permanently desync the macro.
+        if targetWave > 0 and GetWave() > targetWave then
+            hasTime = true
+        end
+        return hasWave and hasTime and hasMoney
+    end, 600, 0.1)
+end
+
+local function PlayPlace(action)
+    local placement = ArrayToCFrame(action.CFrame)
+    if not placement then
+        return false, "Invalid placement CFrame"
+    end
+
+    local existing = FindMatchingRuntimeTower(action)
+    if existing then
+        State.RuntimeHandles[action.Handle] = existing
+        State.UsedRuntimeTowers[existing] = true
+        return true
+    end
+
+    local deadline = os.clock() + 180
+    local estimatedCost = tonumber(action.EstimatedCost) or 0
+
+    while State.Playing and os.clock() < deadline and not IsGameEnded() do
+        existing = FindMatchingRuntimeTower(action)
+        if existing then
+            State.RuntimeHandles[action.Handle] = existing
+            State.UsedRuntimeTowers[existing] = true
+            return true
+        end
+
+        if GetMoney() >= estimatedCost then
+            Remotes.Place:FireServer(action.Unit, placement, false)
+
+            local success, tower = WaitUntil(function()
+                return FindMatchingRuntimeTower(action)
+            end, 3, 0.1)
+
+            if success and tower then
+                State.RuntimeHandles[action.Handle] = tower
+                State.UsedRuntimeTowers[tower] = true
+                return true
+            end
+        end
+
+        task.wait(1.5)
+    end
+
+    return false, "Place timed out"
+end
+
+local function ResolveHandle(handle)
+    local tower = State.RuntimeHandles[handle]
+    if tower and tower.Parent == TowerDataFolder then
+        return tower
+    end
+    return nil
+end
+
+local function PlayUpgrade(action)
+    local tower = ResolveHandle(action.Handle)
+    if not tower then
+        return false, "Tower handle is missing: " .. tostring(action.Handle)
+    end
+
+    local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
+    local estimatedCost = tonumber(action.EstimatedCost) or 0
+    local deadline = os.clock() + 180
+    local fundsUnlocked = estimatedCost <= 0
+
+    while State.Playing and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
+        local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
+        if currentLevel >= targetLevel then
+            return true
+        end
+
+        -- Upgrade All can replicate a multi-level jump (for example 0 -> 4)
+        -- as one recorded action. The server remote still upgrades one level
+        -- per call, so confirm each intermediate level and immediately send the
+        -- next request instead of waiting for the final level for three seconds.
+        if not fundsUnlocked and GetMoney() >= estimatedCost then
+            fundsUnlocked = true
+        end
+
+        if fundsUnlocked then
+            local levelBeforeRequest = currentLevel
+            Remotes.Upgrade:FireServer(tostring(tower.Name))
+            local progressed = WaitUntil(function()
+                return tower.Parent ~= TowerDataFolder
+                    or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
+            end, 1, 0.03)
+
+            if tower.Parent ~= TowerDataFolder then
+                return false, "Tower disappeared during upgrade"
+            end
+            if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
+                return true
+            end
+
+            -- A confirmed level can be followed almost immediately. If the
+            -- request was dropped, use a small retry delay without stalling the
+            -- entire macro action.
+            task.wait(progressed and 0.03 or 0.2)
+        else
+            task.wait(0.1)
+        end
+    end
+
+    return false, "Upgrade timed out"
+end
+
+local function IsAutomaticRecordedTarget(index, action)
+    if State.ProfileVersion >= 2 then
+        return false
+    end
+    local previous = State.Actions[index - 1]
+    if not previous
+        or previous.Type ~= "Upgrade"
+        or previous.Handle ~= action.Handle then
+        return false
+    end
+
+    local targetTime = tonumber(action.RecordedAt)
+    local upgradeTime = tonumber(previous.RecordedAt)
+    return targetTime ~= nil
+        and upgradeTime ~= nil
+        and targetTime >= upgradeTime
+        and targetTime - upgradeTime <= 0.5
+end
+
+local function PlaySell(action)
+    local tower = ResolveHandle(action.Handle)
+    if not tower then
+        return true
+    end
+
+    for _ = 1, 3 do
+        if not State.Playing or tower.Parent ~= TowerDataFolder then
+            return true
+        end
+
+        Remotes.Sell:FireServer(tostring(tower.Name))
+        if WaitUntil(function()
+            return tower.Parent ~= TowerDataFolder
+        end, 3, 0.1) then
+            return true
+        end
+        task.wait(1)
+    end
+
+    return false, "Sell was not confirmed"
+end
+
+local function PlayTarget(action)
+    local tower = ResolveHandle(action.Handle)
+    if not tower then
+        return false, "Tower handle is missing: " .. tostring(action.Handle)
+    end
+
+    for _ = 1, 8 do
+        if not State.Playing or tower.Parent ~= TowerDataFolder then
+            return false, "Tower disappeared"
+        end
+
+        if tower:GetAttribute("TargetMode") == action.Mode then
+            return true
+        end
+
+        Remotes.Target:FireServer(tostring(tower.Name))
+        task.wait(0.25)
+    end
+
+    return tower:GetAttribute("TargetMode") == action.Mode, "Target mode was not confirmed"
+end
+
+local function StopPlayback(reason)
+    State.Playing = false
+    if reason then
+        SetStatus("Stopped", reason)
+    end
+end
+
+local function StartPlayback()
+    if State.Recording then
+        return false, "Stop recording first"
+    end
+    if not MatchObjectsReady() then
+        return false, "Playback is armed and will start after entering a match"
+    end
+    if State.Playing then
+        return false, "Playback is already running"
+    end
+    if #State.Actions == 0 then
+        return false, "Load or record a profile first"
+    end
+
+    State.Playing = true
+    State.AutoPlaybackStarted = true
+    State.PlaybackFirstActionArmed = false
+    State.PlaybackFirstActionDone = false
+    State.RuntimeHandles = {}
+    State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
+
+    task.spawn(function()
+        SetStatus("Playback", string.format("Running %s", State.ProfileName))
+        local playbackStartedAt = os.clock()
+
+        -- Match the recorder's clock to the first live wave, not loading time.
+        while State.Playing and not IsGameEnded() and GetWave() < 1 do
+            playbackStartedAt = os.clock()
+            task.wait(0.1)
+        end
+
+        for index, action in ipairs(State.Actions) do
+            if not State.Playing or IsGameEnded() then
+                break
+            end
+
+            if index == 1 then
+                -- The playback clock and action gate are now live. Speed/skip
+                -- may safely advance income because this action will execute as
+                -- soon as its recorded wave/time/money conditions are met.
+                State.PlaybackFirstActionArmed = true
+            end
+
+            SetStatus(
+                "Playback",
+                string.format("%d/%d  %s  W%d", index, #State.Actions, action.Type or "?", action.Wave or 0)
+            )
+
+            local gateReady = WaitForActionGate(action, playbackStartedAt)
+            if not gateReady or not State.Playing or IsGameEnded() then
+                break
+            end
+
+            local success, message
+            if action.Type == "Place" then
+                success, message = PlayPlace(action)
+            elseif action.Type == "Upgrade" then
+                success, message = PlayUpgrade(action)
+            elseif action.Type == "Sell" then
+                success, message = PlaySell(action)
+            elseif action.Type == "Target" then
+                if IsAutomaticRecordedTarget(index, action) then
+                    -- Older profiles may contain the game's automatic N/A ->
+                    -- First transition immediately after an upgrade. It is not
+                    -- a player target command and must not block playback.
+                    success = true
+                else
+                    success, message = PlayTarget(action)
+                end
+            else
+                success, message = false, "Unknown action type: " .. tostring(action.Type)
+            end
+
+            if not success then
+                StopPlayback(string.format("Action %d failed: %s", index, message or "unknown error"))
+                return
+            end
+
+            if index == 1 then
+                State.PlaybackFirstActionDone = true
+            end
+        end
+
+        if State.Playing then
+            State.Playing = false
+            SetStatus("Playback complete", "Waiting for the match to end")
+        end
+    end)
+
+    return true
+end
+
+local function ApplySpeed(speed)
+    speed = tonumber(speed) or 1
+    if speed < 1 or speed > 6 then
+        speed = 1
+    end
+
+    State.Speed = speed
+    pcall(function()
+        Remotes.Speed:FireServer(speed)
+    end)
+    if Gui.Runtime then
+        Gui.Runtime:SetDesc(string.format("Wave %d | Money %d | %s | Base %s | Speed x%d", GetWave(), GetMoney(), GetUnitCountText(), GetBaseHealthText(), speed))
+    end
+end
+
+-- Background automation. These use visible replicated state and rate-limited RemoteEvents.
+task.spawn(function()
+    local lastReady = 0
+    local lastSkip = 0
+    local lastRefresh = 0
+    local readyAttempts = 0
+    local readyComplete = false
+    local wasMatchReady = false
+    local lastDisplayedSpeed = nil
+    local speedSentWithoutState = false
+    local startupSpeedReset = false
+    local replayLatched = false
+    local restartAfterReplay = false
+
+    while State.Running do
+        local now = os.clock()
+        if now - lastRefresh >= 1 then
+            lastRefresh = now
+            RefreshGameObjects()
+        end
+        local ended = IsGameEnded()
+        local matchReady = TowerDataFolder ~= nil and TowersFolder ~= nil and Remotes.Place ~= nil
+        local macroConfigured = State.PlaybackEnabled and State.ProfileName ~= ""
+        local macroProfilePrepared = not macroConfigured or #State.Actions > 0
+        local macroAutomationReady = macroProfilePrepared
+            and (not macroConfigured or State.PlaybackFirstActionArmed)
+
+        if not matchReady or ended then
+            State.AutoPlaybackStarted = false
+            State.PlaybackFirstActionArmed = false
+            State.PlaybackFirstActionDone = false
+            readyAttempts = 0
+            readyComplete = false
+            wasMatchReady = false
+            lastDisplayedSpeed = nil
+            speedSentWithoutState = false
+            startupSpeedReset = false
+        elseif not wasMatchReady then
+            wasMatchReady = true
+            readyAttempts = 0
+            readyComplete = false
+            lastDisplayedSpeed = nil
+            speedSentWithoutState = false
+            startupSpeedReset = false
+        elseif State.PlaybackEnabled
+            and not State.AutoPlaybackStarted
+            and not State.Playing
+            and not State.Recording
+            and #State.Actions > 0
+            and Gui.StartEnabledPlayback then
+            Gui.StartEnabledPlayback()
+        end
+
+        -- Send a small, bounded number of ready requests at match initialization.
+        -- This tolerates stale wave text after teleport without spamming for the
+        -- full duration of every match.
+        if readyAttempts >= 3 and GetWave() >= 2 then
+            readyComplete = true
+        elseif readyAttempts >= 12 then
+            readyComplete = true
+        end
+        if State.AutoReady
+            and macroProfilePrepared
+            and matchReady
+            and not ended
+            and not readyComplete
+            and Remotes.Ready
+            and now - lastReady >= 1 then
+            lastReady = now
+            readyAttempts = readyAttempts + 1
+            pcall(function() Remotes.Ready:FireServer(true) end)
+        end
+
+        -- Config is restored before WindUI finishes loading the selected macro.
+        -- Keep the opening at x1 and suppress skip until action 1's playback
+        -- gate is actively watching wave/time/money. It can then earn missing
+        -- starting cash without letting automation outrun a slow-loading macro.
+        if matchReady
+            and macroProfilePrepared
+            and not macroAutomationReady
+            and (State.AutoSpeed or State.AutoSkip)
+            and Remotes.Speed
+            and not startupSpeedReset then
+            startupSpeedReset = true
+            pcall(function() Remotes.Speed:FireServer(1) end)
+        end
+
+        local gui = GetPlayerGui()
+        local skipGui = gui and gui:FindFirstChild("skipWave")
+        local skipWindowOpen = skipGui and skipGui.Enabled == true
+        if State.AutoSkip
+            and macroAutomationReady
+            and not ended
+            and Remotes.Skip
+            and skipWindowOpen
+            and now - lastSkip >= 0.35 then
+            lastSkip = now
+            pcall(function() Remotes.Skip:FireServer(true) end)
+        end
+
+        if State.AutoSpeed
+            and macroAutomationReady
+            and matchReady
+            and Remotes.Speed
+            and not ended then
+            local displayedSpeed = GetDisplayedSpeed()
+            if displayedSpeed then
+                if displayedSpeed ~= lastDisplayedSpeed then
+                    lastDisplayedSpeed = displayedSpeed
+                    if displayedSpeed ~= State.Speed then
+                        ApplySpeed(State.Speed)
+                    end
+                end
+            elseif not speedSentWithoutState then
+                speedSentWithoutState = true
+                ApplySpeed(State.Speed)
+            end
+        end
+
+        if ended and not replayLatched then
+            replayLatched = true
+            if State.AutoBackLobby and State.LastCountedJobId ~= game.JobId then
+                State.LastCountedJobId = game.JobId
+                State.MatchesCompleted = State.MatchesCompleted + 1
+
+                if State.MatchesCompleted >= State.MatchesBeforeLobby then
+                    State.PendingLobbyReturn = true
+                    SetStatus("Match cycle complete", "Using the game's Return to Lobby button")
+                else
+                    SetStatus(
+                        "Match counted",
+                        string.format("%d/%d matches before lobby", State.MatchesCompleted, State.MatchesBeforeLobby)
+                    )
+                end
+
+                if Gui.UpdateMatchCounter then Gui.UpdateMatchCounter() end
+                if Gui.SaveConfigNow then
+                    Gui.SaveConfigNow()
+                elseif Gui.QueueSave then
+                    Gui.QueueSave()
+                end
+            end
+
+            SendMatchEndWebhook()
+
+            local lobbyReturnTriggered = false
+            if State.PendingLobbyReturn then
+                local message
+                lobbyReturnTriggered, message = TriggerBackLobbyButton()
+                if not lobbyReturnTriggered then
+                    SetStatus("Lobby button waiting", tostring(message) .. " | retrying")
+                    task.spawn(function()
+                        local retryMessage = message
+                        for _ = 1, 20 do
+                            if not State.Running or not State.PendingLobbyReturn then
+                                return
+                            end
+                            task.wait(0.5)
+                            local triggered
+                            triggered, retryMessage = TriggerBackLobbyButton()
+                            if triggered then
+                                SetStatus("Returning to lobby", "Game back button triggered")
+                                return
+                            end
+                        end
+                        SetStatus("Lobby button failed", tostring(retryMessage))
+                    end)
+                end
+            end
+
+            local shouldReplay = State.AutoReplay and not State.PendingLobbyReturn
+            if shouldReplay and Remotes.Replay then
+                restartAfterReplay = not State.PendingLobbyReturn
+                    and State.PlaybackEnabled
+                    and #State.Actions > 0
+                pcall(function() Remotes.Replay:FireServer() end)
+            end
+        elseif not ended then
+            replayLatched = false
+
+            if restartAfterReplay and not State.Playing then
+                restartAfterReplay = false
+                local started, message = StartPlayback()
+                if started and Gui.SetPlaybackToggle then
+                    Gui.SetPlaybackToggle(true)
+                elseif not started then
+                    SetStatus("Replay started", message or "Could not restart profile")
+                end
+            end
+        end
+
+        task.wait(0.1)
+    end
+end)
+
+-- Kept as an inert fallback reference while the live interface below uses WindUI.
+if false then
+local function MakeButton(parent, text, position, size)
+    local button = Instance.new("TextButton")
+    button.AutoButtonColor = true
+    button.BackgroundColor3 = Color3.fromRGB(50, 54, 66)
+    button.BorderSizePixel = 0
+    button.Position = position
+    button.Size = size
+    button.Font = Enum.Font.GothamSemibold
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(236, 238, 245)
+    button.TextSize = 12
+    button.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = button
+    return button
+end
+
+local function MakeLabel(parent, text, position, size, fontSize)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Position = position
+    label.Size = size
+    label.Font = Enum.Font.Gotham
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(220, 223, 234)
+    label.TextSize = fontSize or 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = parent
+    return label
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "SkibidiDefenseHub"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local success = pcall(function()
+    screenGui.Parent = type(gethui) == "function" and gethui() or CoreGui
+end)
+if not success then
+    screenGui.Parent = GetPlayerGui()
+end
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.Position = UDim2.fromScale(0.5, 0.5)
+main.Size = UDim2.fromOffset(620, 430)
+main.BackgroundColor3 = Color3.fromRGB(24, 26, 33)
+main.BorderSizePixel = 0
+main.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = main
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(66, 71, 88)
+stroke.Thickness = 1
+stroke.Parent = main
+
+local topBar = Instance.new("Frame")
+topBar.Name = "TopBar"
+topBar.Size = UDim2.new(1, 0, 0, 44)
+topBar.BackgroundColor3 = Color3.fromRGB(31, 34, 43)
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+
+local topCorner = Instance.new("UICorner")
+topCorner.CornerRadius = UDim.new(0, 10)
+topCorner.Parent = topBar
+
+local topMask = Instance.new("Frame")
+topMask.Position = UDim2.new(0, 0, 1, -10)
+topMask.Size = UDim2.new(1, 0, 0, 10)
+topMask.BorderSizePixel = 0
+topMask.BackgroundColor3 = topBar.BackgroundColor3
+topMask.Parent = topBar
+
+local title = MakeLabel(topBar, "Skibidi Defense Hub", UDim2.fromOffset(16, 0), UDim2.new(1, -100, 1, 0), 16)
+title.Font = Enum.Font.GothamBold
+
+local minimize = MakeButton(topBar, "—", UDim2.new(1, -74, 0, 8), UDim2.fromOffset(28, 28))
+local close = MakeButton(topBar, "×", UDim2.new(1, -40, 0, 8), UDim2.fromOffset(28, 28))
+close.BackgroundColor3 = Color3.fromRGB(133, 49, 59)
+
+local left = Instance.new("Frame")
+left.Position = UDim2.fromOffset(12, 56)
+left.Size = UDim2.fromOffset(285, 362)
+left.BackgroundTransparency = 1
+left.Parent = main
+
+local right = Instance.new("Frame")
+right.Position = UDim2.fromOffset(307, 56)
+right.Size = UDim2.fromOffset(301, 362)
+right.BackgroundColor3 = Color3.fromRGB(29, 32, 40)
+right.BorderSizePixel = 0
+right.Parent = main
+
+local rightCorner = Instance.new("UICorner")
+rightCorner.CornerRadius = UDim.new(0, 8)
+rightCorner.Parent = right
+
+MakeLabel(left, "Profile", UDim2.fromOffset(0, 0), UDim2.fromOffset(80, 24), 13)
+
+local profileBox = Instance.new("TextBox")
+profileBox.Position = UDim2.fromOffset(0, 26)
+profileBox.Size = UDim2.fromOffset(285, 34)
+profileBox.BackgroundColor3 = Color3.fromRGB(38, 41, 51)
+profileBox.BorderSizePixel = 0
+profileBox.ClearTextOnFocus = false
+profileBox.Font = Enum.Font.Gotham
+profileBox.PlaceholderText = "example: map1_solo"
+profileBox.Text = ""
+profileBox.TextColor3 = Color3.fromRGB(238, 240, 247)
+profileBox.PlaceholderColor3 = Color3.fromRGB(130, 135, 150)
+profileBox.TextSize = 13
+profileBox.Parent = left
+local profileCorner = Instance.new("UICorner")
+profileCorner.CornerRadius = UDim.new(0, 6)
+profileCorner.Parent = profileBox
+
+local recordButton = MakeButton(left, "Start Recording", UDim2.fromOffset(0, 70), UDim2.fromOffset(138, 34))
+local stopSaveButton = MakeButton(left, "Stop & Save", UDim2.fromOffset(147, 70), UDim2.fromOffset(138, 34))
+local loadButton = MakeButton(left, "Load Profile", UDim2.fromOffset(0, 112), UDim2.fromOffset(138, 34))
+local playButton = MakeButton(left, "Play", UDim2.fromOffset(147, 112), UDim2.fromOffset(66, 34))
+local stopButton = MakeButton(left, "Stop", UDim2.fromOffset(219, 112), UDim2.fromOffset(66, 34))
+
+local autoReadyButton = MakeButton(left, "Auto Ready: OFF", UDim2.fromOffset(0, 158), UDim2.fromOffset(138, 32))
+local autoSkipButton = MakeButton(left, "Auto Skip: OFF", UDim2.fromOffset(147, 158), UDim2.fromOffset(138, 32))
+local autoReplayButton = MakeButton(left, "Auto Replay: OFF", UDim2.fromOffset(0, 198), UDim2.fromOffset(138, 32))
+local speedLabel = MakeLabel(left, "Speed: x1", UDim2.fromOffset(150, 198), UDim2.fromOffset(135, 28), 12)
+speedLabel.TextXAlignment = Enum.TextXAlignment.Center
+Gui.SpeedLabel = speedLabel
+
+for speed = 1, 6 do
+    local button = MakeButton(
+        left,
+        "x" .. speed,
+        UDim2.fromOffset((speed - 1) * 57, 236),
+        UDim2.fromOffset(51, 30)
+    )
+    button.MouseButton1Click:Connect(function()
+        ApplySpeed(speed)
+    end)
+end
+
+Gui.StatusTitle = MakeLabel(left, "Idle", UDim2.fromOffset(0, 280), UDim2.fromOffset(285, 24), 14)
+Gui.StatusTitle.Font = Enum.Font.GothamBold
+Gui.StatusDetail = MakeLabel(left, "Waiting", UDim2.fromOffset(0, 304), UDim2.fromOffset(285, 40), 12)
+Gui.StatusDetail.TextWrapped = true
+Gui.StatusDetail.TextColor3 = Color3.fromRGB(157, 164, 184)
+
+Gui.ActionCount = MakeLabel(right, "0 actions", UDim2.fromOffset(12, 6), UDim2.fromOffset(130, 24), 12)
+local stateLabel = MakeLabel(right, "", UDim2.new(1, -154, 0, 6), UDim2.fromOffset(142, 24), 11)
+stateLabel.TextXAlignment = Enum.TextXAlignment.Right
+stateLabel.TextColor3 = Color3.fromRGB(145, 151, 170)
+
+Gui.ActionList = Instance.new("ScrollingFrame")
+Gui.ActionList.Position = UDim2.fromOffset(8, 34)
+Gui.ActionList.Size = UDim2.new(1, -16, 1, -42)
+Gui.ActionList.BackgroundTransparency = 1
+Gui.ActionList.BorderSizePixel = 0
+Gui.ActionList.ScrollBarThickness = 4
+Gui.ActionList.ScrollBarImageColor3 = Color3.fromRGB(91, 98, 121)
+Gui.ActionList.CanvasSize = UDim2.fromOffset(0, 0)
+Gui.ActionList.Parent = right
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 0)
+listLayout.Parent = Gui.ActionList
+
+recordButton.MouseButton1Click:Connect(function()
+    local ok, message = StartRecording(profileBox.Text)
+    if not ok then
+        SetStatus("Cannot record", message)
+    end
+end)
+
+stopSaveButton.MouseButton1Click:Connect(function()
+    local ok, message = StopRecording(true)
+    if not ok then
+        SetStatus("Cannot save", message)
+    end
+end)
+
+loadButton.MouseButton1Click:Connect(function()
+    local ok, message = LoadProfile(profileBox.Text)
+    if ok then
+        RefreshActionList()
+        SetStatus("Loaded", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
+    else
+        local profiles = ListProfiles()
+        SetStatus("Load failed", message .. (#profiles > 0 and (" | Available: " .. table.concat(profiles, ", ")) or ""))
+    end
+end)
+
+playButton.MouseButton1Click:Connect(function()
+    local ok, message = StartPlayback()
+    if not ok then
+        SetStatus("Cannot play", message)
+    end
+end)
+
+stopButton.MouseButton1Click:Connect(function()
+    StopPlayback("Stopped by user")
+end)
+
+autoReadyButton.MouseButton1Click:Connect(function()
+    State.AutoReady = not State.AutoReady
+    SetToggleVisual(autoReadyButton, State.AutoReady, "Auto Ready")
+end)
+
+autoSkipButton.MouseButton1Click:Connect(function()
+    State.AutoSkip = not State.AutoSkip
+    SetToggleVisual(autoSkipButton, State.AutoSkip, "Auto Skip")
+end)
+
+autoReplayButton.MouseButton1Click:Connect(function()
+    State.AutoReplay = not State.AutoReplay
+    SetToggleVisual(autoReplayButton, State.AutoReplay, "Auto Replay")
+end)
+
+local minimized = false
+minimize.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    main.Size = minimized and UDim2.fromOffset(620, 44) or UDim2.fromOffset(620, 430)
+    left.Visible = not minimized
+    right.Visible = not minimized
+end)
+
+local dragging = false
+local dragStart
+local startPosition
+
+topBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPosition = main.Position
+    end
+end)
+
+AddConnection(State.Connections, UserInputService.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        main.Position = startPosition + UDim2.fromOffset(delta.X, delta.Y)
+    end
+end))
+
+AddConnection(State.Connections, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end))
+
+AddConnection(State.Connections, UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+        screenGui.Enabled = not screenGui.Enabled
+    end
+end))
+
+task.spawn(function()
+    while State.Running do
+        stateLabel.Text = string.format("W%d | $%d | %s | Base %s", GetWave(), GetMoney(), GetUnitCountText(), GetBaseHealthText())
+        task.wait(0.5)
+    end
+end)
+
+function Hub.Destroy()
+    State.Running = false
+    State.Recording = false
+    State.Playing = false
+    DisconnectAll(State.RecorderConnections)
+    DisconnectAll(State.Connections)
+    pcall(function()
+        screenGui:Destroy()
+    end)
+    if Environment.SkibidiDefenseHub == Hub then
+        Environment.SkibidiDefenseHub = nil
+    end
+end
+
+Hub.State = State
+Hub.StartRecording = StartRecording
+Hub.StopRecording = StopRecording
+Hub.StartPlayback = StartPlayback
+Hub.StopPlayback = StopPlayback
+Hub.SaveProfile = SaveProfile
+Hub.LoadProfile = LoadProfile
+Hub.ListProfiles = ListProfiles
+Hub.SetSpeed = ApplySpeed
+
+close.MouseButton1Click:Connect(Hub.Destroy)
+
+RefreshActionList()
+SetToggleVisual(autoReadyButton, false, "Auto Ready")
+SetToggleVisual(autoSkipButton, false, "Auto Skip")
+SetToggleVisual(autoReplayButton, false, "Auto Replay")
+SetStatus("Idle", "Enter a profile name, then record a fresh match")
+
+print("Skibidi Defense Hub loaded. RightShift toggles the UI.")
+end
+
+-- WindUI interface -----------------------------------------------------------
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local Window = WindUI:CreateWindow({
+    Title = "Skibidi Defense Hub",
+    Author = "Made By Kero :3",
+    Folder = "SkibidiDefenseHub",
+    Icon = "clapperboard",
+    Theme = "Dark",
+    Size = UDim2.fromOffset(620, 480),
+    Transparent = true,
+    HideSearchBar = true,
+    NewElements = true,
+    ToggleKey = Enum.KeyCode.RightShift,
+    OpenButton = {
+        Title = "Skibidi Defense Hub",
+        Enabled = true,
+        Draggable = true,
+        OnlyMobile = false,
+    },
+})
+
+pcall(function() Window:SetToggleKey(Enum.KeyCode.RightShift) end)
+pcall(function() Window:SetTogleKey(Enum.KeyCode.RightShift) end)
+
+local function Notify(title, content)
+    pcall(function()
+        WindUI:Notify({ Title = title, Content = content, Duration = 4, Icon = "bell" })
+    end)
+end
+
+local function WrapParagraph(element)
+    local wrapper = {}
+    function wrapper:SetTitle(value)
+        pcall(function()
+            if element.SetTitle then element:SetTitle(value) else element:Set({ Title = value }) end
+        end)
+    end
+    function wrapper:SetDesc(value)
+        pcall(function()
+            if element.SetDesc then element:SetDesc(value) else element:Set({ Desc = value }) end
+        end)
+    end
+    return wrapper
+end
+
+local function ReadConfig()
+    if not HasFilesystem or not isfile(ConfigFile) then
+        return {}
+    end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(ConfigFile))
+    end)
+    return ok and type(decoded) == "table" and decoded or {}
+end
+
+local Config = ReadConfig()
+State.AutoReplay = Config.AutoReplay == true
+State.AutoReady = Config.AutoReady == true
+State.AutoSkip = Config.AutoSkip == true
+State.AutoSpeed = Config.AutoSpeed == true
+State.MovingAround = Config.MovingAround == true
+State.AutoJoinMap = Config.AutoJoinMap == true
+State.LobbyMode = tostring(Config.LobbyMode or "Story")
+State.LobbyChapter = tostring(Config.LobbyChapter or "Chapter 1")
+State.AutoBackLobby = Config.AutoBackLobby == true
+State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeLobby) or 5))
+State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
+State.LastCountedJobId = tostring(Config.LastCountedJobId or "")
+State.PendingLobbyReturn = Config.PendingLobbyReturn == true
+State.WebhookEnabled = Config.WebhookEnabled == true
+State.WebhookURL = tostring(Config.WebhookURL or "")
+State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
+State.PlaybackEnabled = Config.PlaybackEnabled == true
+State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 6)
+State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode) and Config.PlaybackMode or "Hybrid"
+State.ProfileName = SanitizeName(Config.SelectedProfile or "")
+
+local saveQueued = false
+local function SaveConfig()
+    if not HasFilesystem then return end
+    local payload = {
+        AutoReplay = State.AutoReplay,
+        AutoReady = State.AutoReady,
+        AutoSkip = State.AutoSkip,
+        AutoSpeed = State.AutoSpeed,
+        MovingAround = State.MovingAround,
+        AutoJoinMap = State.AutoJoinMap,
+        LobbyMode = State.LobbyMode,
+        LobbyChapter = State.LobbyChapter,
+        AutoBackLobby = State.AutoBackLobby,
+        MatchesBeforeLobby = State.MatchesBeforeLobby,
+        MatchesCompleted = State.MatchesCompleted,
+        LastCountedJobId = State.LastCountedJobId,
+        PendingLobbyReturn = State.PendingLobbyReturn,
+        WebhookEnabled = State.WebhookEnabled,
+        WebhookURL = State.WebhookURL,
+        WebhookMatchEnd = State.WebhookMatchEnd,
+        PlaybackEnabled = State.PlaybackEnabled,
+        Speed = State.Speed,
+        PlaybackMode = State.PlaybackMode,
+        SelectedProfile = State.ProfileName,
+        NewProfileName = Config.NewProfileName or "",
+    }
+    pcall(function()
+        writefile(ConfigFile, HttpService:JSONEncode(payload))
+    end)
+end
+
+local function QueueSave()
+    if saveQueued then return end
+    saveQueued = true
+    task.delay(0.25, function()
+        saveQueued = false
+        SaveConfig()
+    end)
+end
+Gui.QueueSave = QueueSave
+Gui.SaveConfigNow = SaveConfig
+
+if State.PendingLobbyReturn then
+    if game.PlaceId == LobbyPlaceId then
+        State.PendingLobbyReturn = false
+        State.MatchesCompleted = 0
+        State.LastCountedJobId = ""
+        SaveConfig()
+    else
+        task.delay(1, function()
+            if State.Running and State.PendingLobbyReturn then
+                local triggered, buttonMessage = TriggerBackLobbyButton()
+                if not triggered then
+                    local ok, teleportMessage = pcall(function()
+                        TeleportService:Teleport(LobbyPlaceId, LocalPlayer)
+                    end)
+                    if not ok then
+                        Notify(
+                            "Lobby return failed",
+                            tostring(buttonMessage) .. " | " .. tostring(teleportMessage)
+                        )
+                    end
+                end
+            end
+        end)
+    end
+end
+
+local LobbyTab = Window:Tab({ Title = "Lobby", Icon = "house" })
+local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
+local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
+local WebhookTab = Window:Tab({ Title = "Webhook", Icon = "webhook" })
+
+LobbyTab:Section({ Title = "Lobby Automation", Desc = "Ready and replay controls" })
+
+local ModeChapters = {
+    Story = {
+        "Chapter 1", "Chapter 1.5", "Chapter 2", "Chapter 3", "Chapter 4",
+        "Chapter 5", "Chapter 6", "Chapter 7", "Chapter 8", "Chapter 9",
+    },
+    Multiverse = { "Multiverse Chapter 1", "Multiverse Chapter 2", "Multiverse Chapter 3" },
+    Nightmare = { "Void", "Suspicious Detections", "Spreaded Corruption", "Rise Of The Corruption" },
+    Event = { "Partner Takeover", "Skibi Trials" },
+    Versus = { "Versus 1v1", "Versus 2v2", "Versus 3v3", "Versus 4v4" },
+    Endless = { "Normal", "Roguelite" },
+    Episodes = {
+        "Episode 79", "A Fight From the Past", "Civil War", "Land Of Creation",
+        "The Final Showdown", "The Last Base",
+    },
+    Raid = { "WorldRaid" },
+}
+
+local function GetModeChapters(mode)
+    if mode ~= "All" then
+        return table.clone(ModeChapters[mode] or {})
+    end
+
+    local result = {}
+    for _, chapters in pairs(ModeChapters) do
+        for _, chapter in ipairs(chapters) do
+            if not table.find(result, chapter) then
+                table.insert(result, chapter)
+            end
+        end
+    end
+    local replicatedServers = ReplicatedStorage:FindFirstChild("Servers")
+    if replicatedServers then
+        for _, entry in ipairs(replicatedServers:GetChildren()) do
+            if not table.find(result, entry.Name) then
+                table.insert(result, entry.Name)
+            end
+        end
+    end
+    table.sort(result)
+    return result
+end
+
+if not ModeChapters[State.LobbyMode] and State.LobbyMode ~= "All" then
+    State.LobbyMode = "Story"
+end
+local initialChapters = GetModeChapters(State.LobbyMode)
+if not table.find(initialChapters, State.LobbyChapter) then
+    State.LobbyChapter = initialChapters[1] or "Chapter 1"
+end
+
+local chapterDropdown
+LobbyTab:Dropdown({
+    Title = "Mode",
+    Values = { "Story", "Multiverse", "Nightmare", "Event", "Versus", "Endless", "Episodes", "Raid", "All" },
+    Value = State.LobbyMode,
+    Multi = false,
+    Callback = function(value)
+        State.LobbyMode = value
+        local chapters = GetModeChapters(value)
+        if not table.find(chapters, State.LobbyChapter) then
+            State.LobbyChapter = chapters[1] or ""
+        end
+        if chapterDropdown then
+            pcall(function() chapterDropdown:Refresh(chapters) end)
+            pcall(function() chapterDropdown:Select(State.LobbyChapter) end)
+        end
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+chapterDropdown = LobbyTab:Dropdown({
+    Title = "Chapter",
+    Values = initialChapters,
+    Value = State.LobbyChapter,
+    Multi = false,
+    Callback = function(value)
+        State.LobbyChapter = value
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+LobbyTab:Toggle({
+    Title = "Auto Join Map",
+    Value = State.AutoJoinMap,
+    Callback = function(value)
+        State.AutoJoinMap = value == true
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+LobbyTab:Section({ Title = "Match Cycle", Desc = "Persisted across replay teleports" })
+local matchCounterParagraph = WrapParagraph(LobbyTab:Paragraph({ Title = "Match Counter", Desc = "Loading..." }))
+local function UpdateMatchCounter()
+    matchCounterParagraph:SetDesc(string.format(
+        "%d/%d completed | %s",
+        State.MatchesCompleted,
+        State.MatchesBeforeLobby,
+        State.PendingLobbyReturn and "returning to lobby" or "running"
+    ))
+end
+Gui.UpdateMatchCounter = UpdateMatchCounter
+UpdateMatchCounter()
+
+LobbyTab:Toggle({
+    Title = "Auto Back Lobby After X Matches",
+    Value = State.AutoBackLobby,
+    Callback = function(value)
+        State.AutoBackLobby = value == true
+        QueueSave()
+        UpdateMatchCounter()
+    end,
+})
+
+LobbyTab:Input({
+    Title = "Matches Before Lobby",
+    Placeholder = "5",
+    Value = tostring(State.MatchesBeforeLobby),
+    Callback = function(value)
+        local amount = tonumber(tostring(value):match("%d+"))
+        if amount then
+            State.MatchesBeforeLobby = math.max(1, math.floor(amount))
+            QueueSave()
+            UpdateMatchCounter()
+        end
+    end,
+})
+
+LobbyTab:Button({
+    Title = "Reset Match Counter",
+    Icon = "rotate-ccw",
+    Callback = function()
+        State.MatchesCompleted = 0
+        State.LastCountedJobId = ""
+        State.PendingLobbyReturn = false
+        QueueSave()
+        UpdateMatchCounter()
+    end,
+})
+
+LobbyTab:Toggle({
+    Title = "Auto Replay",
+    Value = State.AutoReplay,
+    Callback = function(value)
+        State.AutoReplay = value == true
+        QueueSave()
+    end,
+})
+LobbyTab:Toggle({
+    Title = "Auto Ready Up",
+    Value = State.AutoReady,
+    Callback = function(value)
+        State.AutoReady = value == true
+        if State.AutoReady then
+            pcall(function() Remotes.Ready:FireServer(true) end)
+        end
+        QueueSave()
+    end,
+})
+
+task.spawn(function()
+    while State.Running do
+        if game.PlaceId == LobbyPlaceId
+            and State.AutoJoinMap
+            and not State.JoinRequested
+            and State.LobbyChapter ~= "" then
+            RefreshGameObjects()
+            if Remotes.CreateServer then
+                State.JoinRequested = true
+                SetStatus("Auto Join", "Creating " .. State.LobbyChapter)
+                task.spawn(function()
+                    local ok, result = pcall(function()
+                        return Remotes.CreateServer:InvokeServer(State.LobbyChapter)
+                    end)
+                    if not ok then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", tostring(result))
+                        return
+                    end
+
+                    SetStatus("Auto Join", "Starting " .. State.LobbyChapter)
+                    local startRemote = Remotes.StartServer
+                    for _ = 1, 20 do
+                        if startRemote then break end
+                        task.wait(0.25)
+                        RefreshGameObjects()
+                        startRemote = Remotes.StartServer
+                    end
+
+                    if not startRemote then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", "Events.start was not found")
+                        return
+                    end
+
+                    local started, startError = pcall(function()
+                        startRemote:FireServer(false)
+                    end)
+                    if not started then
+                        State.JoinRequested = false
+                        Notify("Auto Join failed", tostring(startError))
+                    end
+                end)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+WebhookTab:Section({ Title = "Discord Webhook", Desc = "Optional match notifications" })
+
+WebhookTab:Input({
+    Title = "Webhook URL",
+    Placeholder = "https://discord.com/api/webhooks/...",
+    Value = State.WebhookURL,
+    Callback = function(value)
+        State.WebhookURL = tostring(value or "")
+        QueueSave()
+    end,
+})
+
+WebhookTab:Toggle({
+    Title = "Enable Webhook",
+    Value = State.WebhookEnabled,
+    Callback = function(value)
+        State.WebhookEnabled = value == true
+        QueueSave()
+    end,
+})
+
+WebhookTab:Toggle({
+    Title = "Notify On Match End",
+    Value = State.WebhookMatchEnd,
+    Callback = function(value)
+        State.WebhookMatchEnd = value == true
+        QueueSave()
+    end,
+})
+
+WebhookTab:Button({
+    Title = "Send Test Webhook",
+    Icon = "send",
+    Callback = function()
+        local ok, message = SendDiscordWebhook(
+            "Webhook Test",
+            "Skibidi Defense Hub webhook is working.",
+            5763719
+        )
+        if ok then
+            Notify("Webhook", "Test message sent")
+        else
+            Notify("Webhook failed", tostring(message))
+        end
+    end,
+})
+
+MacrosTab:Section({ Title = "Macro State", Desc = "Passive recorder and verified playback" })
+Gui.Status = WrapParagraph(MacrosTab:Paragraph({ Title = "State: Idle", Desc = "Waiting" }))
+Gui.Runtime = WrapParagraph(MacrosTab:Paragraph({ Title = "Live match", Desc = "Reading game state..." }))
+Gui.ActionSummary = WrapParagraph(MacrosTab:Paragraph({ Title = "Recorded actions: 0", Desc = "No actions loaded" }))
+
+local newProfileName = Config.NewProfileName or ""
+local profileInput = MacrosTab:Input({
+    Title = "Create Macro",
+    Placeholder = "example: map1_solo",
+    Value = newProfileName,
+    Callback = function(value)
+        newProfileName = SanitizeName(value)
+        Config.NewProfileName = newProfileName
+        QueueSave()
+    end,
+})
+
+local profileValues = ListProfiles()
+if #profileValues == 0 then profileValues = { "(none)" } end
+local selectedDefault = State.ProfileName ~= "" and State.ProfileName or profileValues[1]
+local profileDropdown
+
+local function RefreshProfiles(selectName)
+    local values = ListProfiles()
+    if #values == 0 then values = { "(none)" } end
+    pcall(function() profileDropdown:Refresh(values) end)
+    if selectName and selectName ~= "" then
+        pcall(function() profileDropdown:Select(selectName) end)
+    end
+end
+Gui.RefreshProfiles = RefreshProfiles
+
+local function StartEnabledPlayback()
+    if not State.PlaybackEnabled or State.Playing or State.Recording or #State.Actions == 0 then
+        return
+    end
+    local ok, message = StartPlayback()
+    if ok then
+        State.AutoPlaybackStarted = true
+    else
+        SetStatus("Auto playback", tostring(message))
+    end
+end
+Gui.StartEnabledPlayback = StartEnabledPlayback
+
+MacrosTab:Button({
+    Title = "Create New Macro",
+    Icon = "file-plus",
+    Callback = function()
+        local name = SanitizeName(newProfileName)
+        if name == "" then
+            Notify("Create Macro", "Enter a macro name first")
+            return
+        end
+        if HasFilesystem and isfile(ProfilePath(name)) then
+            Notify("Create Macro", "That macro already exists")
+            return
+        end
+        local previousActions, previousName = State.Actions, State.ProfileName
+        State.Actions, State.ProfileName = {}, name
+        local ok, message = SaveProfile(name)
+        if not ok then
+            State.Actions, State.ProfileName = previousActions, previousName
+            Notify("Create failed", tostring(message))
+            return
+        end
+        RefreshProfiles(name)
+        RefreshActionList()
+        SetStatus("Created", name .. " is ready to record")
+        QueueSave()
+    end,
+})
+
+profileDropdown = MacrosTab:Dropdown({
+    Title = "Select Macro",
+    Values = profileValues,
+    Value = selectedDefault,
+    Multi = false,
+    Callback = function(value)
+        if value == "(none)" then return end
+        local ok, message = LoadProfile(value)
+        if ok then
+            RefreshActionList()
+            SetStatus("Loaded", string.format("%s (%d actions)", State.ProfileName, #State.Actions))
+            QueueSave()
+            task.defer(StartEnabledPlayback)
+        else
+            SetStatus("Load failed", tostring(message))
+        end
+    end,
+})
+
+MacrosTab:Dropdown({
+    Title = "Playback Mode",
+    Values = { "Hybrid", "Time", "Money" },
+    Value = State.PlaybackMode,
+    Multi = false,
+    Callback = function(value)
+        State.PlaybackMode = value
+        QueueSave()
+    end,
+})
+
+local changingToggle = false
+local recordToggle
+local playbackToggle
+local function SetWindToggle(element, value)
+    if not element then return end
+    changingToggle = true
+    pcall(function() element:Set(value) end)
+    changingToggle = false
+end
+Gui.SetRecordToggle = function(value) SetWindToggle(recordToggle, value) end
+Gui.SetPlaybackToggle = function(value) SetWindToggle(playbackToggle, value) end
+
+recordToggle = MacrosTab:Toggle({
+    Title = "Record",
+    Value = false,
+    Callback = function(value)
+        if changingToggle then return end
+        if value then
+            if State.PlaybackEnabled then
+                SetWindToggle(playbackToggle, false)
+                State.PlaybackEnabled = false
+                QueueSave()
+            end
+            if State.Playing then
+                StopPlayback("Stopped to begin recording")
+            end
+            local name = State.ProfileName ~= "" and State.ProfileName or newProfileName
+            local ok, message = StartRecording(name)
+            if not ok then
+                SetWindToggle(recordToggle, false)
+                Notify("Cannot record", tostring(message))
+            end
+        elseif State.Recording then
+            local ok, message = StopRecording(true)
+            if ok then
+                RefreshProfiles(State.ProfileName)
+                QueueSave()
+            else
+                Notify("Cannot save", tostring(message))
+            end
+        end
+    end,
+})
+Gui.RecordToggle = recordToggle
+
+playbackToggle = MacrosTab:Toggle({
+    Title = "Playback",
+    Value = State.PlaybackEnabled,
+    Callback = function(value)
+        if changingToggle then return end
+        State.PlaybackEnabled = value == true
+        QueueSave()
+        if value then
+            if State.Recording then
+                SetWindToggle(recordToggle, false)
+                StopRecording(true)
+            end
+            local ok, message = StartPlayback()
+            if not ok then
+                SetStatus("Playback armed", tostring(message))
+            end
+        elseif State.Playing then
+            StopPlayback("Stopped by user")
+        end
+    end,
+})
+Gui.PlayToggle = playbackToggle
+
+MiscTab:Section({ Title = "Wave & Speed", Desc = "Match automation" })
+MiscTab:Toggle({
+    Title = "Auto Skip Waves",
+    Value = State.AutoSkip,
+    Callback = function(value)
+        State.AutoSkip = value == true
+        QueueSave()
+    end,
+})
+MiscTab:Toggle({
+    Title = "Auto Speed Scale",
+    Value = State.AutoSpeed,
+    Callback = function(value)
+        State.AutoSpeed = value == true
+        if State.AutoSpeed then ApplySpeed(State.Speed) end
+        QueueSave()
+    end,
+})
+MiscTab:Dropdown({
+    Title = "Speed Scale",
+    Values = { "x1", "x2", "x3", "x4", "x5", "x6" },
+    Value = "x" .. tostring(State.Speed),
+    Multi = false,
+    Callback = function(value)
+        local speed = tonumber(tostring(value):match("%d+")) or 1
+        State.Speed = math.clamp(speed, 1, 6)
+        if State.AutoSpeed then ApplySpeed(State.Speed) end
+        QueueSave()
+    end,
+})
+
+MiscTab:Section({ Title = "Movement", Desc = "Character movement" })
+MiscTab:Toggle({
+    Title = "Moving Around (AntiKick)",
+    Value = State.MovingAround,
+    Callback = function(value)
+        SetMovingAround(value)
+        QueueSave()
+    end,
+})
+
+if State.MovingAround then
+    task.defer(function()
+        SetMovingAround(true)
+    end)
+end
+
+if State.ProfileName ~= "" then
+    local ok = LoadProfile(State.ProfileName)
+    if not ok then State.ProfileName = "" end
+end
+
+if State.PlaybackEnabled and #State.Actions > 0 then
+    task.defer(StartEnabledPlayback)
+end
+
+task.spawn(function()
+    while State.Running do
+        if Gui.Runtime then
+            Gui.Runtime:SetTitle(State.Playing and ("Live match - " .. State.PlaybackMode) or "Live match")
+            Gui.Runtime:SetDesc(string.format(
+                "Wave %d | Money %d | %s | Base %s | Speed x%d",
+                GetWave(), GetMoney(), GetUnitCountText(), GetBaseHealthText(), State.Speed
+            ))
+        end
+        task.wait(0.5)
+    end
+end)
+
+function Hub.Destroy()
+    MovingSession = MovingSession + 1
+    StopCharacterMovement()
+    State.Running = false
+    State.Recording = false
+    State.Playing = false
+    SaveConfig()
+    DisconnectAll(State.RecorderConnections)
+    DisconnectAll(State.Connections)
+    pcall(function() Window:Destroy() end)
+    if Environment.SkibidiDefenseHub == Hub then
+        Environment.SkibidiDefenseHub = nil
+    end
+end
+
+Hub.State = State
+Hub.StartRecording = StartRecording
+Hub.StopRecording = StopRecording
+Hub.StartPlayback = StartPlayback
+Hub.StopPlayback = StopPlayback
+Hub.SaveProfile = SaveProfile
+Hub.LoadProfile = LoadProfile
+Hub.ListProfiles = ListProfiles
+Hub.SetSpeed = ApplySpeed
+
+RefreshActionList()
+SetStatus("Idle", State.ProfileName ~= "" and ("Loaded " .. State.ProfileName) or "Create or select a macro")
+SaveConfig()
+print("Skibidi Defense Hub loaded. Made By Kero :3 | RightShift toggles WindUI.")
