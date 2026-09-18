@@ -49,6 +49,7 @@ local State = {
     Playing = false,
     PlaybackEnabled = false,
     AutoPlaybackStarted = false,
+    PlaybackFirstActionArmed = false,
     PlaybackFirstActionDone = false,
     AutoReady = false,
     AutoSkip = false,
@@ -1302,6 +1303,7 @@ local function StartPlayback()
 
     State.Playing = true
     State.AutoPlaybackStarted = true
+    State.PlaybackFirstActionArmed = false
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
@@ -1319,6 +1321,13 @@ local function StartPlayback()
         for index, action in ipairs(State.Actions) do
             if not State.Playing or IsGameEnded() then
                 break
+            end
+
+            if index == 1 then
+                -- The playback clock and action gate are now live. Speed/skip
+                -- may safely advance income because this action will execute as
+                -- soon as its recorded wave/time/money conditions are met.
+                State.PlaybackFirstActionArmed = true
             end
 
             SetStatus(
@@ -1410,10 +1419,11 @@ task.spawn(function()
         local macroConfigured = State.PlaybackEnabled and State.ProfileName ~= ""
         local macroProfilePrepared = not macroConfigured or #State.Actions > 0
         local macroAutomationReady = macroProfilePrepared
-            and (not macroConfigured or State.PlaybackFirstActionDone)
+            and (not macroConfigured or State.PlaybackFirstActionArmed)
 
         if not matchReady or ended then
             State.AutoPlaybackStarted = false
+            State.PlaybackFirstActionArmed = false
             State.PlaybackFirstActionDone = false
             readyAttempts = 0
             readyComplete = false
@@ -1458,8 +1468,9 @@ task.spawn(function()
         end
 
         -- Config is restored before WindUI finishes loading the selected macro.
-        -- Keep the opening at x1 and suppress skip until action 1 is confirmed,
-        -- otherwise a slow client can lose several seconds of the wave.
+        -- Keep the opening at x1 and suppress skip until action 1's playback
+        -- gate is actively watching wave/time/money. It can then earn missing
+        -- starting cash without letting automation outrun a slow-loading macro.
         if matchReady
             and macroProfilePrepared
             and not macroAutomationReady
