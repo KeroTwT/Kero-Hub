@@ -36,6 +36,7 @@ local State = {
     AutoJoinMap = false,
     LobbyMode = "Story",
     LobbyChapter = "Chapter 1",
+    LobbyModifiers = {},
     AutoBackLobby = false,
     MatchesBeforeLobby = 5,
     MatchesCompleted = 0,
@@ -109,6 +110,7 @@ local function RefreshGameObjects()
     Remotes.Speed = speedFolder and speedFolder:FindFirstChild("Change")
     Remotes.CreateServer = eventsFolder and eventsFolder:FindFirstChild("createServer")
     Remotes.StartServer = eventsFolder and eventsFolder:FindFirstChild("start")
+    Remotes.ModifierState = ReplicatedStorage:FindFirstChild("ModifierState")
 
     Scripted = Workspace:FindFirstChild("Scripted")
     TowerDataFolder = Scripted and Scripted:FindFirstChild("TowerData")
@@ -1938,6 +1940,15 @@ State.MovingAround = Config.MovingAround == true
 State.AutoJoinMap = Config.AutoJoinMap == true
 State.LobbyMode = tostring(Config.LobbyMode or "Story")
 State.LobbyChapter = tostring(Config.LobbyChapter or "Chapter 1")
+if type(Config.LobbyModifiers) == "table" then
+    for key, value in pairs(Config.LobbyModifiers) do
+        if type(key) == "string" and value == true then
+            State.LobbyModifiers[key] = true
+        elseif type(key) == "number" and type(value) == "string" then
+            State.LobbyModifiers[value] = true
+        end
+    end
+end
 State.AutoBackLobby = Config.AutoBackLobby == true
 State.MatchesBeforeLobby = math.max(1, math.floor(tonumber(Config.MatchesBeforeLobby) or 5))
 State.MatchesCompleted = math.max(0, math.floor(tonumber(Config.MatchesCompleted) or 0))
@@ -1963,6 +1974,7 @@ local function SaveConfig()
         AutoJoinMap = State.AutoJoinMap,
         LobbyMode = State.LobbyMode,
         LobbyChapter = State.LobbyChapter,
+        LobbyModifiers = State.LobbyModifiers,
         AutoBackLobby = State.AutoBackLobby,
         MatchesBeforeLobby = State.MatchesBeforeLobby,
         MatchesCompleted = State.MatchesCompleted,
@@ -2043,6 +2055,112 @@ local ModeChapters = {
     Raid = { "WorldRaid" },
 }
 
+-- Extracted from the client modifier registry/UI using Skibidi_Modifier_Probe.lua.
+-- The server can still reject unavailable, incompatible, or entitlement-gated choices.
+local LobbyModifierValues = {
+    "NormalRegen",
+    "GodlyRegen",
+    "WeakerEnemies",
+    "WayWeakerEnemies",
+    "StrongerEnemies",
+    "WayStrongerEnemies",
+    "GodlyEnemies",
+    "LessEnemies",
+    "DoubleEnemies",
+    "AcceleratingEnemies",
+    "DeceleratingEnemies",
+    "RandomSpeed",
+    "RandomHP",
+    "AllHidden",
+    "NoHidden",
+    "AllAir",
+    "NoAir",
+    "Ambushed",
+    "AggressiveFoes",
+    "AdvancedForces",
+    "Deflection",
+    "TowerNerf",
+    "TowerNerf2",
+    "ThreePlacement",
+    "TenPlacement",
+    "OnePlacement",
+    "InfinitePlacement",
+    "DoubleWaveMoney",
+    "LessWaveMoney",
+    "MoreDamageMoney",
+    "LessDamageMoney",
+    "MarketLock",
+    "BudgetOptimization",
+    "MassiveTowers",
+    "PositionShift",
+    "SmallWar",
+    "ToiletSpawner",
+    "RandomLoadout",
+    "Freeze",
+    "InfiniteHP",
+    "InfiniteMoney",
+    "SandboxMap",
+}
+
+local LobbyModifierSet = {}
+for _, modifierName in ipairs(LobbyModifierValues) do
+    LobbyModifierSet[modifierName] = true
+end
+
+local function NormalizeModifierSelection(value)
+    local selected = {}
+    if type(value) ~= "table" then
+        return selected
+    end
+
+    for key, item in pairs(value) do
+        local modifierName
+        if type(key) == "string" and item == true then
+            modifierName = key
+        elseif type(key) == "number" and type(item) == "string" then
+            modifierName = item
+        end
+
+        if modifierName and LobbyModifierSet[modifierName] then
+            selected[modifierName] = true
+        end
+    end
+    return selected
+end
+
+State.LobbyModifiers = NormalizeModifierSelection(State.LobbyModifiers)
+
+local function ApplyLobbyModifiers()
+    local selected = {}
+    for _, modifierName in ipairs(LobbyModifierValues) do
+        if State.LobbyModifiers[modifierName] == true then
+            table.insert(selected, modifierName)
+        end
+    end
+
+    if #selected == 0 then
+        return true
+    end
+
+    RefreshGameObjects()
+    if not Remotes.ModifierState or not Remotes.ModifierState:IsA("RemoteEvent") then
+        return false, "ReplicatedStorage.ModifierState was not found"
+    end
+
+    SetStatus("Auto Join", string.format("Applying %d modifier(s)", #selected))
+    for _, modifierName in ipairs(selected) do
+        local ok, message = pcall(function()
+            Remotes.ModifierState:FireServer(modifierName, true)
+        end)
+        if not ok then
+            return false, modifierName .. ": " .. tostring(message)
+        end
+        task.wait(0.05)
+    end
+
+    return true
+end
+
 local function GetModeChapters(mode)
     if mode ~= "All" then
         return table.clone(ModeChapters[mode] or {})
@@ -2114,6 +2232,20 @@ LobbyTab:Toggle({
     Value = State.AutoJoinMap,
     Callback = function(value)
         State.AutoJoinMap = value == true
+        State.JoinRequested = false
+        QueueSave()
+    end,
+})
+
+LobbyTab:Dropdown({
+    Title = "Modifiers",
+    Values = LobbyModifierValues,
+    Value = State.LobbyModifiers,
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Callback = function(value)
+        State.LobbyModifiers = NormalizeModifierSelection(value)
         State.JoinRequested = false
         QueueSave()
     end,
@@ -2205,6 +2337,13 @@ task.spawn(function()
                     if not ok then
                         State.JoinRequested = false
                         Notify("Auto Join failed", tostring(result))
+                        return
+                    end
+
+                    local modifiersApplied, modifierError = ApplyLobbyModifiers()
+                    if not modifiersApplied then
+                        State.JoinRequested = false
+                        Notify("Auto Join modifiers failed", tostring(modifierError))
                         return
                     end
 
