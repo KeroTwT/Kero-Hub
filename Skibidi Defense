@@ -55,6 +55,7 @@ local State = {
     AutoSkip = false,
     AutoReplay = false,
     AutoSpeed = false,
+    SpeedScaleDelay = 1,
     MovingAround = false,
     AutoJoinMap = false,
     LobbyMode = "Story",
@@ -1400,12 +1401,9 @@ end
 task.spawn(function()
     local lastReady = 0
     local lastSkip = 0
+    local lastSpeed = 0
     local lastRefresh = 0
-    local readyAttempts = 0
-    local readyComplete = false
     local wasMatchReady = false
-    local lastDisplayedSpeed = nil
-    local speedSentWithoutState = false
     local startupSpeedReset = false
     local replayLatched = false
     local restartAfterReplay = false
@@ -1427,18 +1425,12 @@ task.spawn(function()
             State.AutoPlaybackStarted = false
             State.PlaybackFirstActionArmed = false
             State.PlaybackFirstActionDone = false
-            readyAttempts = 0
-            readyComplete = false
             wasMatchReady = false
-            lastDisplayedSpeed = nil
-            speedSentWithoutState = false
+            lastSpeed = 0
             startupSpeedReset = false
         elseif not wasMatchReady then
             wasMatchReady = true
-            readyAttempts = 0
-            readyComplete = false
-            lastDisplayedSpeed = nil
-            speedSentWithoutState = false
+            lastSpeed = 0
             startupSpeedReset = false
         elseif State.PlaybackEnabled
             and not State.AutoPlaybackStarted
@@ -1449,23 +1441,13 @@ task.spawn(function()
             Gui.StartEnabledPlayback()
         end
 
-        -- Send a small, bounded number of ready requests at match initialization.
-        -- This tolerates stale wave text after teleport without spamming for the
-        -- full duration of every match.
-        if readyAttempts >= 3 and GetWave() >= 2 then
-            readyComplete = true
-        elseif readyAttempts >= 12 then
-            readyComplete = true
-        end
+        -- Keep ready enabled for the full match. Some maps recreate their ready
+        -- state after loading; the user-controlled delay keeps these requests bounded.
         if State.AutoReady
-            and macroProfilePrepared
-            and matchReady
             and not ended
-            and not readyComplete
             and Remotes.Ready
             and now - lastReady >= 1 then
             lastReady = now
-            readyAttempts = readyAttempts + 1
             pcall(function() Remotes.Ready:FireServer(true) end)
         end
 
@@ -1500,19 +1482,10 @@ task.spawn(function()
             and macroAutomationReady
             and matchReady
             and Remotes.Speed
-            and not ended then
-            local displayedSpeed = GetDisplayedSpeed()
-            if displayedSpeed then
-                if displayedSpeed ~= lastDisplayedSpeed then
-                    lastDisplayedSpeed = displayedSpeed
-                    if displayedSpeed ~= State.Speed then
-                        ApplySpeed(State.Speed)
-                    end
-                end
-            elseif not speedSentWithoutState then
-                speedSentWithoutState = true
-                ApplySpeed(State.Speed)
-            end
+            and not ended
+            and now - lastSpeed >= State.SpeedScaleDelay then
+            lastSpeed = now
+            ApplySpeed(State.Speed)
         end
 
         if ended and not replayLatched then
@@ -1959,6 +1932,7 @@ State.AutoReplay = Config.AutoReplay == true
 State.AutoReady = Config.AutoReady == true
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
+State.SpeedScaleDelay = math.clamp(tonumber(Config.SpeedScaleDelay or Config.AutoReadyDelay) or 1, 0.5, 10)
 State.MovingAround = Config.MovingAround == true
 State.AutoJoinMap = Config.AutoJoinMap == true
 State.LobbyMode = tostring(Config.LobbyMode or "Story")
@@ -1993,6 +1967,7 @@ local function SaveConfig()
         AutoReady = State.AutoReady,
         AutoSkip = State.AutoSkip,
         AutoSpeed = State.AutoSpeed,
+        SpeedScaleDelay = State.SpeedScaleDelay,
         MovingAround = State.MovingAround,
         AutoJoinMap = State.AutoJoinMap,
         LobbyMode = State.LobbyMode,
@@ -2080,7 +2055,9 @@ local ModeChapters = {
 
 -- Extracted from the client modifier registry/UI using Skibidi_Modifier_Probe.lua.
 -- The server can still reject unavailable, incompatible, or entitlement-gated choices.
-local LobbyModifierValues = {
+local LobbyModifierIds = {
+    "LBRUN",
+    "BPXP",
     "NormalRegen",
     "GodlyRegen",
     "WeakerEnemies",
@@ -2126,8 +2103,32 @@ local LobbyModifierValues = {
 }
 
 local LobbyModifierSet = {}
-for _, modifierName in ipairs(LobbyModifierValues) do
-    LobbyModifierSet[modifierName] = true
+local LobbyModifierDisplayToId = {}
+local LobbyModifierIdToDisplay = {}
+local LobbyModifierValues = {}
+local LobbyModifierSpecialNames = {
+    LBRUN = "Leaderboard Run",
+    BPXP = "Battlepass XP",
+}
+
+local function HumanizeModifierId(modifierId)
+    local specialName = LobbyModifierSpecialNames[modifierId]
+    if specialName then
+        return specialName
+    end
+
+    return modifierId
+        :gsub("(%l)(%u)", "%1 %2")
+        :gsub("(%a)(%d)", "%1 %2")
+        :gsub("(%d)(%a)", "%1 %2")
+end
+
+for _, modifierId in ipairs(LobbyModifierIds) do
+    LobbyModifierSet[modifierId] = true
+    local displayName = string.format("%s [%s]", HumanizeModifierId(modifierId), modifierId)
+    LobbyModifierDisplayToId[displayName] = modifierId
+    LobbyModifierIdToDisplay[modifierId] = displayName
+    table.insert(LobbyModifierValues, displayName)
 end
 
 local function NormalizeModifierSelection(value)
@@ -2144,8 +2145,9 @@ local function NormalizeModifierSelection(value)
             modifierName = item
         end
 
-        if modifierName and LobbyModifierSet[modifierName] then
-            selected[modifierName] = true
+        local modifierId = modifierName and (LobbyModifierDisplayToId[modifierName] or modifierName)
+        if modifierId and LobbyModifierSet[modifierId] then
+            selected[modifierId] = true
         end
     end
     return selected
@@ -2153,9 +2155,19 @@ end
 
 State.LobbyModifiers = NormalizeModifierSelection(State.LobbyModifiers)
 
+local function ModifierSelectionForDropdown(selection)
+    local values = {}
+    for _, modifierId in ipairs(LobbyModifierIds) do
+        if selection[modifierId] == true then
+            table.insert(values, LobbyModifierIdToDisplay[modifierId])
+        end
+    end
+    return values
+end
+
 local function ApplyLobbyModifiers()
     local selected = {}
-    for _, modifierName in ipairs(LobbyModifierValues) do
+    for _, modifierName in ipairs(LobbyModifierIds) do
         if State.LobbyModifiers[modifierName] == true then
             table.insert(selected, modifierName)
         end
@@ -2263,7 +2275,7 @@ LobbyTab:Toggle({
 LobbyTab:Dropdown({
     Title = "Modifiers",
     Values = LobbyModifierValues,
-    Value = State.LobbyModifiers,
+    Value = ModifierSelectionForDropdown(State.LobbyModifiers),
     Multi = true,
     AllowNone = true,
     SearchBarEnabled = true,
@@ -2644,6 +2656,20 @@ MiscTab:Dropdown({
         local speed = tonumber(tostring(value):match("%d+")) or 1
         State.Speed = math.clamp(speed, 1, 6)
         if State.AutoSpeed then ApplySpeed(State.Speed) end
+        QueueSave()
+    end,
+})
+MiscTab:Slider({
+    Title = "Speed Scale Delay",
+    Desc = "Seconds between repeated speed requests",
+    Step = 0.5,
+    Value = {
+        Min = 0.5,
+        Max = 10,
+        Default = State.SpeedScaleDelay,
+    },
+    Callback = function(value)
+        State.SpeedScaleDelay = math.clamp(tonumber(value) or 1, 0.5, 10)
         QueueSave()
     end,
 })
