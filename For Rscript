@@ -1378,7 +1378,7 @@ end
 task.spawn(function()
     local lastReady = 0
     local lastSkip = 0
-    local lastSpeed = 0
+    local speedReadySince = nil
     local lastRefresh = 0
     local wasMatchReady = false
     local startupSpeedReset = false
@@ -1403,11 +1403,11 @@ task.spawn(function()
             State.PlaybackFirstActionArmed = false
             State.PlaybackFirstActionDone = false
             wasMatchReady = false
-            lastSpeed = 0
+            speedReadySince = nil
             startupSpeedReset = false
         elseif not wasMatchReady then
             wasMatchReady = true
-            lastSpeed = 0
+            speedReadySince = nil
             startupSpeedReset = false
         elseif State.PlaybackEnabled
             and not State.AutoPlaybackStarted
@@ -1455,14 +1455,21 @@ task.spawn(function()
             pcall(function() Remotes.Skip:FireServer(true) end)
         end
 
-        if State.AutoSpeed
+        local speedEligible = State.AutoSpeed
             and macroAutomationReady
             and matchReady
             and Remotes.Speed
             and not ended
-            and now - lastSpeed >= State.SpeedScaleDelay then
-            lastSpeed = now
-            ApplySpeed(State.Speed)
+
+        if speedEligible then
+            if speedReadySince == nil then
+                speedReadySince = now
+            elseif now - speedReadySince >= State.SpeedScaleDelay then
+                speedReadySince = now
+                ApplySpeed(State.Speed)
+            end
+        else
+            speedReadySince = nil
         end
 
         if ended and not replayLatched then
@@ -2620,7 +2627,6 @@ MiscTab:Toggle({
     Value = State.AutoSpeed,
     Callback = function(value)
         State.AutoSpeed = value == true
-        if State.AutoSpeed then ApplySpeed(State.Speed) end
         QueueSave()
     end,
 })
@@ -2632,7 +2638,6 @@ MiscTab:Dropdown({
     Callback = function(value)
         local speed = tonumber(tostring(value):match("%d+")) or 1
         State.Speed = math.clamp(speed, 1, 6)
-        if State.AutoSpeed then ApplySpeed(State.Speed) end
         QueueSave()
     end,
 })
