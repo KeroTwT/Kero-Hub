@@ -256,6 +256,15 @@ local function GetTowerName(tower)
 end
 
 local VariantSuffixes = { " Gold", " Rainbow", " Shiny", " Void" }
+local function DetectUnitVariant(unitName, recordedVariant)
+    local explicit = tostring(recordedVariant or "")
+    if explicit ~= "" then return explicit end
+    local name = tostring(unitName or "")
+    if name:sub(-5) == " Gold" or name:sub(-6) == " Shiny" then return "Shiny" end
+    if name:sub(-8) == " Rainbow" or name:sub(-5) == " Void" then return "Void" end
+    return "Normal"
+end
+
 local function ResolveBaseUnitName(unitName, recordedBaseUnit)
     local explicit = tostring(recordedBaseUnit or "")
     if explicit ~= "" then return explicit end
@@ -459,6 +468,7 @@ local function LoadProfile(name)
     for _, action in ipairs(decoded.Actions) do
         if action.Type == "Place" or action.Type == "Upgrade" then
             action.BaseUnit = ResolveBaseUnitName(action.Unit, action.BaseUnit)
+            action.Variant = DetectUnitVariant(action.Unit, action.Variant)
         end
     end
     State.Actions = decoded.Actions
@@ -527,6 +537,7 @@ local function AttachTower(tower, recordPlacement)
             Handle = handle,
             Unit = variantUnit,
             BaseUnit = ResolveBaseUnitName(variantUnit),
+            Variant = DetectUnitVariant(variantUnit),
             Cost = GetTowerCost(tower),
             CFrame = CFrameToArray(cframe),
         })
@@ -546,6 +557,7 @@ local function AttachTower(tower, recordPlacement)
                         Handle = meta.Handle,
                         Unit = GetTowerName(tower),
                         BaseUnit = ResolveBaseUnitName(GetTowerName(tower)),
+                        Variant = DetectUnitVariant(GetTowerName(tower)),
                         PreviousLevel = expected - 1,
                         Level = expected,
                         Cost = meta.NextPrice,
@@ -834,13 +846,26 @@ local function ExecuteAction(action)
         if TowersFolder then
             for _, tower in ipairs(TowersFolder:GetChildren()) do before[tower] = true end
         end
-        local ok, accepted = Invoke(Remotes.Request, { baseUnit, variantUnit }, false, true)
+        local ok, accepted, placementMetadata = Invoke(
+            Remotes.Request,
+            { variantUnit, baseUnit },
+            false,
+            true
+        )
         local reason = accepted
         if not ok then return false, "RequestTower: " .. tostring(reason) end
         if accepted == false then return false, "RequestTower was rejected" end
+        if type(placementMetadata) ~= "table" then placementMetadata = {} end
         task.wait(0.05)
         local spawned
-        ok, spawned = Invoke(Remotes.Place, baseUnit, cframe, false, variantUnit, {})
+        ok, spawned = Invoke(
+            Remotes.Place,
+            baseUnit,
+            cframe,
+            false,
+            variantUnit,
+            placementMetadata
+        )
         reason = spawned
         if not ok then return false, "SpawnTower: " .. tostring(reason) end
         if spawned == false then return false, "SpawnTower was rejected" end
@@ -873,8 +898,7 @@ local function ExecuteAction(action)
             return false, string.format("Upgrade order mismatch: level %d cannot become %d", oldLevel, expectedLevel)
         end
         local variantUnit = tostring(action.Unit or GetTowerName(tower))
-        local baseUnit = ResolveBaseUnitName(variantUnit, action.BaseUnit)
-        local ok, accepted = Invoke(Remotes.Upgrade, tower, baseUnit)
+        local ok, accepted = Invoke(Remotes.Upgrade, tower, variantUnit)
         if not ok then return false, "UpgradeTower: " .. tostring(accepted) end
         if accepted == false then return false, "UpgradeTower was rejected" end
         local confirmed = WaitUntil(function()
