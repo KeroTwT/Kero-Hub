@@ -40,6 +40,9 @@ local State = {
     AutoVoteMap = false,
     AutoVoteComplication = false,
     EndAction = "None",
+    WebhookEnabled = false,
+    WebhookURL = "",
+    WebhookMatchEnd = true,
     SelectedMap = "Base",
     Complication = "Normal",
     FirstPlaybackActionDone = false,
@@ -148,13 +151,17 @@ local function IsMatchActive()
     return IsGameRunning() and GetWave() >= 1
 end
 
-local function IsEndScreenVisible()
+local function GetEndScreen()
     local player = Players.LocalPlayer or LocalPlayer
-    if not player then return false end
+    if not player then return nil end
     LocalPlayer = player
     local playerGui = player:FindFirstChildOfClass("PlayerGui")
     local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
-    local endScreen = gameGui and gameGui:FindFirstChild("EndScreen")
+    return gameGui and gameGui:FindFirstChild("EndScreen")
+end
+
+local function IsEndScreenVisible()
+    local endScreen = GetEndScreen()
     if not endScreen then return false end
     if endScreen:IsA("LayerCollector") then return endScreen.Enabled end
     if endScreen:IsA("GuiObject") then return endScreen.Visible end
@@ -164,6 +171,56 @@ end
 local function GetMatchMessage()
     RefreshObjects()
     return tostring(GetValue(InfoFolder, "Message", ""))
+end
+
+local function GetMatchResultText()
+    local endScreen = GetEndScreen()
+    local candidates = endScreen and endScreen:GetDescendants() or {}
+    if endScreen then table.insert(candidates, 1, endScreen) end
+
+    for _, object in ipairs(candidates) do
+        if object:IsA("TextLabel") or object:IsA("TextButton") then
+            local text = string.lower(tostring(object.Text or ""))
+            if text:find("victory", 1, true) or text:find("you won", 1, true) then
+                return "Victory"
+            end
+        end
+    end
+    for _, object in ipairs(candidates) do
+        if object:IsA("TextLabel") or object:IsA("TextButton") then
+            local text = string.lower(tostring(object.Text or ""))
+            if text:find("defeat", 1, true) or text:find("game over", 1, true) then
+                return "Defeat"
+            end
+        end
+    end
+
+    local message = string.lower(GetMatchMessage())
+    if message:find("victory", 1, true) then return "Victory" end
+    if message:find("defeat", 1, true) then return "Defeat" end
+    return "Match Ended"
+end
+
+local function GetBaseHealthText()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
+    local info = gameGui and gameGui:FindFirstChild("Info")
+    local health = info and info:FindFirstChild("Health")
+    local title = health and health:FindFirstChild("Title")
+    if title and (title:IsA("TextLabel") or title:IsA("TextButton")) then
+        local text = tostring(title.Text or "")
+        if text ~= "" then return text end
+    end
+    return "Unknown"
+end
+
+local function GetCurrentStageText()
+    RefreshObjects()
+    local mapName = tostring(GetValue(InfoFolder, "Mode", ""))
+    local complication = tostring(GetValue(InfoFolder, "Complication", ""))
+    if mapName == "" then mapName = State.SelectedMap end
+    if complication == "" then complication = State.Complication end
+    return string.format("%s (%s)", mapName, complication)
 end
 
 local function GetSpeed()
@@ -579,6 +636,117 @@ local function Fire(remote, ...)
     return ok, reason
 end
 
+local function IsDiscordWebhookURL(value)
+    local url = tostring(value or "")
+    return url:match("^https://discord%.com/api/webhooks/") ~= nil
+        or url:match("^https://discordapp%.com/api/webhooks/") ~= nil
+end
+
+local function GetRequestFunction()
+    return http_request or request or (syn and syn.request) or (fluxus and fluxus.request)
+end
+
+local function SendDiscordWebhook(title, description, color, fields, imageURL, footerIconURL)
+    if not State.WebhookEnabled then
+        return false, "Webhook is disabled"
+    end
+    if not IsDiscordWebhookURL(State.WebhookURL) then
+        return false, "Enter a valid Discord webhook URL"
+    end
+
+    local requestFunction = GetRequestFunction()
+    if type(requestFunction) ~= "function" then
+        return false, "This executor does not support HTTP requests"
+    end
+
+    local embed = {
+        title = tostring(title or "Slop TD Hub"),
+        description = tostring(description or ""),
+        color = tonumber(color) or 5793266,
+        fields = type(fields) == "table" and fields or nil,
+        footer = {
+            text = "Made By Kero",
+            icon_url = footerIconURL,
+        },
+        timestamp = DateTime.now():ToIsoDate(),
+    }
+    if imageURL and imageURL ~= "" then
+        embed.image = { url = imageURL }
+    end
+    local payload = {
+        username = "Slop TD Hub",
+        embeds = { embed },
+    }
+    local ok, response = pcall(function()
+        return requestFunction({
+            Url = State.WebhookURL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+    if not ok then return false, tostring(response) end
+
+    if type(response) == "table" then
+        local statusCode = tonumber(response.StatusCode or response.Status)
+        if response.Success == false or (statusCode and (statusCode < 200 or statusCode >= 300)) then
+            return false, "Discord returned HTTP " .. tostring(statusCode or "error")
+        end
+    end
+    return true
+end
+
+local function SendMatchEndWebhook()
+    if not State.WebhookEnabled or not State.WebhookMatchEnd then
+        return false, "Match notifications are disabled"
+    end
+
+    local result = GetMatchResultText()
+    local color = result == "Victory" and 65280
+        or result == "Defeat" and 16711680
+        or 16776960
+    local player = Players.LocalPlayer or LocalPlayer
+    local nextAction = State.EndAction == "None" and "Wait" or State.EndAction
+    local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
+    local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
+    local fields = {
+        {
+            name = "Player Info",
+            value = string.format(
+                "👤 Name: ||%s||\n💰 Money: %s\n❤️ Base HP: %s",
+                player and player.Name or "Unknown",
+                tostring(GetCash()),
+                GetBaseHealthText()
+            ),
+            inline = false,
+        },
+        {
+            name = "Match Details",
+            value = string.format(
+                "🌊 Wave: %s\n⚙️ Macro: %s\n🔄 Match: %s\n⏭️ Next: %s",
+                tostring(GetWave()),
+                State.ProfileName ~= "" and State.ProfileName or "None",
+                tostring(math.max(State.MatchSerial, 1)),
+                nextAction
+            ),
+            inline = false,
+        },
+    }
+    local description = string.format(
+        "**Stage:** %s\n**Result:** %s",
+        GetCurrentStageText(),
+        result
+    )
+    return SendDiscordWebhook(
+        "Slop TD Match Report",
+        description,
+        color,
+        fields,
+        mainImage,
+        footerIcon
+    )
+end
+
 local function WaitForActionGate(action, playbackStarted)
     local timeout = os.clock() + 600
     while State.Playing and State.Running and os.clock() < timeout do
@@ -781,6 +949,9 @@ end
 State.EndAction = configuredEndAction
 State.SelectedMap = tostring(Config.SelectedMap or "Base")
 State.Complication = tostring(Config.Complication or "Normal")
+State.WebhookEnabled = Config.WebhookEnabled == true
+State.WebhookURL = tostring(Config.WebhookURL or "")
+State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
 
 local saveQueued = false
 local function SaveConfig()
@@ -798,6 +969,9 @@ local function SaveConfig()
         EndAction = State.EndAction,
         SelectedMap = State.SelectedMap,
         Complication = State.Complication,
+        WebhookEnabled = State.WebhookEnabled,
+        WebhookURL = State.WebhookURL,
+        WebhookMatchEnd = State.WebhookMatchEnd,
     }
     pcall(function()
         writefile(ConfigFile, HttpService:JSONEncode(payload))
@@ -860,6 +1034,7 @@ end
 local MatchTab = Window:Tab({ Title = "Match", Icon = "map" })
 local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
+local WebhookTab = Window:Tab({ Title = "Webhook", Icon = "webhook" })
 
 MatchTab:Section({ Title = "Pre-match Vote" })
 local MapValues = {
@@ -919,6 +1094,51 @@ MatchTab:Dropdown({
         value = tostring(value)
         State.EndAction = validEndActions[value] and value or "None"
         QueueSave()
+    end,
+})
+
+WebhookTab:Section({ Title = "Discord Webhook" })
+WebhookTab:Input({
+    Title = "Webhook URL",
+    Placeholder = "https://discord.com/api/webhooks/...",
+    Value = State.WebhookURL,
+    Callback = function(value)
+        State.WebhookURL = tostring(value or "")
+        QueueSave()
+    end,
+})
+WebhookTab:Toggle({
+    Title = "Enable Webhook",
+    Value = State.WebhookEnabled,
+    Callback = function(value)
+        State.WebhookEnabled = value == true
+        QueueSave()
+    end,
+})
+WebhookTab:Toggle({
+    Title = "Notify On Match End",
+    Value = State.WebhookMatchEnd,
+    Callback = function(value)
+        State.WebhookMatchEnd = value == true
+        QueueSave()
+    end,
+})
+WebhookTab:Button({
+    Title = "Send Test Webhook",
+    Icon = "send",
+    Callback = function()
+        task.spawn(function()
+            local ok, reason = SendDiscordWebhook(
+                "Webhook Test",
+                "Slop TD Hub webhook is working.",
+                5763719
+            )
+            if ok then
+                Notify("Webhook", "Test message sent")
+            else
+                Notify("Webhook failed", tostring(reason))
+            end
+        end)
     end,
 })
 
@@ -1084,6 +1304,7 @@ MiscTab:Dropdown({
 })
 
 local lastMatchActive = IsMatchActive()
+if lastMatchActive then State.MatchSerial = 1 end
 local lastMapVoting = IsMapVoting()
 local lastComplicationVoting = IsComplicationVoting()
 local votedMap = false
@@ -1094,6 +1315,9 @@ local matchEndedAt
 local endScreenVisible = IsEndScreenVisible()
 local endScreenShownAt = endScreenVisible and os.clock() or nil
 local endActionSent = false
+local webhookSent = false
+local webhookPending = false
+local webhookStartedAt = 0
 task.spawn(function()
     while State.Running do
         RefreshObjects()
@@ -1120,9 +1344,13 @@ task.spawn(function()
         if currentEndScreenVisible and not endScreenVisible then
             endScreenShownAt = os.clock()
             endActionSent = false
+            webhookSent = false
+            webhookPending = false
         elseif not currentEndScreenVisible then
             endScreenShownAt = nil
             endActionSent = false
+            webhookSent = false
+            webhookPending = false
         elseif not endScreenShownAt then
             endScreenShownAt = matchEndedAt or os.clock()
         end
@@ -1165,8 +1393,23 @@ task.spawn(function()
             votedComplication = ok
         end
 
+        if currentEndScreenVisible and State.WebhookEnabled
+            and State.WebhookMatchEnd and not webhookSent then
+            webhookSent = true
+            webhookPending = true
+            webhookStartedAt = os.clock()
+            task.spawn(function()
+                local ok, reason = SendMatchEndWebhook()
+                webhookPending = false
+                if not ok and State.Running then
+                    SetStatus("Webhook failed", tostring(reason))
+                end
+            end)
+        end
+
         if State.EndAction ~= "None" and endScreenShownAt and not endActionSent
-            and os.clock() - endScreenShownAt >= 1.5 then
+            and os.clock() - endScreenShownAt >= 1.5
+            and (not webhookPending or os.clock() - webhookStartedAt >= 5) then
             local ok, reason
             if State.EndAction == "Replay" then
                 ok, reason = Fire(Remotes.EndDecision, true)
