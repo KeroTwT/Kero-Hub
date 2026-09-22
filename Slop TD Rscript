@@ -255,6 +255,27 @@ local function GetTowerName(tower)
     return tostring((tower and tower:GetAttribute("ID")) or (tower and tower.Name) or "")
 end
 
+local VariantSuffixes = { " Gold", " Rainbow", " Shiny", " Void" }
+local function ResolveBaseUnitName(unitName, recordedBaseUnit)
+    local explicit = tostring(recordedBaseUnit or "")
+    if explicit ~= "" then return explicit end
+
+    local variant = tostring(unitName or "")
+    local templates = ReplicatedStorage:FindFirstChild("Towers")
+    if templates and templates:FindFirstChild(variant) then
+        return variant
+    end
+    for _, suffix in ipairs(VariantSuffixes) do
+        if variant:sub(-#suffix) == suffix then
+            local candidate = variant:sub(1, #variant - #suffix)
+            if candidate ~= "" and (not templates or templates:FindFirstChild(candidate)) then
+                return candidate
+            end
+        end
+    end
+    return variant
+end
+
 local function GetTowerLevel(tower)
     return tonumber(GetValue(GetConfig(tower), "LVL", 0)) or 0
 end
@@ -393,7 +414,7 @@ local function SaveProfile(name)
     local valid, validationReason = ValidateActions(State.Actions)
     if not valid then return false, validationReason end
     local payload = {
-        Version = 2,
+        Version = 3,
         Game = "Slop TD",
         PlaceId = game.PlaceId,
         Name = name,
@@ -435,6 +456,11 @@ local function LoadProfile(name)
         end
     end
     if not decoded then return false, lastReason end
+    for _, action in ipairs(decoded.Actions) do
+        if action.Type == "Place" or action.Type == "Upgrade" then
+            action.BaseUnit = ResolveBaseUnitName(action.Unit, action.BaseUnit)
+        end
+    end
     State.Actions = decoded.Actions
     State.ProfileName = name
     return true
@@ -495,10 +521,12 @@ local function AttachTower(tower, recordPlacement)
     State.TowerMeta[tower] = meta
 
     if recordPlacement and State.Recording and cframe then
+        local variantUnit = GetTowerName(tower)
         AddAction({
             Type = "Place",
             Handle = handle,
-            Unit = GetTowerName(tower),
+            Unit = variantUnit,
+            BaseUnit = ResolveBaseUnitName(variantUnit),
             Cost = GetTowerCost(tower),
             CFrame = CFrameToArray(cframe),
         })
@@ -517,6 +545,7 @@ local function AttachTower(tower, recordPlacement)
                         Type = "Upgrade",
                         Handle = meta.Handle,
                         Unit = GetTowerName(tower),
+                        BaseUnit = ResolveBaseUnitName(GetTowerName(tower)),
                         PreviousLevel = expected - 1,
                         Level = expected,
                         Cost = meta.NextPrice,
@@ -798,24 +827,27 @@ local function ExecuteAction(action)
     if kind == "Place" then
         local cframe = ArrayToCFrame(action.CFrame)
         if not cframe then return false, "Invalid placement CFrame" end
+        local variantUnit = tostring(action.Unit or "")
+        local baseUnit = ResolveBaseUnitName(variantUnit, action.BaseUnit)
+        if baseUnit == "" or variantUnit == "" then return false, "Invalid unit identity" end
         local before = {}
         if TowersFolder then
             for _, tower in ipairs(TowersFolder:GetChildren()) do before[tower] = true end
         end
-        local ok, accepted = Invoke(Remotes.Request, { action.Unit, action.Unit }, false, true)
+        local ok, accepted = Invoke(Remotes.Request, { baseUnit, variantUnit }, false, true)
         local reason = accepted
         if not ok then return false, "RequestTower: " .. tostring(reason) end
         if accepted == false then return false, "RequestTower was rejected" end
         task.wait(0.05)
         local spawned
-        ok, spawned = Invoke(Remotes.Place, action.Unit, cframe, false, action.Unit, {})
+        ok, spawned = Invoke(Remotes.Place, baseUnit, cframe, false, variantUnit, {})
         reason = spawned
         if not ok then return false, "SpawnTower: " .. tostring(reason) end
         if spawned == false then return false, "SpawnTower was rejected" end
         local tower = typeof(spawned) == "Instance" and spawned or nil
         if not tower or not tower.Parent or not IsOwnTower(tower) then
             local mappingReason
-            tower, mappingReason = FindNewTower(before, tostring(action.Unit), cframe)
+            tower, mappingReason = FindNewTower(before, variantUnit, cframe)
             if mappingReason then return false, mappingReason end
         end
         if not tower then return false, "Server did not create the placed tower" end
@@ -840,7 +872,9 @@ local function ExecuteAction(action)
         if expectedLevel ~= oldLevel + 1 then
             return false, string.format("Upgrade order mismatch: level %d cannot become %d", oldLevel, expectedLevel)
         end
-        local ok, accepted = Invoke(Remotes.Upgrade, tower, action.Unit or GetTowerName(tower))
+        local variantUnit = tostring(action.Unit or GetTowerName(tower))
+        local baseUnit = ResolveBaseUnitName(variantUnit, action.BaseUnit)
+        local ok, accepted = Invoke(Remotes.Upgrade, tower, baseUnit)
         if not ok then return false, "UpgradeTower: " .. tostring(accepted) end
         if accepted == false then return false, "UpgradeTower was rejected" end
         local confirmed = WaitUntil(function()
