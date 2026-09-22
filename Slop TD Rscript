@@ -1201,6 +1201,7 @@ MatchTab:Dropdown({
     Values = MapValues,
     Value = State.SelectedMap,
     Multi = false,
+    SearchBarEnabled = true,
     Callback = function(value)
         State.SelectedMap = tostring(value)
         QueueSave()
