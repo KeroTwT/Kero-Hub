@@ -1399,6 +1399,26 @@ local endActionSent = false
 local webhookSent = false
 local webhookPending = false
 local webhookStartedAt = 0
+local recordingFinalizePending = false
+local function FinalizeRecordingAtMatchEnd()
+    if not State.Recording or recordingFinalizePending then return end
+    recordingFinalizePending = true
+    task.spawn(function()
+        -- Let any final replicated tower changes already queued this frame reach the recorder.
+        task.wait(0.2)
+        if State.Recording then
+            local ok, reason = StopRecording(true)
+            SetToggle(recordToggle, false)
+            if ok then
+                RefreshProfiles(State.ProfileName)
+                Notify("Macro saved", string.format("%s | %d actions", State.ProfileName, #State.Actions))
+            else
+                Notify("Auto-save failed", tostring(reason))
+            end
+        end
+        recordingFinalizePending = false
+    end)
+end
 task.spawn(function()
     while State.Running do
         RefreshObjects()
@@ -1434,6 +1454,9 @@ task.spawn(function()
             webhookPending = false
         elseif not endScreenShownAt then
             endScreenShownAt = matchEndedAt or os.clock()
+        end
+        if currentEndScreenVisible then
+            FinalizeRecordingAtMatchEnd()
         end
         endScreenVisible = currentEndScreenVisible
         lastMatchActive = active
