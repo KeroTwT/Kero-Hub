@@ -43,6 +43,12 @@ local State = {
     WebhookEnabled = false,
     WebhookURL = "",
     WebhookMatchEnd = true,
+    AutoLobby = false,
+    LobbyPlayers = 1,
+    AutoSummon = false,
+    SummonCurrency = "Cash",
+    SummonAmount = 10,
+    SummonDelay = 1.5,
     SelectedMap = "Base",
     Complication = "Normal",
     FirstPlaybackActionDone = false,
@@ -99,6 +105,8 @@ end
 local function RefreshObjects()
     local functions = ReplicatedStorage:FindFirstChild("Functions")
     local events = ReplicatedStorage:FindFirstChild("Events")
+    local remoteRoot = ReplicatedStorage:FindFirstChild("Remotes")
+    local summon = remoteRoot and remoteRoot:FindFirstChild("Summon")
     Remotes.Request = functions and functions:FindFirstChild("RequestTower")
     Remotes.Place = functions and functions:FindFirstChild("SpawnTower")
     Remotes.Upgrade = functions and functions:FindFirstChild("UpgradeTower")
@@ -110,6 +118,11 @@ local function RefreshObjects()
     Remotes.VoteComplication = events and events:FindFirstChild("VoteForComplication")
     Remotes.EndDecision = events and events:FindFirstChild("EndDecision")
     Remotes.ExitGame = events and events:FindFirstChild("ExitGame")
+    Remotes.EnterElevator = events and events:FindFirstChild("EnterElevator")
+    Remotes.LeaveElevator = events and events:FindFirstChild("LeaveElevator")
+    Remotes.StartElevator = events and events:FindFirstChild("StartElevator")
+    Remotes.Summon = summon and summon:FindFirstChild("Summon")
+    Remotes.SummonPremium = summon and summon:FindFirstChild("SummonPremium")
     TowersFolder = Workspace:FindFirstChild("Towers")
     InfoFolder = Workspace:FindFirstChild("Info")
 end
@@ -1010,6 +1023,13 @@ State.Complication = tostring(Config.Complication or "Normal")
 State.WebhookEnabled = Config.WebhookEnabled == true
 State.WebhookURL = tostring(Config.WebhookURL or "")
 State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
+State.AutoLobby = Config.AutoLobby == true
+State.LobbyPlayers = math.clamp(tonumber(Config.LobbyPlayers) or 1, 1, 4)
+State.AutoSummon = Config.AutoSummon == true
+State.SummonCurrency = Config.SummonCurrency == "Gem" and "Gem" or "Cash"
+State.SummonAmount = table.find({ 1, 10, 50 }, tonumber(Config.SummonAmount))
+    and tonumber(Config.SummonAmount) or 10
+State.SummonDelay = math.clamp(tonumber(Config.SummonDelay) or 1.5, 0.5, 10)
 
 local saveQueued = false
 local function SaveConfig()
@@ -1030,6 +1050,12 @@ local function SaveConfig()
         WebhookEnabled = State.WebhookEnabled,
         WebhookURL = State.WebhookURL,
         WebhookMatchEnd = State.WebhookMatchEnd,
+        AutoLobby = State.AutoLobby,
+        LobbyPlayers = State.LobbyPlayers,
+        AutoSummon = State.AutoSummon,
+        SummonCurrency = State.SummonCurrency,
+        SummonAmount = State.SummonAmount,
+        SummonDelay = State.SummonDelay,
     }
     pcall(function()
         writefile(ConfigFile, HttpService:JSONEncode(payload))
@@ -1089,10 +1115,76 @@ local function WrapParagraph(element)
     return wrapper
 end
 
+local LobbyTab = Window:Tab({ Title = "Lobby", Icon = "door-open" })
 local MatchTab = Window:Tab({ Title = "Match", Icon = "map" })
 local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
 local MiscTab = Window:Tab({ Title = "Misc", Icon = "settings" })
 local WebhookTab = Window:Tab({ Title = "Webhook", Icon = "webhook" })
+
+LobbyTab:Section({ Title = "Play" })
+Gui.LobbyStatus = WrapParagraph(LobbyTab:Paragraph({
+    Title = "Lobby automation",
+    Desc = "Waiting",
+}))
+LobbyTab:Dropdown({
+    Title = "Players",
+    Values = { "1 Player", "2 Players", "3 Players", "4 Players" },
+    Value = tostring(State.LobbyPlayers) .. (State.LobbyPlayers == 1 and " Player" or " Players"),
+    Multi = false,
+    Callback = function(value)
+        State.LobbyPlayers = math.clamp(tonumber(tostring(value):match("%d+")) or 1, 1, 4)
+        QueueSave()
+    end,
+})
+LobbyTab:Toggle({
+    Title = "Auto Join & Start",
+    Value = State.AutoLobby,
+    Callback = function(value)
+        State.AutoLobby = value == true
+        QueueSave()
+    end,
+})
+
+LobbyTab:Section({ Title = "Auto Summon" })
+LobbyTab:Dropdown({
+    Title = "Currency",
+    Values = { "Cash", "Gem" },
+    Value = State.SummonCurrency,
+    Multi = false,
+    Callback = function(value)
+        State.SummonCurrency = tostring(value) == "Gem" and "Gem" or "Cash"
+        QueueSave()
+    end,
+})
+LobbyTab:Dropdown({
+    Title = "Amount",
+    Desc = "Cash/Gem: x1, x10 or x50",
+    Values = { "x1", "x10", "x50" },
+    Value = "x" .. tostring(State.SummonAmount),
+    Multi = false,
+    Callback = function(value)
+        State.SummonAmount = tonumber(tostring(value):match("%d+")) or 10
+        QueueSave()
+    end,
+})
+LobbyTab:Slider({
+    Title = "Summon Delay",
+    Step = 0.5,
+    Value = { Min = 0.5, Max = 10, Default = State.SummonDelay },
+    Callback = function(value)
+        State.SummonDelay = math.clamp(tonumber(value) or 1.5, 0.5, 10)
+        QueueSave()
+    end,
+})
+local autoSummonToggle
+autoSummonToggle = LobbyTab:Toggle({
+    Title = "Auto Summon",
+    Value = State.AutoSummon,
+    Callback = function(value)
+        State.AutoSummon = value == true
+        QueueSave()
+    end,
+})
 
 MatchTab:Section({ Title = "Pre-match Vote" })
 local MapValues = {
@@ -1360,6 +1452,187 @@ MiscTab:Dropdown({
         QueueSave()
     end,
 })
+
+local LobbyPlaceId = 134459712190924
+local ElevatorByPlayers = {
+    [1] = "Elevator6",
+    [2] = "Elevator5",
+    [3] = "Elevator8",
+    [4] = "Elevator7",
+}
+
+local function ResolvePlayElevator(playerCount)
+    local elevators = Workspace:FindFirstChild("Elevators")
+    if elevators then
+        for _, elevator in ipairs(elevators:GetChildren()) do
+            local maxPlayers = tonumber(elevator:GetAttribute("MaxPlayers"))
+            local isRaid = tostring(elevator:GetAttribute("IsRaid")):lower() == "true"
+            if elevator:IsA("Model") and maxPlayers == playerCount and not isRaid then
+                return elevator.Name
+            end
+        end
+    end
+    return ElevatorByPlayers[playerCount]
+end
+
+local function GetElevatorStandPosition(elevator)
+    if not elevator then return nil end
+    local bestPart
+    local bestScore = -math.huge
+    for _, object in ipairs(elevator:GetDescendants()) do
+        if object:IsA("BasePart") then
+            local size = object.Size
+            local cframe = object.CFrame
+            local worldX = math.abs(cframe.RightVector.X) * size.X
+                + math.abs(cframe.UpVector.X) * size.Y
+                + math.abs(cframe.LookVector.X) * size.Z
+            local worldY = math.abs(cframe.RightVector.Y) * size.X
+                + math.abs(cframe.UpVector.Y) * size.Y
+                + math.abs(cframe.LookVector.Y) * size.Z
+            local worldZ = math.abs(cframe.RightVector.Z) * size.X
+                + math.abs(cframe.UpVector.Z) * size.Y
+                + math.abs(cframe.LookVector.Z) * size.Z
+            local score = (worldX * worldZ) / math.max(worldY, 0.2)
+            local lowerName = object.Name:lower()
+            if lowerName:find("pad", 1, true) or lowerName:find("circle", 1, true)
+                or lowerName:find("teleport", 1, true) or lowerName:find("floor", 1, true) then
+                score = score * 4
+            end
+            if score > bestScore then
+                bestScore = score
+                bestPart = object
+            end
+        end
+    end
+    if bestPart then
+        local size = bestPart.Size
+        local cframe = bestPart.CFrame
+        local worldY = math.abs(cframe.RightVector.Y) * size.X
+            + math.abs(cframe.UpVector.Y) * size.Y
+            + math.abs(cframe.LookVector.Y) * size.Z
+        return bestPart.Position + Vector3.new(0, worldY * 0.5 + 3, 0)
+    end
+    local boxCFrame, boxSize = elevator:GetBoundingBox()
+    return Vector3.new(
+        elevator:GetPivot().Position.X,
+        boxCFrame.Position.Y - boxSize.Y * 0.5 + 3,
+        elevator:GetPivot().Position.Z
+    )
+end
+
+local function MoveIntoElevator(elevator)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local position = GetElevatorStandPosition(elevator)
+    if not root or not position then return false end
+    root.CFrame = CFrame.new(position) * root.CFrame.Rotation
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    return true, position
+end
+
+local function IsPlayerInElevator(elevator)
+    if not elevator then return false end
+    local ids = tostring(elevator:GetAttribute("PlayerUserIds") or "")
+    return (tonumber(elevator:GetAttribute("Players")) or 0) > 0
+        and ids:find(tostring(LocalPlayer.UserId), 1, true) ~= nil
+end
+
+local function SetLobbyStatus(title, description)
+    if not Gui.LobbyStatus then return end
+    Gui.LobbyStatus:SetTitle(title)
+    Gui.LobbyStatus:SetDesc(description)
+end
+
+local lobbyAttemptKey
+task.spawn(function()
+    while State.Running do
+        RefreshObjects()
+        if game.PlaceId == LobbyPlaceId and State.AutoLobby then
+            local elevatorName = ResolvePlayElevator(State.LobbyPlayers)
+            local attemptKey = elevatorName .. ":" .. tostring(State.AutoLobby)
+            if not Remotes.EnterElevator or not Remotes.StartElevator then
+                SetLobbyStatus("Lobby automation", "Waiting for elevator remotes")
+            elseif lobbyAttemptKey ~= attemptKey then
+                lobbyAttemptKey = attemptKey
+                local elevators = Workspace:FindFirstChild("Elevators")
+                local elevator = elevators and elevators:FindFirstChild(elevatorName)
+                SetLobbyStatus("Moving into " .. elevatorName, tostring(State.LobbyPlayers) .. " player slot")
+                local moved, standPosition = MoveIntoElevator(elevator)
+                if not moved then
+                    SetLobbyStatus("Move failed", "Character or elevator pad is unavailable")
+                else
+                    task.wait(0.75)
+                    local fired, reason = true, nil
+                    if not IsPlayerInElevator(elevator) then
+                        fired, reason = Fire(Remotes.EnterElevator, elevatorName)
+                    end
+                    if not fired then
+                        SetLobbyStatus("Join failed", tostring(reason))
+                    else
+                        local joined = WaitUntil(function()
+                            local character = LocalPlayer.Character
+                            local root = character and character:FindFirstChild("HumanoidRootPart")
+                            if root and standPosition and (root.Position - standPosition).Magnitude > 3 then
+                                root.CFrame = CFrame.new(standPosition) * root.CFrame.Rotation
+                                root.AssemblyLinearVelocity = Vector3.zero
+                            end
+                            return IsPlayerInElevator(elevator)
+                        end, 4, 0.08)
+                        if joined then
+                            SetLobbyStatus("Joined", "Starting " .. elevatorName)
+                            task.wait(0.35)
+                            MoveIntoElevator(elevator)
+                            local started, startReason = Fire(Remotes.StartElevator, elevatorName)
+                            if started then
+                                SetLobbyStatus("Start sent", "Waiting for teleport")
+                            else
+                                SetLobbyStatus("Start failed", tostring(startReason))
+                            end
+                        else
+                            SetLobbyStatus("Join not confirmed", "No retry was sent")
+                        end
+                    end
+                end
+            end
+        else
+            lobbyAttemptKey = nil
+        end
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    while State.Running do
+        RefreshObjects()
+        if game.PlaceId == LobbyPlaceId and State.AutoSummon then
+            local amount = State.SummonAmount
+            local remote = State.SummonCurrency == "Gem"
+                and Remotes.SummonPremium or Remotes.Summon
+            if not remote then
+                SetLobbyStatus("Auto Summon", "Waiting for summon remote")
+                task.wait(0.5)
+            else
+                local ok, towers, _, summary = Invoke(remote, amount)
+                if ok and type(towers) == "table" and #towers > 0 then
+                    local best = type(summary) == "table" and tostring(summary.Best or "") or ""
+                    SetLobbyStatus(
+                        "Auto Summon: " .. State.SummonCurrency,
+                        string.format("Summoned x%d%s", #towers, best ~= "" and (" | Best: " .. best) or "")
+                    )
+                else
+                    State.AutoSummon = false
+                    pcall(function() autoSummonToggle:Set(false) end)
+                    QueueSave()
+                    SetLobbyStatus("Auto Summon stopped", tostring(towers or "Summon was rejected"))
+                end
+                task.wait(State.SummonDelay)
+            end
+        else
+            task.wait(0.5)
+        end
+    end
+end)
 
 local lastMatchActive = IsMatchActive()
 if lastMatchActive then State.MatchSerial = 1 end
