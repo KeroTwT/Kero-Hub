@@ -21,10 +21,14 @@ local userConfig = type(Environment.UniversalTDProbeConfig) == "table"
     or {}
 
 local requestedMode = string.lower(tostring(userConfig.Mode or "Normal"))
-local selectedMode = requestedMode == "perfect" and "Perfect"
+local isBrutalPerfectRequest = requestedMode == "brutal_perfect"
+    or requestedMode == "brutal-perfect"
+    or requestedMode == "brutalperfect"
+local selectedMode = isBrutalPerfectRequest and "Brutal_Perfect"
+    or requestedMode == "perfect" and "Perfect"
     or requestedMode == "brutal" and "Brutal"
     or "Normal"
-local isPerfect = selectedMode == "Perfect"
+local isPerfect = selectedMode == "Perfect" or selectedMode == "Brutal_Perfect"
 local isBrutal = selectedMode == "Brutal" or isPerfect
 
 local Config = {
@@ -75,6 +79,7 @@ local Probe = {
     Transactions = {},
     TransactionOrder = {},
     LastRemote = nil,
+    Hook = { enabled = false, available = false, state = "not_initialized" },
     RemoteCandidates = {},
     StateCandidates = {},
     WorldCandidates = {},
@@ -1037,6 +1042,8 @@ end
 function Probe.Status()
     return {
         running = Probe.Running,
+        mode = Config.Mode,
+        hook = serialize(Probe.Hook),
         events = Probe.EventCount,
         dropped = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
@@ -1083,12 +1090,13 @@ local hookOk, hookState = false, "disabled_for_mode"
 if Config.CaptureOutgoing then
     hookOk, hookState = installOutgoingHook()
 end
+Probe.Hook = { enabled = Config.CaptureOutgoing, available = hookOk, state = hookState }
 
 emit("session_started", {
     placeId = game.PlaceId,
     jobId = game.JobId,
     config = Config,
-    hook = { enabled = Config.CaptureOutgoing, available = hookOk, state = hookState },
+    hook = Probe.Hook,
     note = Config.CaptureOutgoing
         and "Original remote call runs before deferred serialization/logging."
         or "Passive mode; outgoing remote calls are not hooked.",
