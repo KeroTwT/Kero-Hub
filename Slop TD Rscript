@@ -4,6 +4,9 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
@@ -77,6 +80,13 @@ local State = {
     AutoSpeed = false,
     AutoJump = false,
     AutoAntiMacro = false,
+    FpsBoost = false,
+    BlackScreen = false,
+    FpsBoostSerial = 0,
+    FpsBoostConnection = nil,
+    FpsBoostLightingConnection = nil,
+    FpsOriginals = setmetatable({}, { __mode = "k" }),
+    BlackScreenGui = nil,
     AntiMacroToken = nil,
     AntiMacroTokenAt = 0,
     AntiMacroCheckConnection = nil,
@@ -97,6 +107,10 @@ local State = {
     ActiveMutator = nil,
     MutatorConnection = nil,
     MutatorBoundRemote = nil,
+    AutoSellAll = false,
+    AutoSellWave = 100,
+    AutoSellBusy = false,
+    AutoSellTriggeredSerial = -1,
     EndAction = "None",
     WebhookEnabled = false,
     WebhookURL = "",
@@ -1090,6 +1104,70 @@ local function StopPlayback(reason)
     SetStatus("Stopped", reason or "Playback stopped")
 end
 
+local function SetAutoSellStatus(title, detail)
+    if Gui.AutoSellStatus then
+        Gui.AutoSellStatus:SetTitle(tostring(title))
+        Gui.AutoSellStatus:SetDesc(tostring(detail or ""))
+    end
+end
+
+local function SellAllOwnTowers()
+    if State.AutoSellBusy then return false, "Sell is already running" end
+    State.AutoSellBusy = true
+    RefreshObjects()
+    if not Remotes.Sell then
+        State.AutoSellBusy = false
+        return false, "SellTower remote is unavailable"
+    end
+
+    if State.Playing then
+        StopPlayback("Auto Sell All reached wave " .. tostring(State.AutoSellWave))
+    end
+
+    local sold, failed, emptyPasses = 0, 0, 0
+    for _ = 1, 5 do
+        RefreshObjects()
+        local targets = {}
+        if TowersFolder then
+            for _, tower in ipairs(TowersFolder:GetChildren()) do
+                if IsOwnTower(tower) then table.insert(targets, tower) end
+            end
+        end
+        if #targets == 0 then
+            emptyPasses = emptyPasses + 1
+            if emptyPasses >= 2 then break end
+            task.wait(0.2)
+        else
+            emptyPasses = 0
+        end
+
+        for _, tower in ipairs(targets) do
+            if State.Running and tower.Parent and IsOwnTower(tower) then
+                local ok, accepted = Invoke(Remotes.Sell, tower)
+                if ok and accepted ~= false then
+                    local removed = WaitUntil(function() return not tower.Parent end, 1.5, 0.05)
+                    if removed then sold = sold + 1 else failed = failed + 1 end
+                else
+                    failed = failed + 1
+                end
+                task.wait(0.06)
+            end
+        end
+        task.wait(0.15)
+    end
+
+    local remaining = 0
+    RefreshObjects()
+    if TowersFolder then
+        for _, tower in ipairs(TowersFolder:GetChildren()) do
+            if IsOwnTower(tower) then remaining = remaining + 1 end
+        end
+    end
+    State.AutoSellBusy = false
+    local detail = string.format("Sold %d | Failed %d | Remaining %d", sold, failed, remaining)
+    return remaining == 0, detail
+end
+
 local function StartPlayback()
     if State.Playing then return true end
     if State.Recording then return false, "Stop recording first" end
@@ -1203,6 +1281,8 @@ State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
 State.AutoJump = Config.AutoJump == true
 State.AutoAntiMacro = Config.AutoAntiMacro == true
+State.FpsBoost = Config.FpsBoost == true
+State.BlackScreen = Config.BlackScreen == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 5)
 State.AutoVoteMap = Config.AutoVoteMap == true
 State.AutoVoteComplication = Config.AutoVoteComplication == true
@@ -1211,6 +1291,8 @@ State.MutatorAutoPick = table.find(
     { "Priority", "Highest Reward", "No Mutator" },
     Config.MutatorAutoPick
 ) and Config.MutatorAutoPick or "Priority"
+State.AutoSellAll = Config.AutoSellAll == true
+State.AutoSellWave = math.clamp(math.floor(tonumber(Config.AutoSellWave) or 100), 1, 500)
 local validEndActions = { ["None"] = true, ["Replay"] = true, ["New Map"] = true, ["Return Lobby"] = true }
 local configuredEndAction = tostring(Config.EndAction or "")
 if not validEndActions[configuredEndAction] then
@@ -1271,6 +1353,8 @@ local function SaveConfig()
         AutoSpeed = State.AutoSpeed,
         AutoJump = State.AutoJump,
         AutoAntiMacro = State.AutoAntiMacro,
+        FpsBoost = State.FpsBoost,
+        BlackScreen = State.BlackScreen,
         Speed = State.Speed,
         AutoVoteMap = State.AutoVoteMap,
         AutoVoteComplication = State.AutoVoteComplication,
@@ -1279,6 +1363,8 @@ local function SaveConfig()
         SelectedMutators = State.SelectedMutators,
         MutatorPriorities = State.MutatorPriorities,
         MutatorCatalog = State.MutatorCatalog,
+        AutoSellAll = State.AutoSellAll,
+        AutoSellWave = State.AutoSellWave,
         EndAction = State.EndAction,
         SelectedMap = State.SelectedMap,
         Complication = State.Complication,
@@ -1377,6 +1463,223 @@ local function WrapParagraph(element)
         end)
     end
     return wrapper
+end
+
+local function SetPerformanceStatus(title, detail)
+    if Gui.PerformanceStatus then
+        Gui.PerformanceStatus:SetTitle(tostring(title))
+        Gui.PerformanceStatus:SetDesc(tostring(detail or ""))
+    end
+end
+
+local function SaveAndSetPerformanceProperty(instance, property, value)
+    if not instance then return false end
+    local originals = State.FpsOriginals[instance]
+    if not originals then
+        originals = {}
+        State.FpsOriginals[instance] = originals
+    end
+    if originals[property] == nil then
+        local readOk, original = pcall(function() return instance[property] end)
+        if not readOk then return false end
+        originals[property] = original
+    end
+    return pcall(function() instance[property] = value end)
+end
+
+local function OptimizePerformanceObject(object)
+    if not State.FpsBoost or not object then return end
+    if object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam")
+        or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Sparkles")
+        or object:IsA("PostEffect") then
+        SaveAndSetPerformanceProperty(object, "Enabled", false)
+    elseif object:IsA("BasePart") then
+        SaveAndSetPerformanceProperty(object, "CastShadow", false)
+        if object:IsA("MeshPart") then
+            SaveAndSetPerformanceProperty(object, "RenderFidelity", Enum.RenderFidelity.Performance)
+        end
+    end
+end
+
+local function DisconnectFpsBoostWatchers()
+    if State.FpsBoostConnection then
+        pcall(function() State.FpsBoostConnection:Disconnect() end)
+        State.FpsBoostConnection = nil
+    end
+    if State.FpsBoostLightingConnection then
+        pcall(function() State.FpsBoostLightingConnection:Disconnect() end)
+        State.FpsBoostLightingConnection = nil
+    end
+end
+
+local function RestoreFpsBoost()
+    DisconnectFpsBoostWatchers()
+    State.FpsBoostSerial = State.FpsBoostSerial + 1
+    for instance, properties in pairs(State.FpsOriginals) do
+        if instance then
+            for property, value in pairs(properties) do
+                pcall(function() instance[property] = value end)
+            end
+        end
+    end
+    State.FpsOriginals = setmetatable({}, { __mode = "k" })
+end
+
+local function SetFpsBoost(enabled)
+    enabled = enabled == true
+    if not enabled then
+        State.FpsBoost = false
+        RestoreFpsBoost()
+        SetPerformanceStatus("FPS Boost disabled", "Original effects and shadows restored")
+        return true
+    end
+
+    State.FpsBoost = true
+    State.FpsBoostSerial = State.FpsBoostSerial + 1
+    local serial = State.FpsBoostSerial
+    DisconnectFpsBoostWatchers()
+    SaveAndSetPerformanceProperty(Lighting, "GlobalShadows", false)
+    SaveAndSetPerformanceProperty(Lighting, "EnvironmentDiffuseScale", 0)
+    SaveAndSetPerformanceProperty(Lighting, "EnvironmentSpecularScale", 0)
+    SaveAndSetPerformanceProperty(Lighting, "ShadowSoftness", 0)
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if terrain then
+        SaveAndSetPerformanceProperty(terrain, "Decoration", false)
+        SaveAndSetPerformanceProperty(terrain, "WaterWaveSize", 0)
+        SaveAndSetPerformanceProperty(terrain, "WaterWaveSpeed", 0)
+        SaveAndSetPerformanceProperty(terrain, "WaterReflectance", 0)
+    end
+
+    State.FpsBoostConnection = Workspace.DescendantAdded:Connect(function(object)
+        task.defer(OptimizePerformanceObject, object)
+    end)
+    State.FpsBoostLightingConnection = Lighting.DescendantAdded:Connect(function(object)
+        task.defer(OptimizePerformanceObject, object)
+    end)
+    task.spawn(function()
+        local objects = Workspace:GetDescendants()
+        for _, object in ipairs(Lighting:GetDescendants()) do table.insert(objects, object) end
+        for index, object in ipairs(objects) do
+            if not State.FpsBoost or State.FpsBoostSerial ~= serial then return end
+            OptimizePerformanceObject(object)
+            if index % 250 == 0 then task.wait() end
+        end
+        if State.FpsBoost and State.FpsBoostSerial == serial then
+            SetPerformanceStatus("FPS Boost enabled", string.format("Optimized %d objects", #objects))
+        end
+    end)
+    SetPerformanceStatus("FPS Boost enabling", "Disabling effects, shadows and post-processing")
+    return true
+end
+
+local function DestroyBlackScreenGui()
+    if State.BlackScreenGui then
+        pcall(function() State.BlackScreenGui:Destroy() end)
+        State.BlackScreenGui = nil
+    end
+end
+
+local SetBlackScreen
+local function CreateBlackScreenGui()
+    DestroyBlackScreenGui()
+    local parents = {}
+    if type(gethui) == "function" then
+        local ok, hiddenGui = pcall(gethui)
+        if ok and hiddenGui then table.insert(parents, hiddenGui) end
+    end
+    table.insert(parents, CoreGui)
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then table.insert(parents, playerGui) end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "SlopTDBlackScreen"
+    screen.IgnoreGuiInset = true
+    screen.ResetOnSpawn = false
+    screen.DisplayOrder = 2147483647
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local background = Instance.new("Frame")
+    background.Name = "Background"
+    background.Size = UDim2.fromScale(1, 1)
+    background.BackgroundColor3 = Color3.new(0, 0, 0)
+    background.BorderSizePixel = 0
+    background.ZIndex = 1
+    background.Parent = screen
+
+    local button = Instance.new("TextButton")
+    button.Name = "DisableBlackScreen"
+    button.AnchorPoint = Vector2.new(0.5, 0.5)
+    button.Position = UDim2.fromScale(0.5, 0.5)
+    button.Size = UDim2.fromOffset(230, 52)
+    button.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = true
+    button.Text = "Disable Black Screen"
+    button.TextColor3 = Color3.fromRGB(245, 245, 245)
+    button.TextSize = 17
+    button.Font = Enum.Font.GothamSemibold
+    button.ZIndex = 2
+    button.Parent = background
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(70, 220, 120)
+    stroke.Thickness = 2
+    stroke.Transparency = 0.15
+    stroke.Parent = button
+
+    local parented = false
+    for _, parent in ipairs(parents) do
+        if pcall(function() screen.Parent = parent end) then
+            parented = true
+            break
+        end
+    end
+    if not parented then
+        screen:Destroy()
+        return false, "Could not parent the Black Screen overlay"
+    end
+    State.BlackScreenGui = screen
+    button.Activated:Connect(function()
+        SetBlackScreen(false)
+        if Gui.BlackScreenToggle then
+            pcall(function() Gui.BlackScreenToggle:Set(false) end)
+        end
+        QueueSave()
+    end)
+    return true
+end
+
+SetBlackScreen = function(enabled)
+    enabled = enabled == true
+    if enabled then
+        local guiOk, guiReason = CreateBlackScreenGui()
+        if not guiOk then
+            State.BlackScreen = false
+            SetPerformanceStatus("Black Screen unavailable", tostring(guiReason))
+            return false, guiReason
+        end
+    end
+    local ok, reason = pcall(function()
+        RunService:Set3dRenderingEnabled(not enabled)
+    end)
+    if not ok then
+        DestroyBlackScreenGui()
+        State.BlackScreen = false
+        SetPerformanceStatus("Black Screen unavailable", tostring(reason))
+        return false, reason
+    end
+    if not enabled then DestroyBlackScreenGui() end
+    State.BlackScreen = enabled
+    SetPerformanceStatus(
+        enabled and "Black Screen enabled" or "Black Screen disabled",
+        enabled and "3D rendering is disabled; the hub remains usable"
+            or "3D rendering restored"
+    )
+    return true
 end
 
 local RefreshMutatorControls
@@ -1630,6 +1933,38 @@ MatchTab:Toggle({
     Value = State.AutoVoteComplication,
     Callback = function(value)
         State.AutoVoteComplication = value == true
+        QueueSave()
+    end,
+})
+
+MatchTab:Section({ Title = "Endless Farming" })
+Gui.AutoSellStatus = WrapParagraph(MatchTab:Paragraph({
+    Title = "Auto Sell All Towers",
+    Desc = string.format("Armed for wave %d", State.AutoSellWave),
+}))
+MatchTab:Slider({
+    Title = "Sell All At Wave",
+    Desc = "Stops macro/Auto Place, then sells every tower owned by you",
+    Step = 1,
+    Value = { Min = 1, Max = 500, Default = State.AutoSellWave },
+    Callback = function(value)
+        State.AutoSellWave = math.clamp(math.floor(tonumber(value) or 100), 1, 500)
+        State.AutoSellTriggeredSerial = -1
+        SetAutoSellStatus("Auto Sell All Towers", string.format("Armed for wave %d", State.AutoSellWave))
+        QueueSave()
+    end,
+})
+MatchTab:Toggle({
+    Title = "Auto Sell All Towers At Certain Wave",
+    Value = State.AutoSellAll,
+    Callback = function(value)
+        State.AutoSellAll = value == true
+        State.AutoSellTriggeredSerial = -1
+        SetAutoSellStatus(
+            State.AutoSellAll and "Auto Sell armed" or "Auto Sell disabled",
+            State.AutoSellAll and string.format("Waiting for wave %d", State.AutoSellWave)
+                or "Towers will not be sold automatically"
+        )
         QueueSave()
     end,
 })
@@ -2326,6 +2661,43 @@ playbackToggle = MacrosTab:Toggle({
         QueueSave()
     end,
 })
+
+MiscTab:Section({ Title = "Performance" })
+Gui.PerformanceStatus = WrapParagraph(MiscTab:Paragraph({
+    Title = "Performance controls",
+    Desc = "Effects and 3D rendering are currently enabled",
+}))
+local fpsBoostToggle
+fpsBoostToggle = MiscTab:Toggle({
+    Title = "FPS Boost",
+    Desc = "Disables particles, trails, beams, shadows and post-processing",
+    Value = State.FpsBoost,
+    Callback = function(value)
+        SetFpsBoost(value == true)
+        QueueSave()
+    end,
+})
+local blackScreenToggle
+blackScreenToggle = MiscTab:Toggle({
+    Title = "Black Screen",
+    Desc = "Disables 3D rendering for the lowest GPU usage",
+    Value = State.BlackScreen,
+    Callback = function(value)
+        local ok = SetBlackScreen(value == true)
+        if not ok and blackScreenToggle then
+            task.defer(function() pcall(function() blackScreenToggle:Set(false) end) end)
+        end
+        QueueSave()
+    end,
+})
+Gui.BlackScreenToggle = blackScreenToggle
+if State.FpsBoost then task.defer(SetFpsBoost, true) end
+if State.BlackScreen then
+    task.defer(function()
+        local ok = SetBlackScreen(true)
+        if not ok then pcall(function() blackScreenToggle:Set(false) end) end
+    end)
+end
 
 MiscTab:Section({ Title = "Wave & Speed" })
 MiscTab:Toggle({
@@ -3114,6 +3486,7 @@ task.spawn(function()
     while State.Running do
         if IsMatchActive() and not State.Playing and not State.Recording and not State.PlaybackEnabled
             and (State.AutoPlace or State.AutoUpgrade) and not State.AutoPlayBusy
+            and not (State.AutoSellAll and GetWave() >= State.AutoSellWave)
             and os.clock() >= nextActionAt then
             State.AutoPlayBusy = true
             local _, delay = RunAutoPlayStep()
@@ -3172,7 +3545,30 @@ task.spawn(function()
         lastMapVoting = mapVoting
         lastComplicationVoting = complicationVoting
 
+        local sellThresholdReached = active and State.AutoSellAll
+            and GetWave() >= State.AutoSellWave
+        if sellThresholdReached and not State.AutoSellBusy
+            and State.AutoSellTriggeredSerial ~= State.MatchSerial then
+            State.AutoSellTriggeredSerial = State.MatchSerial
+            SetAutoSellStatus(
+                "Selling all towers",
+                string.format("Wave %d reached", GetWave())
+            )
+            task.spawn(function()
+                local ok, detail = SellAllOwnTowers()
+                if ok then
+                    SetAutoSellStatus("All towers sold", detail)
+                else
+                    SetAutoSellStatus("Auto Sell incomplete", detail)
+                    if State.Running and IsMatchActive() then
+                        State.AutoSellTriggeredSerial = -1
+                    end
+                end
+            end)
+        end
+
         if active and State.PlaybackEnabled and not State.Playing
+            and not sellThresholdReached
             and State.PlaybackSerial ~= State.MatchSerial and #State.Actions > 0 then
             StartPlayback()
         end
@@ -3261,13 +3657,16 @@ end)
 
 function Hub.Destroy()
     if not State.Running then return end
+    SaveConfig()
     State.Running = false
     State.Recording = false
     State.Playing = false
+    RestoreFpsBoost()
+    DestroyBlackScreenGui()
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
     DisconnectAll(State.RecorderConnections)
     DisconnectAll(State.Connections)
     DestroyPlacementVisual()
-    SaveConfig()
     pcall(function() Window:Destroy() end)
     if Environment.SlopTDHub == Hub then Environment.SlopTDHub = nil end
 end
