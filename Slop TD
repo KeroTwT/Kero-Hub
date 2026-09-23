@@ -159,6 +159,7 @@ local function RefreshObjects()
     local events = ReplicatedStorage:FindFirstChild("Events")
     local remoteRoot = ReplicatedStorage:FindFirstChild("Remotes")
     local summon = remoteRoot and remoteRoot:FindFirstChild("Summon")
+    local playerData = remoteRoot and remoteRoot:FindFirstChild("PlayerData")
     Remotes.Request = functions and functions:FindFirstChild("RequestTower")
     Remotes.Place = functions and functions:FindFirstChild("SpawnTower")
     Remotes.Upgrade = functions and functions:FindFirstChild("UpgradeTower")
@@ -178,6 +179,7 @@ local function RefreshObjects()
     Remotes.AntiMacroRespond = antiMacro and antiMacro:FindFirstChild("Respond")
     Remotes.Summon = summon and summon:FindFirstChild("Summon")
     Remotes.SummonPremium = summon and summon:FindFirstChild("SummonPremium")
+    Remotes.GetPlayerData = playerData and playerData:FindFirstChild("GetData")
     TowersFolder = Workspace:FindFirstChild("Towers")
     InfoFolder = Workspace:FindFirstChild("Info")
 end
@@ -745,6 +747,36 @@ local function Fire(remote, ...)
     return ok, reason
 end
 
+local function FormatNumber(value)
+    local number = tonumber(value)
+    if not number then return "Unknown" end
+    local sign = number < 0 and "-" or ""
+    local digits = tostring(math.floor(math.abs(number)))
+    local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    return sign .. formatted
+end
+
+local function GetAccountCurrencies()
+    RefreshObjects()
+    local ok, data = Invoke(Remotes.GetPlayerData)
+    if ok and type(data) == "table" then
+        State.LastAccountCurrencies = {
+            Cash = tonumber(data.Cash),
+            Gem = tonumber(data.Crystals),
+            Star = tonumber(data.Stars),
+        }
+    end
+    local cached = State.LastAccountCurrencies or {}
+    local function fallback(name, alternate)
+        local value = LocalPlayer:FindFirstChild(name)
+            or (alternate and LocalPlayer:FindFirstChild(alternate))
+        return value and value:IsA("ValueBase") and tonumber(value.Value) or nil
+    end
+    return cached.Cash or fallback("Cash"),
+        cached.Gem or fallback("Crystals", "Gems"),
+        cached.Star or fallback("Stars", "Star")
+end
+
 local function IsDiscordWebhookURL(value)
     local url = tostring(value or "")
     return url:match("^https://discord%.com/api/webhooks/") ~= nil
@@ -815,28 +847,26 @@ local function SendMatchEndWebhook()
         or result == "Defeat" and 16711680
         or 16776960
     local player = Players.LocalPlayer or LocalPlayer
-    local nextAction = State.EndAction == "None" and "Wait" or State.EndAction
+    local cash, gem, star = GetAccountCurrencies()
     local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
     local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
     local fields = {
         {
             name = "Player Info",
             value = string.format(
-                "👤 Name: ||%s||\n💰 Money: %s\n❤️ Base HP: %s",
+                "👤 Name: ||%s||\n❤️ Base HP: %s",
                 player and player.Name or "Unknown",
-                tostring(GetCash()),
                 GetBaseHealthText()
             ),
             inline = false,
         },
         {
-            name = "Match Details",
+            name = "Currencies",
             value = string.format(
-                "🌊 Wave: %s\n⚙️ Macro: %s\n🔄 Match: %s\n⏭️ Next: %s",
-                tostring(GetWave()),
-                State.ProfileName ~= "" and State.ProfileName or "None",
-                tostring(math.max(State.MatchSerial, 1)),
-                nextAction
+                "💵 Cash: %s\n💎 Gem: %s\n⭐ Star: %s",
+                FormatNumber(cash),
+                FormatNumber(gem),
+                FormatNumber(star)
             ),
             inline = false,
         },
@@ -1758,10 +1788,23 @@ WebhookTab:Button({
     Icon = "send",
     Callback = function()
         task.spawn(function()
+            local cash, gem, star = GetAccountCurrencies()
             local ok, reason = SendDiscordWebhook(
                 "Webhook Test",
                 "Slop TD Hub webhook is working.",
-                5763719
+                5763719,
+                {
+                    {
+                        name = "Currencies",
+                        value = string.format(
+                            "💵 Cash: %s\n💎 Gem: %s\n⭐ Star: %s",
+                            FormatNumber(cash),
+                            FormatNumber(gem),
+                            FormatNumber(star)
+                        ),
+                        inline = false,
+                    },
+                }
             )
             if ok then
                 Notify("Webhook", "Test message sent")
