@@ -59,6 +59,7 @@ local State = {
     Connections = {},
     AutoSkip = false,
     AutoSpeed = false,
+    AutoJump = false,
     Speed = 1,
     AutoVoteMap = false,
     AutoVoteComplication = false,
@@ -1032,6 +1033,7 @@ State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMo
 State.ProfileName = SanitizeName(Config.SelectedProfile or "")
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
+State.AutoJump = Config.AutoJump == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 5)
 State.AutoVoteMap = Config.AutoVoteMap == true
 State.AutoVoteComplication = Config.AutoVoteComplication == true
@@ -1064,6 +1066,7 @@ local function SaveConfig()
         NewProfileName = Config.NewProfileName or "",
         AutoSkip = State.AutoSkip,
         AutoSpeed = State.AutoSpeed,
+        AutoJump = State.AutoJump,
         Speed = State.Speed,
         AutoVoteMap = State.AutoVoteMap,
         AutoVoteComplication = State.AutoVoteComplication,
@@ -1476,6 +1479,35 @@ MiscTab:Dropdown({
         QueueSave()
     end,
 })
+
+MiscTab:Section({ Title = "Anti-AFK" })
+MiscTab:Toggle({
+    Title = "Auto Jump",
+    Value = State.AutoJump,
+    Callback = function(value)
+        State.AutoJump = value == true
+        QueueSave()
+    end,
+})
+
+task.spawn(function()
+    while State.Running do
+        if State.AutoJump then
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health > 0 and not humanoid.Sit
+                and humanoid.FloorMaterial ~= Enum.Material.Air then
+                humanoid.Jump = true
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                task.wait(math.random(8, 14))
+            else
+                task.wait(0.75)
+            end
+        else
+            task.wait(0.5)
+        end
+    end
+end)
 
 local LobbyPlaceId = 134459712190924
 local ElevatorByPlayers = {
