@@ -12,6 +12,45 @@ while not LocalPlayer do
 end
 local Environment = getgenv()
 
+local DEFAULT_MUTATORS = {
+    TinySlop = {
+        Id = "TinySlop", Title = "Tiny Slop",
+        Bad = "Tiny enemies, +20% speed", Good = "+20% Rewards",
+    },
+    Gigantism = {
+        Id = "Gigantism", Title = "Gigantism",
+        Bad = "Enemies x1.5 size & HP", Good = "+30% Rewards",
+    },
+    ArmoredSlop = {
+        Id = "ArmoredSlop", Title = "Armored Slop",
+        Bad = "x2.5 enemy HP, -20% speed", Good = "+40% Rewards",
+    },
+    Regeneration = {
+        Id = "Regeneration", Title = "Regeneration",
+        Bad = "Enemies heal 2% HP per second", Good = "+30% Rewards",
+    },
+    BossRush = {
+        Id = "BossRush", Title = "Boss Rush",
+        Bad = "Bosses x2 HP, others +25% HP", Good = "+30% Rewards",
+    },
+    Speedrun = {
+        Id = "Speedrun", Title = "Speedrun",
+        Bad = "+40% enemy speed", Good = "x2 Cash",
+    },
+    Blackout = {
+        Id = "Blackout", Title = "Blackout",
+        Bad = "Lights out! Only enemy eyes glow", Good = "+25% Rewards",
+    },
+    Brainrot = {
+        Id = "Brainrot", Title = "Brainrot",
+        Bad = "Random enemy speed", Good = "+20% Rewards",
+    },
+    None = {
+        Id = "None", Title = "No Mutator",
+        Bad = "No bonus", Good = "Normal game",
+    },
+}
+
 local Previous = Environment.SlopTDHub
 if Previous and type(Previous.Destroy) == "function" then
     pcall(Previous.Destroy)
@@ -46,10 +85,23 @@ local State = {
     Speed = 1,
     AutoVoteMap = false,
     AutoVoteComplication = false,
+    AutoVoteMutator = false,
+    MutatorAutoPick = "Priority",
+    SelectedMutators = {},
+    MutatorPriorities = {},
+    MutatorCatalog = {},
+    CurrentMutatorOffer = {},
+    MutatorVoteSerial = 0,
+    MutatorLastVoteSerial = -1,
+    MutatorLastVoteId = nil,
+    ActiveMutator = nil,
+    MutatorConnection = nil,
+    MutatorBoundRemote = nil,
     EndAction = "None",
     WebhookEnabled = false,
     WebhookURL = "",
     WebhookMatchEnd = true,
+    LastKnownGem = nil,
     AutoLobby = false,
     LobbyPlayers = 1,
     AutoSummon = false,
@@ -146,6 +198,7 @@ local function RefreshObjects()
     Remotes.Speed = functions and functions:FindFirstChild("ChangeSpeed")
     Remotes.VoteMap = events and events:FindFirstChild("VoteForMap")
     Remotes.VoteComplication = events and events:FindFirstChild("VoteForComplication")
+    Remotes.SlopMutator = events and events:FindFirstChild("SlopMutator")
     Remotes.EndDecision = events and events:FindFirstChild("EndDecision")
     Remotes.ExitGame = events and events:FindFirstChild("ExitGame")
     Remotes.EnterElevator = events and events:FindFirstChild("EnterElevator")
@@ -733,24 +786,49 @@ local function FormatNumber(value)
     return sign .. formatted
 end
 
+local function ParseNumber(value)
+    local cleaned = tostring(value or ""):gsub(",", ""):gsub("%s", "")
+    return tonumber(cleaned)
+end
+
+local function GetLiveGemBalance()
+    local leaderstats = LocalPlayer and LocalPlayer:FindFirstChild("leaderstats")
+    local gems = leaderstats and leaderstats:FindFirstChild("Gems")
+    if gems and gems:IsA("ValueBase") then
+        local value = ParseNumber(gems.Value)
+        if value then return value end
+    end
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local main = playerGui and playerGui:FindFirstChild("Main")
+    local gemFrame = main and main:FindFirstChild("Gems")
+    local decor = gemFrame and gemFrame:FindFirstChild("Decor")
+    local title = decor and decor:FindFirstChild("Title")
+    if title and (title:IsA("TextLabel") or title:IsA("TextButton")) then
+        return ParseNumber(title.Text)
+    end
+    return nil
+end
+
 local function GetAccountCurrencies()
     RefreshObjects()
     local ok, data = Invoke(Remotes.GetPlayerData)
     if ok and type(data) == "table" then
         State.LastAccountCurrencies = {
             Cash = tonumber(data.Cash),
-            Gem = tonumber(data.Crystals),
+            Gem = tonumber(data.Gems),
             Star = tonumber(data.Stars),
         }
     end
     local cached = State.LastAccountCurrencies or {}
+    local liveGem = GetLiveGemBalance()
+    if liveGem ~= nil then State.LastKnownGem = liveGem end
     local function fallback(name, alternate)
         local value = LocalPlayer:FindFirstChild(name)
             or (alternate and LocalPlayer:FindFirstChild(alternate))
         return value and value:IsA("ValueBase") and tonumber(value.Value) or nil
     end
     return cached.Cash or fallback("Cash"),
-        cached.Gem or fallback("Crystals", "Gems"),
+        liveGem or cached.Gem or State.LastKnownGem or fallback("Gems"),
         cached.Star or fallback("Stars", "Star")
 end
 
@@ -1065,6 +1143,58 @@ local function ReadConfig()
 end
 
 local Config = ReadConfig()
+local function LoadMutatorCatalog(source)
+    local catalog = {}
+    local function merge(entries)
+        if type(entries) ~= "table" then return end
+        for key, entry in pairs(entries) do
+            if type(entry) == "table" then
+                local id = tostring(entry.Id or key or "")
+                if id ~= "" then
+                    catalog[id] = {
+                        Id = id,
+                        Title = tostring(entry.Title or id),
+                        Bad = tostring(entry.Bad or "Unknown drawback"),
+                        Good = tostring(entry.Good or "Unknown reward"),
+                    }
+                end
+            end
+        end
+    end
+    merge(DEFAULT_MUTATORS)
+    merge(source)
+    return catalog
+end
+
+local function LoadMutatorSelection(source)
+    local selected, seen = {}, {}
+    if type(source) ~= "table" then return selected end
+    for key, value in pairs(source) do
+        local id
+        if type(key) == "number" and type(value) == "string" then
+            id = value
+        elseif type(key) == "string" and value == true then
+            id = key
+        end
+        id = id and tostring(id) or nil
+        if id and id ~= "" and not seen[id] then
+            seen[id] = true
+            table.insert(selected, id)
+        end
+    end
+    return selected
+end
+
+State.MutatorCatalog = LoadMutatorCatalog(Config.MutatorCatalog)
+State.SelectedMutators = LoadMutatorSelection(Config.SelectedMutators)
+State.MutatorPriorities = {}
+if type(Config.MutatorPriorities) == "table" then
+    for id, priority in pairs(Config.MutatorPriorities) do
+        State.MutatorPriorities[tostring(id)] = math.clamp(
+            math.floor(tonumber(priority) or 10), 1, 20
+        )
+    end
+end
 State.PlaybackEnabled = Config.PlaybackEnabled == true
 State.PlaybackMode = table.find({ "Hybrid", "Time", "Money" }, Config.PlaybackMode)
     and Config.PlaybackMode or "Hybrid"
@@ -1076,6 +1206,11 @@ State.AutoAntiMacro = Config.AutoAntiMacro == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 5)
 State.AutoVoteMap = Config.AutoVoteMap == true
 State.AutoVoteComplication = Config.AutoVoteComplication == true
+State.AutoVoteMutator = Config.AutoVoteMutator == true
+State.MutatorAutoPick = table.find(
+    { "Priority", "Highest Reward", "No Mutator" },
+    Config.MutatorAutoPick
+) and Config.MutatorAutoPick or "Priority"
 local validEndActions = { ["None"] = true, ["Replay"] = true, ["New Map"] = true, ["Return Lobby"] = true }
 local configuredEndAction = tostring(Config.EndAction or "")
 if not validEndActions[configuredEndAction] then
@@ -1087,6 +1222,7 @@ State.Complication = tostring(Config.Complication or "Normal")
 State.WebhookEnabled = Config.WebhookEnabled == true
 State.WebhookURL = tostring(Config.WebhookURL or "")
 State.WebhookMatchEnd = Config.WebhookMatchEnd ~= false
+State.LastKnownGem = tonumber(Config.LastKnownGem)
 State.AutoLobby = Config.AutoLobby == true
 State.LobbyPlayers = math.clamp(tonumber(Config.LobbyPlayers) or 1, 1, 4)
 State.AutoSummon = Config.AutoSummon == true
@@ -1138,12 +1274,18 @@ local function SaveConfig()
         Speed = State.Speed,
         AutoVoteMap = State.AutoVoteMap,
         AutoVoteComplication = State.AutoVoteComplication,
+        AutoVoteMutator = State.AutoVoteMutator,
+        MutatorAutoPick = State.MutatorAutoPick,
+        SelectedMutators = State.SelectedMutators,
+        MutatorPriorities = State.MutatorPriorities,
+        MutatorCatalog = State.MutatorCatalog,
         EndAction = State.EndAction,
         SelectedMap = State.SelectedMap,
         Complication = State.Complication,
         WebhookEnabled = State.WebhookEnabled,
         WebhookURL = State.WebhookURL,
         WebhookMatchEnd = State.WebhookMatchEnd,
+        LastKnownGem = State.LastKnownGem,
         AutoLobby = State.AutoLobby,
         LobbyPlayers = State.LobbyPlayers,
         AutoSummon = State.AutoSummon,
@@ -1179,6 +1321,19 @@ local function QueueSave()
         SaveConfig()
     end)
 end
+
+-- Gems only exist in lobby UI/leaderstats. Cache the latest lobby balance so
+-- match-end webhooks can still report the account total after teleporting.
+task.spawn(function()
+    while State.Running do
+        local liveGem = GetLiveGemBalance()
+        if liveGem ~= nil and liveGem ~= State.LastKnownGem then
+            State.LastKnownGem = liveGem
+            SaveConfig()
+        end
+        task.wait(1)
+    end
+end)
 
 local WindUI = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
@@ -1224,8 +1379,141 @@ local function WrapParagraph(element)
     return wrapper
 end
 
+local RefreshMutatorControls
+local RebuildMutatorPriorityControls
+local TryAutoVoteMutator
+
+local function GetMutatorDropdownValues()
+    local values = {}
+    for _, entry in pairs(State.MutatorCatalog) do
+        table.insert(values, tostring(entry.Title or entry.Id))
+    end
+    table.sort(values, function(a, b) return a:lower() < b:lower() end)
+    return values
+end
+
+local function MutatorIdFromTitle(title)
+    title = tostring(title or "")
+    for id, entry in pairs(State.MutatorCatalog) do
+        if tostring(entry.Title or id) == title then return id end
+    end
+    return State.MutatorCatalog[title] and title or nil
+end
+
+local function MutatorSelectionForDropdown()
+    local values = {}
+    for _, id in ipairs(State.SelectedMutators) do
+        local entry = State.MutatorCatalog[id]
+        if entry then table.insert(values, tostring(entry.Title or id)) end
+    end
+    return values
+end
+
+local function NormalizeMutatorSelection(value)
+    local result, seen = {}, {}
+    if type(value) ~= "table" then return result end
+    for key, item in pairs(value) do
+        local selected = type(key) == "number" and item or (item == true and key or nil)
+        local id = MutatorIdFromTitle(selected)
+        if id and not seen[id] then
+            seen[id] = true
+            table.insert(result, id)
+        end
+    end
+    table.sort(result, function(a, b)
+        local pa = tonumber(State.MutatorPriorities[a]) or 20
+        local pb = tonumber(State.MutatorPriorities[b]) or 20
+        if pa ~= pb then return pa < pb end
+        return a < b
+    end)
+    return result
+end
+
+local function SetMutatorStatus(title, detail)
+    if Gui.MutatorStatus then
+        Gui.MutatorStatus:SetTitle(tostring(title))
+        Gui.MutatorStatus:SetDesc(tostring(detail or ""))
+    end
+end
+
+local function MutatorRewardScore(entry)
+    local reward = tostring(entry and entry.Good or "")
+    local multiplier = tonumber(reward:lower():match("x%s*(%d+%.?%d*)"))
+    if multiplier then return math.max(0, (multiplier - 1) * 100) end
+    return tonumber(reward:match("%+(%d+%.?%d*)%%")) or 0
+end
+
+local function PickMutatorFromOffer()
+    local offeredById = {}
+    for _, entry in ipairs(State.CurrentMutatorOffer) do
+        offeredById[entry.Id] = entry
+    end
+    if State.MutatorAutoPick == "No Mutator" then
+        return offeredById.None and "None" or nil, "No Mutator"
+    end
+
+    local selected = {}
+    for _, id in ipairs(State.SelectedMutators) do selected[id] = true end
+    local best, bestValue
+    for index, entry in ipairs(State.CurrentMutatorOffer) do
+        if entry.Id ~= "None" and selected[entry.Id] then
+            local value = State.MutatorAutoPick == "Highest Reward"
+                and -MutatorRewardScore(entry)
+                or (tonumber(State.MutatorPriorities[entry.Id]) or 20)
+            if best == nil or value < bestValue then
+                best, bestValue = entry, value
+            elseif value == bestValue then
+                local bestPriority = tonumber(State.MutatorPriorities[best.Id]) or 20
+                local entryPriority = tonumber(State.MutatorPriorities[entry.Id]) or 20
+                if entryPriority < bestPriority or (entryPriority == bestPriority and index < best._OfferIndex) then
+                    best, bestValue = entry, value
+                end
+            end
+            entry._OfferIndex = index
+        end
+    end
+    if best then
+        return best.Id, State.MutatorAutoPick == "Highest Reward"
+            and (best.Good or "Highest reward")
+            or ("Priority " .. tostring(State.MutatorPriorities[best.Id] or 20))
+    end
+    return offeredById.None and "None" or nil, "No selected Mutator was offered"
+end
+
+TryAutoVoteMutator = function(force)
+    if not State.AutoVoteMutator or #State.CurrentMutatorOffer == 0 then return false end
+    if State.MutatorVoteDeadline then
+        local ok, serverNow = pcall(Workspace.GetServerTimeNow, Workspace)
+        if ok and tonumber(serverNow) and serverNow >= State.MutatorVoteDeadline then
+            SetMutatorStatus("Vote closed", "Waiting for the next Mutator offer")
+            return false
+        end
+    end
+    RefreshObjects()
+    local id, reason = PickMutatorFromOffer()
+    if not id then
+        SetMutatorStatus("No valid choice", reason)
+        return false
+    end
+    if not force and State.MutatorLastVoteSerial == State.MutatorVoteSerial
+        and State.MutatorLastVoteId == id then
+        return true
+    end
+    local ok, failure = Fire(Remotes.SlopMutator, "Vote", id)
+    if ok then
+        State.MutatorLastVoteSerial = State.MutatorVoteSerial
+        State.MutatorLastVoteId = id
+        local title = State.MutatorCatalog[id] and State.MutatorCatalog[id].Title or id
+        SetMutatorStatus("Vote requested: " .. tostring(title), reason)
+        return true
+    end
+    SetMutatorStatus("Vote failed", tostring(failure))
+    return false
+end
+
 local LobbyTab = Window:Tab({ Title = "Lobby", Icon = "door-open" })
 local MatchTab = Window:Tab({ Title = "Match", Icon = "map" })
+local MutatorTab = Window:Tab({ Title = "Mutators", Icon = "shuffle" })
 local PlacementTab = Window:Tab({ Title = "Auto Place", Icon = "crosshair" })
 local UpgradeTab = Window:Tab({ Title = "Upgrade", Icon = "arrow-up" })
 local MacrosTab = Window:Tab({ Title = "Macros", Icon = "clapperboard" })
@@ -1358,6 +1646,120 @@ MatchTab:Dropdown({
         QueueSave()
     end,
 })
+
+MutatorTab:Section({ Title = "Automatic Vote" })
+Gui.MutatorStatus = WrapParagraph(MutatorTab:Paragraph({
+    Title = "Waiting for Mutator vote",
+    Desc = "The server has not offered Mutators yet",
+}))
+MutatorTab:Toggle({
+    Title = "Auto Vote Mutator",
+    Value = State.AutoVoteMutator,
+    Callback = function(value)
+        State.AutoVoteMutator = value == true
+        QueueSave()
+        if State.AutoVoteMutator then task.defer(TryAutoVoteMutator, true) end
+    end,
+})
+MutatorTab:Dropdown({
+    Title = "Auto Pick",
+    Desc = "Priority, best offered reward, or always No Mutator",
+    Values = { "Priority", "Highest Reward", "No Mutator" },
+    Value = State.MutatorAutoPick,
+    Multi = false,
+    Callback = function(value)
+        value = tostring(value)
+        State.MutatorAutoPick = table.find(
+            { "Priority", "Highest Reward", "No Mutator" }, value
+        ) and value or "Priority"
+        State.MutatorLastVoteSerial = -1
+        QueueSave()
+        task.defer(TryAutoVoteMutator, true)
+    end,
+})
+
+MutatorTab:Section({ Title = "Preferred Mutators" })
+local mutatorDropdown
+mutatorDropdown = MutatorTab:Dropdown({
+    Title = "Mutators",
+    Desc = "Select several Mutators, then assign their priority below",
+    Values = GetMutatorDropdownValues(),
+    Value = MutatorSelectionForDropdown(),
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Callback = function(value)
+        State.SelectedMutators = NormalizeMutatorSelection(value)
+        for index, id in ipairs(State.SelectedMutators) do
+            if State.MutatorPriorities[id] == nil then
+                State.MutatorPriorities[id] = index
+            end
+        end
+        State.MutatorLastVoteSerial = -1
+        if RebuildMutatorPriorityControls then RebuildMutatorPriorityControls() end
+        QueueSave()
+        task.defer(TryAutoVoteMutator, true)
+    end,
+})
+Gui.MutatorDropdown = mutatorDropdown
+
+MutatorTab:Section({ Title = "Selected Priority" })
+Gui.MutatorPriorityHint = WrapParagraph(MutatorTab:Paragraph({
+    Title = "Priority order",
+    Desc = "Select Mutators above to create priority controls",
+}))
+local mutatorPriorityControls = {}
+RebuildMutatorPriorityControls = function()
+    for _, control in ipairs(mutatorPriorityControls) do
+        pcall(function() control:Destroy() end)
+    end
+    table.clear(mutatorPriorityControls)
+
+    local selected = table.clone(State.SelectedMutators)
+    table.sort(selected, function(a, b)
+        local pa = tonumber(State.MutatorPriorities[a]) or 20
+        local pb = tonumber(State.MutatorPriorities[b]) or 20
+        if pa ~= pb then return pa < pb end
+        return a < b
+    end)
+    Gui.MutatorPriorityHint:SetDesc(#selected == 0
+        and "Select Mutators above to create priority controls"
+        or "Priority 1 is picked first when multiple selected Mutators are offered")
+    for index, id in ipairs(selected) do
+        local mutatorId = id
+        local entry = State.MutatorCatalog[mutatorId] or { Title = mutatorId, Bad = "", Good = "" }
+        if State.MutatorPriorities[mutatorId] == nil then State.MutatorPriorities[mutatorId] = index end
+        local control = MutatorTab:Slider({
+            Title = tostring(entry.Title),
+            Desc = string.format("%s | %s", tostring(entry.Bad), tostring(entry.Good)),
+            Step = 1,
+            Value = {
+                Min = 1,
+                Max = 20,
+                Default = math.clamp(tonumber(State.MutatorPriorities[mutatorId]) or index, 1, 20),
+            },
+            Callback = function(value)
+                State.MutatorPriorities[mutatorId] = math.clamp(
+                    math.floor(tonumber(value) or 20), 1, 20
+                )
+                State.MutatorLastVoteSerial = -1
+                QueueSave()
+                task.defer(TryAutoVoteMutator, true)
+            end,
+        })
+        table.insert(mutatorPriorityControls, control)
+    end
+end
+
+RefreshMutatorControls = function()
+    if not Gui.MutatorDropdown then return end
+    pcall(function()
+        Gui.MutatorDropdown:Refresh(GetMutatorDropdownValues())
+        Gui.MutatorDropdown:Select(MutatorSelectionForDropdown())
+    end)
+    RebuildMutatorPriorityControls()
+end
+RebuildMutatorPriorityControls()
 
 local function GetLoadoutUnit(slot)
     local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -1970,6 +2372,97 @@ MiscTab:Toggle({
         QueueSave()
     end,
 })
+
+local function BindMutatorRemote()
+    RefreshObjects()
+    local remote = Remotes.SlopMutator
+    if remote == State.MutatorBoundRemote and State.MutatorConnection
+        and State.MutatorConnection.Connected then
+        return
+    end
+    if State.MutatorConnection then
+        pcall(function() State.MutatorConnection:Disconnect() end)
+        State.MutatorConnection = nil
+    end
+    State.MutatorBoundRemote = remote
+    if not remote or not remote:IsA("RemoteEvent") then return end
+
+    State.MutatorConnection = AddConnection(State.Connections, remote.OnClientEvent:Connect(
+        function(action, payload, deadline)
+            action = tostring(action or "")
+            if action == "Vote" and type(payload) == "table" then
+                local offer, discovered = {}, {}
+                for _, raw in ipairs(payload) do
+                    if type(raw) == "table" then
+                        local id = tostring(raw.Id or "")
+                        if id ~= "" then
+                            local entry = {
+                                Id = id,
+                                Title = tostring(raw.Title or id),
+                                Bad = tostring(raw.Bad or "Unknown drawback"),
+                                Good = tostring(raw.Good or "Unknown reward"),
+                            }
+                            table.insert(offer, entry)
+                            local previous = State.MutatorCatalog[id]
+                            if not previous or previous.Title ~= entry.Title
+                                or previous.Bad ~= entry.Bad or previous.Good ~= entry.Good then
+                                State.MutatorCatalog[id] = table.clone(entry)
+                                table.insert(discovered, entry.Title)
+                            end
+                        end
+                    end
+                end
+                State.CurrentMutatorOffer = offer
+                State.MutatorVoteSerial = State.MutatorVoteSerial + 1
+                State.MutatorLastVoteSerial = -1
+                State.MutatorLastVoteId = nil
+                State.MutatorVoteDeadline = tonumber(deadline)
+
+                local titles = {}
+                for _, entry in ipairs(offer) do table.insert(titles, entry.Title) end
+                SetMutatorStatus("Mutator vote open", table.concat(titles, ", "))
+                if #discovered > 0 then
+                    QueueSave()
+                    if RefreshMutatorControls then RefreshMutatorControls() end
+                    Notify("New Mutator discovered", table.concat(discovered, ", "))
+                end
+                task.defer(TryAutoVoteMutator)
+            elseif action == "Votes" and type(payload) == "table" then
+                local votes = {}
+                for id, count in pairs(payload) do
+                    count = tonumber(count) or 0
+                    if count > 0 then
+                        local entry = State.MutatorCatalog[tostring(id)]
+                        table.insert(votes, string.format(
+                            "%s: %d", entry and entry.Title or tostring(id), count
+                        ))
+                    end
+                end
+                table.sort(votes)
+                if #votes > 0 then SetMutatorStatus("Vote update", table.concat(votes, " | ")) end
+            elseif action == "Active" then
+                local id = type(payload) == "table" and tostring(payload.Id or "") or "None"
+                if id == "" then id = "None" end
+                State.ActiveMutator = id
+                State.CurrentMutatorOffer = {}
+                State.MutatorVoteDeadline = nil
+                local entry = State.MutatorCatalog[id]
+                SetMutatorStatus(
+                    "Active: " .. tostring(entry and entry.Title or id),
+                    entry and string.format("%s | %s", entry.Bad, entry.Good) or ""
+                )
+            end
+        end
+    ))
+end
+
+BindMutatorRemote()
+task.spawn(function()
+    while State.Running do
+        BindMutatorRemote()
+        task.wait(1)
+    end
+end)
 
 task.spawn(function()
     while State.Running do
