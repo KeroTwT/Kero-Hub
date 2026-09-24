@@ -3936,7 +3936,7 @@ local MatchRuntime = {
     VotedMap = false,
     VotedComplication = false,
     LastSkipRequest = 0,
-    LastSpeedRequest = 0,
+    LastSpeedRequest = -math.huge,
     MatchEndedAt = nil,
     EndScreenVisible = IsEndScreenVisible(),
     EndScreenShownAt = nil,
@@ -4004,6 +4004,7 @@ task.spawn(function()
             State.AutoPlayMaxed = setmetatable({}, { __mode = "k" })
             State.AutoPlayUpgradeFailures = setmetatable({}, { __mode = "k" })
             MatchRuntime.MatchEndedAt = nil
+            MatchRuntime.LastSpeedRequest = -math.huge
         elseif not active and MatchRuntime.LastMatchActive then
             State.Playing = false
             State.RuntimeHandles = {}
@@ -4066,16 +4067,16 @@ task.spawn(function()
                 MatchRuntime.LastSkipRequest = os.clock()
                 task.spawn(function() Invoke(Remotes.Skip) end)
             end
-            if State.AutoSpeed and Remotes.Speed and GetSpeed() ~= State.Speed
-                and os.clock() - MatchRuntime.LastSpeedRequest >= 1 then
-                MatchRuntime.LastSpeedRequest = os.clock()
-                task.spawn(function()
-                    local ok, accepted = Invoke(Remotes.Speed, State.Speed)
-                    if not ok or accepted == false then
-                        SetStatus("Speed rejected", tostring(accepted))
-                    end
-                end)
-            end
+        end
+        if active and State.AutoSpeed and Remotes.Speed and GetSpeed() ~= State.Speed
+            and os.clock() - MatchRuntime.LastSpeedRequest >= 1 then
+            MatchRuntime.LastSpeedRequest = os.clock()
+            task.spawn(function()
+                local ok, accepted = Invoke(Remotes.Speed, State.Speed)
+                if not ok or accepted == false then
+                    SetStatus("Speed rejected", tostring(accepted))
+                end
+            end)
         end
 
         if mapVoting and State.AutoVoteMap and not MatchRuntime.VotedMap and Remotes.VoteMap then
