@@ -69,6 +69,7 @@ local State = {
     PlaybackEnabled = false,
     PlaybackMode = "Hybrid",
     ProfileName = "",
+    ProfilePlaceId = nil,
     Actions = {},
     RecordStartedAt = 0,
     NextHandle = 1,
@@ -548,6 +549,7 @@ local function SaveProfile(name)
     local wrote, reason = WriteVerifiedJson(ProfilePath(name), payload)
     if not wrote then return false, reason end
     State.ProfileName = name
+    State.ProfilePlaceId = game.PlaceId
     return true
 end
 
@@ -565,16 +567,12 @@ local function LoadProfile(name)
                 return HttpService:JSONDecode(readfile(candidate))
             end)
             if ok and type(value) == "table" and type(value.Actions) == "table" then
-                if value.PlaceId and tonumber(value.PlaceId) ~= game.PlaceId then
-                    lastReason = "Macro belongs to a different PlaceId"
-                else
-                    local valid, validationReason = ValidateActions(value.Actions)
-                    if valid then
-                        decoded = value
-                        break
-                    end
-                    lastReason = validationReason
+                local valid, validationReason = ValidateActions(value.Actions)
+                if valid then
+                    decoded = value
+                    break
                 end
+                lastReason = validationReason
             end
         end
     end
@@ -587,6 +585,7 @@ local function LoadProfile(name)
     end
     State.Actions = decoded.Actions
     State.ProfileName = name
+    State.ProfilePlaceId = tonumber(decoded.PlaceId)
     return true
 end
 
@@ -1175,6 +1174,15 @@ local function StartPlayback()
     if not IsMatchActive() then
         SetStatus("Playback armed", "Waiting for GameRunning and wave 1")
         return false, "Waiting for the match to start"
+    end
+    if State.ProfilePlaceId and State.ProfilePlaceId ~= game.PlaceId then
+        State.PlaybackSerial = State.MatchSerial
+        local reason = string.format(
+            "Macro belongs to PlaceId %s, current match is %s",
+            tostring(State.ProfilePlaceId), tostring(game.PlaceId)
+        )
+        SetStatus("Playback blocked", reason)
+        return false, reason
     end
 
     State.Playing = true
@@ -2549,13 +2557,22 @@ MacrosTab:Input({
 local profileValues = ListProfiles()
 if #profileValues == 0 then profileValues = { "(none)" } end
 local profileDropdown
+local profileSyncTarget
+local profileSyncSerial = 0
 local function RefreshProfiles(selectName)
     local values = ListProfiles()
     if #values == 0 then values = { "(none)" } end
+    local target = SanitizeName(selectName or State.ProfileName)
+    profileSyncSerial = profileSyncSerial + 1
+    local serial = profileSyncSerial
+    profileSyncTarget = target ~= "" and target or nil
     pcall(function() profileDropdown:Refresh(values) end)
-    if selectName and selectName ~= "" then
-        pcall(function() profileDropdown:Select(selectName) end)
+    if target ~= "" and table.find(values, target) then
+        pcall(function() profileDropdown:Select(target) end)
     end
+    task.delay(0.25, function()
+        if profileSyncSerial == serial then profileSyncTarget = nil end
+    end)
 end
 
 MacrosTab:Button({
@@ -2574,7 +2591,7 @@ MacrosTab:Button({
         if not ok then Notify("Create failed", tostring(reason)) return end
         RefreshProfiles(name)
         RefreshActions()
-        QueueSave()
+        SaveConfig()
         SetStatus("Created", name .. " is ready to record")
     end,
 })
@@ -2586,10 +2603,12 @@ profileDropdown = MacrosTab:Dropdown({
     Multi = false,
     Callback = function(value)
         if value == "(none)" then return end
+        value = SanitizeName(value)
+        if profileSyncTarget and value ~= profileSyncTarget then return end
         local ok, reason = LoadProfile(value)
         if ok then
             RefreshActions()
-            QueueSave()
+            SaveConfig()
             SetStatus("Loaded", string.format("%s | %d actions", value, #State.Actions))
         else
             SetStatus("Load failed", tostring(reason))
