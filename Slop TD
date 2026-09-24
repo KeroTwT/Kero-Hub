@@ -14,6 +14,7 @@ while not LocalPlayer do
     LocalPlayer = Players.LocalPlayer
 end
 local Environment = getgenv()
+local DEFAULT_HUB_LOADER_URL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Slop%20TD"
 
 local DEFAULT_MUTATORS = {
     TinySlop = {
@@ -104,6 +105,8 @@ local State = {
     AutoSpeed = false,
     AutoJump = false,
     AutoAntiMacro = false,
+    AutoExec = false,
+    AutoExecQueued = false,
     FpsBoost = false,
     BlackScreen = false,
     FpsBoostSerial = 0,
@@ -146,6 +149,12 @@ local State = {
     SummonCurrency = "Cash",
     SummonAmount = 10,
     SummonDelay = 1.5,
+    AutoBuyCrate = false,
+    AutoOpenCrate = false,
+    SelectedCrates = {},
+    BuyCrateAmount = 1,
+    OpenCrateAmount = 1,
+    CrateDelay = 1.5,
     SelectedMap = "Base",
     Complication = "Normal",
     FirstPlaybackActionDone = false,
@@ -227,6 +236,7 @@ local function RefreshObjects()
     local remoteRoot = ReplicatedStorage:FindFirstChild("Remotes")
     local summon = remoteRoot and remoteRoot:FindFirstChild("Summon")
     local playerData = remoteRoot and remoteRoot:FindFirstChild("PlayerData")
+    local inventory = remoteRoot and remoteRoot:FindFirstChild("Inventory")
     Remotes.Request = functions and functions:FindFirstChild("RequestTower")
     Remotes.Place = functions and functions:FindFirstChild("SpawnTower")
     Remotes.Upgrade = functions and functions:FindFirstChild("UpgradeTower")
@@ -248,6 +258,8 @@ local function RefreshObjects()
     Remotes.Summon = summon and summon:FindFirstChild("Summon")
     Remotes.SummonPremium = summon and summon:FindFirstChild("SummonPremium")
     Remotes.GetPlayerData = playerData and playerData:FindFirstChild("GetData")
+    Remotes.BuyCrate = inventory and inventory:FindFirstChild("BuyCrate")
+    Remotes.OpenCrate = inventory and inventory:FindFirstChild("OpenCrate")
     TowersFolder = Workspace:FindFirstChild("Towers")
     InfoFolder = Workspace:FindFirstChild("Info")
 end
@@ -1312,6 +1324,7 @@ State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
 State.AutoJump = Config.AutoJump == true
 State.AutoAntiMacro = Config.AutoAntiMacro == true
+State.AutoExec = Config.AutoExec == true
 State.FpsBoost = Config.FpsBoost == true
 State.BlackScreen = Config.BlackScreen == true
 State.Speed = math.clamp(tonumber(Config.Speed) or 1, 1, 5)
@@ -1343,6 +1356,14 @@ State.SummonCurrency = Config.SummonCurrency == "Gem" and "Gem" or "Cash"
 State.SummonAmount = table.find({ 1, 10, 50 }, tonumber(Config.SummonAmount))
     and tonumber(Config.SummonAmount) or 10
 State.SummonDelay = math.clamp(tonumber(Config.SummonDelay) or 1.5, 0.5, 10)
+State.AutoBuyCrate = Config.AutoBuyCrate == true
+State.AutoOpenCrate = Config.AutoOpenCrate == true
+State.SelectedCrates = LoadMutatorSelection(Config.SelectedCrates)
+State.BuyCrateAmount = table.find({ 1, 3, 10, 25, 50 }, tonumber(Config.BuyCrateAmount))
+    and tonumber(Config.BuyCrateAmount) or 1
+State.OpenCrateAmount = table.find({ 1, 10, 25, 50 }, tonumber(Config.OpenCrateAmount))
+    and tonumber(Config.OpenCrateAmount) or 1
+State.CrateDelay = math.clamp(tonumber(Config.CrateDelay) or 1.5, 0.5, 10)
 State.AutoPlace = Config.AutoPlace == true
 State.AutoUpgrade = Config.AutoUpgrade == true
 local function LoadSlotNumbers(source, defaults, minimum, maximum)
@@ -1384,6 +1405,7 @@ local function SaveConfig()
         AutoSpeed = State.AutoSpeed,
         AutoJump = State.AutoJump,
         AutoAntiMacro = State.AutoAntiMacro,
+        AutoExec = State.AutoExec,
         FpsBoost = State.FpsBoost,
         BlackScreen = State.BlackScreen,
         Speed = State.Speed,
@@ -1409,6 +1431,12 @@ local function SaveConfig()
         SummonCurrency = State.SummonCurrency,
         SummonAmount = State.SummonAmount,
         SummonDelay = State.SummonDelay,
+        AutoBuyCrate = State.AutoBuyCrate,
+        AutoOpenCrate = State.AutoOpenCrate,
+        SelectedCrates = State.SelectedCrates,
+        BuyCrateAmount = State.BuyCrateAmount,
+        OpenCrateAmount = State.OpenCrateAmount,
+        CrateDelay = State.CrateDelay,
         AutoPlace = State.AutoPlace,
         AutoUpgrade = State.AutoUpgrade,
         PlaceSlotPriority = State.PlaceSlotPriority,
@@ -1437,6 +1465,207 @@ local function QueueSave()
         saveQueued = false
         SaveConfig()
     end)
+end
+
+local function GetQueueOnTeleport()
+    if type(queue_on_teleport) == "function" then return queue_on_teleport end
+    if type(queueonteleport) == "function" then return queueonteleport end
+    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        return syn.queue_on_teleport
+    end
+    if type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" then
+        return fluxus.queue_on_teleport
+    end
+    return nil
+end
+
+local function QueueHubAutoExec(force)
+    if not State.AutoExec then return false, "Auto Execute is disabled" end
+    if State.AutoExecQueued and not force then
+        return true
+    end
+    local queue = GetQueueOnTeleport()
+    if not queue then
+        State.AutoExecQueued = false
+        return false, "Executor has no queue_on_teleport API"
+    end
+    local queuedSource = string.format([[
+if not game:IsLoaded() then game.Loaded:Wait() end
+task.wait(1)
+local enabled = true
+local url = %q
+if type(isfile) == "function" and type(readfile) == "function"
+    and isfile("SlopTD_Macros/Settings.json") then
+    pcall(function()
+        local settings = game:GetService("HttpService"):JSONDecode(
+            readfile("SlopTD_Macros/Settings.json")
+        )
+        enabled = settings.AutoExec == true
+    end)
+end
+if enabled then
+    local source = game:HttpGet(url)
+    local chunk, reason = loadstring(source)
+    if not chunk then error(reason) end
+    chunk()
+end
+]], DEFAULT_HUB_LOADER_URL)
+    local ok, reason = pcall(queue, queuedSource)
+    if not ok then
+        State.AutoExecQueued = false
+        return false, reason
+    end
+    State.AutoExecQueued = true
+    return true
+end
+
+Hub.Crates = {
+    Catalog = {},
+    Fallback = {
+        ["Alien Crate"] = { Currency = "Stars", BasePrice = 500 },
+        ["Garden Crate"] = { Currency = "Sheckles", BasePrice = 50 },
+        ["Slopbux Crate 2"] = { Currency = "Slopbux", BasePrice = 10 },
+        ["Space Crate"] = { Currency = "Stars", BasePrice = 50 },
+        ["Still Life Crate"] = { Currency = "Gems", BasePrice = 100 },
+    },
+}
+do
+local Crates = Hub.Crates
+
+function Crates.ParseCompactNumber(value)
+    local text = tostring(value or ""):upper():gsub(",", ""):gsub("%s", "")
+    local number, suffix = text:match("^([%d%.]+)([KMB]?)$")
+    number = tonumber(number)
+    if not number then return nil end
+    local multipliers = { K = 1e3, M = 1e6, B = 1e9 }
+    return number * (multipliers[suffix] or 1)
+end
+
+function Crates.NormalizeCurrency(value)
+    local text = tostring(value or ""):lower()
+    if text:find("slopbux", 1, true) then return "Slopbux" end
+    if text:find("sheckle", 1, true) then return "Sheckles" end
+    if text:find("gem", 1, true) then return "Gems" end
+    if text:find("star", 1, true) then return "Stars" end
+    return nil
+end
+
+function Crates.ReadPrice(title)
+    if not title or not (title:IsA("TextLabel") or title:IsA("TextButton")) then return nil, nil end
+    local amountText, currencyText = tostring(title.Text or ""):match("^%s*([%d%.,]+%s*[KMBkmb]?)%s+(.+)%s*$")
+    return Crates.ParseCompactNumber(amountText), Crates.NormalizeCurrency(currencyText)
+end
+
+function Crates.Discover()
+    local catalog = {}
+    for name, entry in pairs(Crates.Fallback) do
+        catalog[name] = {
+            Name = name,
+            Currency = entry.Currency,
+            BasePrice = entry.BasePrice,
+            Prices = {},
+        }
+    end
+
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local main = playerGui and playerGui:FindFirstChild("Main")
+    local shop = main and main:FindFirstChild("Shop")
+    local list = shop and shop:FindFirstChild("List")
+    local scrolling = list and list:FindFirstChild("ScrollingFrame")
+    if scrolling then
+        for _, frame in ipairs(scrolling:GetChildren()) do
+            local actions = frame:FindFirstChild("Actions")
+            if actions then
+                local title = frame:FindFirstChild("Title")
+                local name = title and title:IsA("TextLabel") and tostring(title.Text) or frame.Name
+                if name ~= "" and name:lower():find("crate", 1, true) then
+                    local entry = catalog[name] or { Name = name, Prices = {} }
+                    entry.Prices = entry.Prices or {}
+                    for _, amount in ipairs({ 1, 3, 10, 25, 50 }) do
+                        local button = actions:FindFirstChild(tostring(amount))
+                        local price, currency = Crates.ReadPrice(button and button:FindFirstChild("Title"))
+                        if price then entry.Prices[amount] = price end
+                        if currency then entry.Currency = currency end
+                    end
+                    if not entry.BasePrice and entry.Prices[1] then entry.BasePrice = entry.Prices[1] end
+                    if entry.Currency then catalog[name] = entry end
+                end
+            end
+        end
+    end
+    Crates.Catalog = catalog
+    return catalog
+end
+
+function Crates.Label(name)
+    local entry = Crates.Catalog[tostring(name)] or Crates.Fallback[tostring(name)]
+    return entry and string.format("%s [%s]", tostring(name), tostring(entry.Currency)) or tostring(name)
+end
+
+function Crates.GetDropdownValues()
+    Crates.Discover()
+    local values = {}
+    for name in pairs(Crates.Catalog) do table.insert(values, Crates.Label(name)) end
+    table.sort(values, function(a, b) return a:lower() < b:lower() end)
+    return values
+end
+
+function Crates.NameFromLabel(label)
+    label = tostring(label or "")
+    for name in pairs(Crates.Catalog) do
+        if label == name or label == Crates.Label(name) then return name end
+    end
+    return nil
+end
+
+function Crates.NormalizeSelection(value)
+    local result, seen = {}, {}
+    if type(value) ~= "table" then return result end
+    for key, item in pairs(value) do
+        local selected = type(key) == "number" and item or (item == true and key or nil)
+        local name = Crates.NameFromLabel(selected)
+        if name and not seen[name] then
+            seen[name] = true
+            table.insert(result, name)
+        end
+    end
+    table.sort(result)
+    return result
+end
+
+function Crates.SelectionForDropdown()
+    local values = {}
+    for _, name in ipairs(State.SelectedCrates) do
+        if Crates.Catalog[name] then table.insert(values, Crates.Label(name)) end
+    end
+    return values
+end
+
+function Crates.GetCurrencyBalance(currency)
+    RefreshObjects()
+    local ok, data = Invoke(Remotes.GetPlayerData)
+    if ok and type(data) == "table" then
+        local keys = {
+            Stars = { "Stars", "Star" },
+            Gems = { "Gems", "Gem" },
+            Slopbux = { "Slopbux" },
+            Sheckles = { "Sheckles" },
+        }
+        for _, key in ipairs(keys[currency] or {}) do
+            local value = tonumber(data[key])
+            if value then return value end
+        end
+    end
+    local leaderstats = LocalPlayer and LocalPlayer:FindFirstChild("leaderstats")
+    local value = leaderstats and leaderstats:FindFirstChild(currency)
+    return value and value:IsA("ValueBase") and Crates.ParseCompactNumber(value.Value) or nil
+end
+
+function Crates.SetStatus(title, description)
+    if not Gui.CrateStatus then return end
+    Gui.CrateStatus:SetTitle(tostring(title))
+    Gui.CrateStatus:SetDesc(tostring(description or ""))
+end
 end
 
 -- Gems only exist in lobby UI/leaderstats. Cache the latest lobby balance so
@@ -1909,13 +2138,94 @@ LobbyTab:Slider({
         QueueSave()
     end,
 })
-local autoSummonToggle
-autoSummonToggle = LobbyTab:Toggle({
+Gui.AutoSummonToggle = LobbyTab:Toggle({
     Title = "Auto Summon",
     Value = State.AutoSummon,
     Callback = function(value)
         State.AutoSummon = value == true
         QueueSave()
+    end,
+})
+
+LobbyTab:Section({ Title = "Crates" })
+Gui.CrateStatus = WrapParagraph(LobbyTab:Paragraph({
+    Title = "Crate automation",
+    Desc = "Ready",
+}))
+Gui.CrateDropdown = LobbyTab:Dropdown({
+    Title = "Crates",
+    Desc = "Select multiple crates",
+    Values = Hub.Crates.GetDropdownValues(),
+    Value = Hub.Crates.SelectionForDropdown(),
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Callback = function(value)
+        State.SelectedCrates = Hub.Crates.NormalizeSelection(value)
+        QueueSave()
+        Hub.Crates.SetStatus(
+            "Crate selection updated",
+            #State.SelectedCrates > 0 and table.concat(State.SelectedCrates, ", ") or "Select at least one crate"
+        )
+    end,
+})
+LobbyTab:Dropdown({
+    Title = "Buy Amount",
+    Values = { "x1", "x3", "x10", "x25", "x50" },
+    Value = "x" .. tostring(State.BuyCrateAmount),
+    Multi = false,
+    Callback = function(value)
+        State.BuyCrateAmount = tonumber(tostring(value):match("%d+")) or 1
+        QueueSave()
+    end,
+})
+LobbyTab:Toggle({
+    Title = "Auto Buy Crate",
+    Desc = "Buys selected crates",
+    Value = State.AutoBuyCrate,
+    Callback = function(value)
+        State.AutoBuyCrate = value == true
+        QueueSave()
+    end,
+})
+LobbyTab:Dropdown({
+    Title = "Open Amount",
+    Values = { "x1", "x10", "x25", "x50" },
+    Value = "x" .. tostring(State.OpenCrateAmount),
+    Multi = false,
+    Callback = function(value)
+        State.OpenCrateAmount = tonumber(tostring(value):match("%d+")) or 1
+        QueueSave()
+    end,
+})
+LobbyTab:Toggle({
+    Title = "Auto Open Crate",
+    Desc = "Opens selected crates",
+    Value = State.AutoOpenCrate,
+    Callback = function(value)
+        State.AutoOpenCrate = value == true
+        QueueSave()
+    end,
+})
+LobbyTab:Slider({
+    Title = "Action Delay",
+    Step = 0.5,
+    Value = { Min = 0.5, Max = 10, Default = State.CrateDelay },
+    Callback = function(value)
+        State.CrateDelay = math.clamp(tonumber(value) or 1.5, 0.5, 10)
+        QueueSave()
+    end,
+})
+LobbyTab:Button({
+    Title = "Refresh Crate List",
+    Icon = "refresh-cw",
+    Callback = function()
+        local values = Hub.Crates.GetDropdownValues()
+        pcall(function()
+            Gui.CrateDropdown:Refresh(values)
+            Gui.CrateDropdown:Select(Hub.Crates.SelectionForDropdown())
+        end)
+        Hub.Crates.SetStatus("Crate list refreshed", string.format("%d crates detected", #values))
     end,
 })
 
@@ -2741,6 +3051,29 @@ if State.BlackScreen then
     end)
 end
 
+MiscTab:Section({ Title = "Auto Execute" })
+Gui.AutoExecToggle = MiscTab:Toggle({
+    Title = "Auto Execute",
+    Desc = "Runs the hub after teleport",
+    Value = State.AutoExec,
+    Callback = function(value)
+        State.AutoExec = value == true
+        SaveConfig()
+        if State.AutoExec then
+            local ok, reason = QueueHubAutoExec()
+            if not ok then
+                State.AutoExec = false
+                SaveConfig()
+                if Gui.AutoExecToggle then
+                    task.defer(function() pcall(function() Gui.AutoExecToggle:Set(false) end) end)
+                end
+                Notify("Auto Execute unavailable", tostring(reason))
+            end
+        end
+    end,
+})
+if State.AutoExec then task.defer(QueueHubAutoExec) end
+
 MiscTab:Section({ Title = "Wave & Speed" })
 MiscTab:Toggle({
     Title = "Auto Skip Waves",
@@ -3476,7 +3809,7 @@ task.spawn(function()
                     )
                 else
                     State.AutoSummon = false
-                    pcall(function() autoSummonToggle:Set(false) end)
+                    pcall(function() Gui.AutoSummonToggle:Set(false) end)
                     QueueSave()
                     SetLobbyStatus("Auto Summon stopped", tostring(towers or "Summon was rejected"))
                 end
@@ -3488,25 +3821,136 @@ task.spawn(function()
     end
 end)
 
-local lastMatchActive = IsMatchActive()
-if lastMatchActive then State.MatchSerial = 1 end
-local lastMapVoting = IsMapVoting()
-local lastComplicationVoting = IsComplicationVoting()
-local votedMap = false
-local votedComplication = false
-local lastSkipRequest = 0
-local lastSpeedRequest = 0
-local matchEndedAt
-local endScreenVisible = IsEndScreenVisible()
-local endScreenShownAt = endScreenVisible and os.clock() or nil
-local endActionSent = false
-local webhookSent = false
-local webhookPending = false
-local webhookStartedAt = 0
-local recordingFinalizePending = false
+do
+local crateBuyIndex = 0
+local crateOpenIndex = 0
+local function NextSelectedCrate(index)
+    local count = #State.SelectedCrates
+    if count == 0 then return nil, 0 end
+    index = (index % count) + 1
+    return State.SelectedCrates[index], index
+end
+
+local function RunAutoBuyCrate()
+    local crateName
+    crateName, crateBuyIndex = NextSelectedCrate(crateBuyIndex)
+    if not crateName then
+        Hub.Crates.SetStatus("Auto Buy waiting", "Select at least one crate")
+        return false
+    end
+    RefreshObjects()
+    Hub.Crates.Discover()
+    if not Remotes.BuyCrate then
+        Hub.Crates.SetStatus("Auto Buy waiting", "BuyCrate remote is unavailable")
+        return false
+    end
+    local entry = Hub.Crates.Catalog[crateName]
+    if not entry or not entry.Currency then
+        Hub.Crates.SetStatus("Auto Buy skipped", crateName .. " has no verified currency")
+        return false
+    end
+    local amount = State.BuyCrateAmount
+    local price = entry.Prices and entry.Prices[amount]
+        or (entry.BasePrice and entry.BasePrice * amount)
+    local balance = Hub.Crates.GetCurrencyBalance(entry.Currency)
+    if price and balance and balance < price then
+        Hub.Crates.SetStatus(
+            "Auto Buy waiting: " .. crateName,
+            string.format("Need %s %s | Balance: %s", FormatNumber(price), entry.Currency, FormatNumber(balance))
+        )
+        return false
+    end
+    local ok, reason = Fire(Remotes.BuyCrate, crateName, amount)
+    if not ok then
+        Hub.Crates.SetStatus("Auto Buy failed", tostring(reason))
+        return false
+    end
+    Hub.Crates.SetStatus(
+        "Buy request sent",
+        string.format("%s x%d | %s%s", crateName, amount, entry.Currency, price and (" " .. FormatNumber(price)) or "")
+    )
+    return true
+end
+
+local function RunAutoOpenCrate()
+    local crateName
+    crateName, crateOpenIndex = NextSelectedCrate(crateOpenIndex)
+    if not crateName then
+        Hub.Crates.SetStatus("Auto Open waiting", "Select at least one crate")
+        return false
+    end
+    RefreshObjects()
+    if not Remotes.OpenCrate then
+        Hub.Crates.SetStatus("Auto Open waiting", "OpenCrate remote is unavailable")
+        return false
+    end
+    local amount = State.OpenCrateAmount
+    local ok, rewards = Invoke(Remotes.OpenCrate, crateName, amount)
+    if not ok then
+        Hub.Crates.SetStatus("Auto Open failed: " .. crateName, tostring(rewards))
+        return false
+    end
+    local count = type(rewards) == "table" and #rewards or 0
+    if count == 0 then
+        Hub.Crates.SetStatus("Auto Open waiting: " .. crateName, "No crates opened; check inventory or lower the amount")
+        return false
+    end
+    local first = rewards[1]
+    local best = type(first) == "table" and tostring(first.Name or "") or ""
+    local modifier = type(first) == "table" and tostring(first.Modifier or "") or ""
+    if modifier ~= "" and best ~= "" then best = modifier .. " " .. best end
+    Hub.Crates.SetStatus(
+        "Opened " .. crateName,
+        string.format("x%d%s", count, best ~= "" and (" | First: " .. best) or "")
+    )
+    return true
+end
+
+task.spawn(function()
+    while State.Running do
+        local active = game.PlaceId == LobbyPlaceId
+            and (State.AutoBuyCrate or State.AutoOpenCrate)
+        if active and #State.SelectedCrates == 0 then
+            Hub.Crates.SetStatus("Crate automation waiting", "Select at least one crate")
+            task.wait(0.5)
+        elseif active then
+            if State.AutoBuyCrate then
+                RunAutoBuyCrate()
+                task.wait(State.CrateDelay)
+            end
+            if State.Running and State.AutoOpenCrate then
+                RunAutoOpenCrate()
+                task.wait(State.CrateDelay)
+            end
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+end
+
+local MatchRuntime = {
+    LastMatchActive = IsMatchActive(),
+    LastMapVoting = IsMapVoting(),
+    LastComplicationVoting = IsComplicationVoting(),
+    VotedMap = false,
+    VotedComplication = false,
+    LastSkipRequest = 0,
+    LastSpeedRequest = 0,
+    MatchEndedAt = nil,
+    EndScreenVisible = IsEndScreenVisible(),
+    EndScreenShownAt = nil,
+    EndActionSent = false,
+    WebhookSent = false,
+    WebhookPending = false,
+    WebhookStartedAt = 0,
+    RecordingFinalizePending = false,
+}
+MatchRuntime.EndScreenShownAt = MatchRuntime.EndScreenVisible and os.clock() or nil
+if MatchRuntime.LastMatchActive then State.MatchSerial = 1 end
 local function FinalizeRecordingAtMatchEnd()
-    if not State.Recording or recordingFinalizePending then return end
-    recordingFinalizePending = true
+    if not State.Recording or MatchRuntime.RecordingFinalizePending then return end
+    MatchRuntime.RecordingFinalizePending = true
     task.spawn(function()
         -- Let any final replicated tower changes already queued this frame reach the recorder.
         task.wait(0.2)
@@ -3520,7 +3964,7 @@ local function FinalizeRecordingAtMatchEnd()
                 Notify("Auto-save failed", tostring(reason))
             end
         end
-        recordingFinalizePending = false
+        MatchRuntime.RecordingFinalizePending = false
     end)
 end
 task.spawn(function()
@@ -3547,10 +3991,10 @@ task.spawn(function()
         local complicationVoting = IsComplicationVoting()
         local currentEndScreenVisible = IsEndScreenVisible()
 
-        if mapVoting and not lastMapVoting then votedMap = false end
-        if complicationVoting and not lastComplicationVoting then votedComplication = false end
+        if mapVoting and not MatchRuntime.LastMapVoting then MatchRuntime.VotedMap = false end
+        if complicationVoting and not MatchRuntime.LastComplicationVoting then MatchRuntime.VotedComplication = false end
 
-        if active and not lastMatchActive then
+        if active and not MatchRuntime.LastMatchActive then
             State.MatchSerial = State.MatchSerial + 1
             State.PlaybackSerial = -1
             State.FirstPlaybackActionDone = false
@@ -3559,33 +4003,33 @@ task.spawn(function()
             State.AutoPlayTurn = "Place"
             State.AutoPlayMaxed = setmetatable({}, { __mode = "k" })
             State.AutoPlayUpgradeFailures = setmetatable({}, { __mode = "k" })
-            matchEndedAt = nil
-        elseif not active and lastMatchActive then
+            MatchRuntime.MatchEndedAt = nil
+        elseif not active and MatchRuntime.LastMatchActive then
             State.Playing = false
             State.RuntimeHandles = {}
-            matchEndedAt = os.clock()
+            MatchRuntime.MatchEndedAt = os.clock()
         end
 
-        if currentEndScreenVisible and not endScreenVisible then
-            endScreenShownAt = os.clock()
-            endActionSent = false
-            webhookSent = false
-            webhookPending = false
+        if currentEndScreenVisible and not MatchRuntime.EndScreenVisible then
+            MatchRuntime.EndScreenShownAt = os.clock()
+            MatchRuntime.EndActionSent = false
+            MatchRuntime.WebhookSent = false
+            MatchRuntime.WebhookPending = false
         elseif not currentEndScreenVisible then
-            endScreenShownAt = nil
-            endActionSent = false
-            webhookSent = false
-            webhookPending = false
-        elseif not endScreenShownAt then
-            endScreenShownAt = matchEndedAt or os.clock()
+            MatchRuntime.EndScreenShownAt = nil
+            MatchRuntime.EndActionSent = false
+            MatchRuntime.WebhookSent = false
+            MatchRuntime.WebhookPending = false
+        elseif not MatchRuntime.EndScreenShownAt then
+            MatchRuntime.EndScreenShownAt = MatchRuntime.MatchEndedAt or os.clock()
         end
         if currentEndScreenVisible then
             FinalizeRecordingAtMatchEnd()
         end
-        endScreenVisible = currentEndScreenVisible
-        lastMatchActive = active
-        lastMapVoting = mapVoting
-        lastComplicationVoting = complicationVoting
+        MatchRuntime.EndScreenVisible = currentEndScreenVisible
+        MatchRuntime.LastMatchActive = active
+        MatchRuntime.LastMapVoting = mapVoting
+        MatchRuntime.LastComplicationVoting = complicationVoting
 
         local sellThresholdReached = active and State.AutoSellAll
             and GetWave() >= State.AutoSellWave
@@ -3618,13 +4062,13 @@ task.spawn(function()
         local automationReady = not State.PlaybackEnabled or State.FirstPlaybackActionDone
         if active and automationReady then
             if State.AutoSkip and Remotes.Skip and IsSkipAvailable()
-                and os.clock() - lastSkipRequest >= 1.5 then
-                lastSkipRequest = os.clock()
+                and os.clock() - MatchRuntime.LastSkipRequest >= 1.5 then
+                MatchRuntime.LastSkipRequest = os.clock()
                 task.spawn(function() Invoke(Remotes.Skip) end)
             end
             if State.AutoSpeed and Remotes.Speed and GetSpeed() ~= State.Speed
-                and os.clock() - lastSpeedRequest >= 1 then
-                lastSpeedRequest = os.clock()
+                and os.clock() - MatchRuntime.LastSpeedRequest >= 1 then
+                MatchRuntime.LastSpeedRequest = os.clock()
                 task.spawn(function()
                     local ok, accepted = Invoke(Remotes.Speed, State.Speed)
                     if not ok or accepted == false then
@@ -3634,33 +4078,33 @@ task.spawn(function()
             end
         end
 
-        if mapVoting and State.AutoVoteMap and not votedMap and Remotes.VoteMap then
+        if mapVoting and State.AutoVoteMap and not MatchRuntime.VotedMap and Remotes.VoteMap then
             local ok = Fire(Remotes.VoteMap, State.SelectedMap)
-            votedMap = ok
+            MatchRuntime.VotedMap = ok
         end
         if complicationVoting and State.AutoVoteComplication
-            and not votedComplication and Remotes.VoteComplication then
+            and not MatchRuntime.VotedComplication and Remotes.VoteComplication then
             local ok = Fire(Remotes.VoteComplication, State.Complication)
-            votedComplication = ok
+            MatchRuntime.VotedComplication = ok
         end
 
         if currentEndScreenVisible and State.WebhookEnabled
-            and State.WebhookMatchEnd and not webhookSent then
-            webhookSent = true
-            webhookPending = true
-            webhookStartedAt = os.clock()
+            and State.WebhookMatchEnd and not MatchRuntime.WebhookSent then
+            MatchRuntime.WebhookSent = true
+            MatchRuntime.WebhookPending = true
+            MatchRuntime.WebhookStartedAt = os.clock()
             task.spawn(function()
                 local ok, reason = SendMatchEndWebhook()
-                webhookPending = false
+                MatchRuntime.WebhookPending = false
                 if not ok and State.Running then
                     SetStatus("Webhook failed", tostring(reason))
                 end
             end)
         end
 
-        if State.EndAction ~= "None" and endScreenShownAt and not endActionSent
-            and os.clock() - endScreenShownAt >= 1.5
-            and (not webhookPending or os.clock() - webhookStartedAt >= 5) then
+        if State.EndAction ~= "None" and MatchRuntime.EndScreenShownAt and not MatchRuntime.EndActionSent
+            and os.clock() - MatchRuntime.EndScreenShownAt >= 1.5
+            and (not MatchRuntime.WebhookPending or os.clock() - MatchRuntime.WebhookStartedAt >= 5) then
             local ok, reason
             if State.EndAction == "Replay" then
                 ok, reason = Fire(Remotes.EndDecision, true)
@@ -3670,7 +4114,7 @@ task.spawn(function()
                 ok, reason = Fire(Remotes.ExitGame)
             end
             if ok then
-                endActionSent = true
+                MatchRuntime.EndActionSent = true
                 SetStatus("End action sent", State.EndAction)
             elseif reason then
                 SetStatus("End action unavailable", tostring(reason))
