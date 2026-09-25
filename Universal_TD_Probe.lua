@@ -814,7 +814,7 @@ local function callingContext()
     return context
 end
 
-local function captureOutgoing(remote, method, rawArguments, rawReturned, context, actionId, remotePath, sequence, observedElapsed)
+local function captureOutgoing(remote, method, rawArguments, rawReturned, context, actionId, remotePath, sequence, observedElapsed, capturePath)
     if not Probe.Running or not Config.CaptureOutgoing or not remoteAllowed(remote) then return end
     task.defer(function()
         if not Probe.Running then return end
@@ -827,6 +827,7 @@ local function captureOutgoing(remote, method, rawArguments, rawReturned, contex
         }
         emit("remote_out", {
             method = method,
+            capturePath = capturePath or "unknown",
             remote = serializePrecise(remote),
             arguments = serializePrecise(rawArguments),
             returned = rawReturned and serializePrecise(rawReturned) or nil,
@@ -841,7 +842,29 @@ local function captureOutgoing(remote, method, rawArguments, rawReturned, contex
     end)
 end
 
-local function installOutgoingHook()
+local DirectHookBypass = setmetatable({}, { __mode = "k" })
+local MainThreadKey = {}
+
+local function currentThreadKey()
+    return coroutine.running() or MainThreadKey
+end
+
+local function directHookIsBypassed()
+    return (DirectHookBypass[currentThreadKey()] or 0) > 0
+end
+
+local function pushDirectHookBypass()
+    local key = currentThreadKey()
+    DirectHookBypass[key] = (DirectHookBypass[key] or 0) + 1
+    return key
+end
+
+local function popDirectHookBypass(key)
+    local depth = (DirectHookBypass[key] or 1) - 1
+    DirectHookBypass[key] = depth > 0 and depth or nil
+end
+
+local function installNamecallHook()
     Environment.__UniversalTDProbeV2Capture = captureOutgoing
     Environment.__UniversalTDProbeV2Enabled = true
     if Environment.__UniversalTDProbeV2HookInstalled then
@@ -873,14 +896,107 @@ local function installOutgoingHook()
         local actionId = activeActionId()
         local sequence = reserveSequence()
         local observedElapsed = os.clock() - StartedAt
-        local returned = table.pack(oldNamecall(remote, ...))
+        local bypassKey = pushDirectHookBypass()
+        local callResult = table.pack(pcall(oldNamecall, remote, ...))
+        popDirectHookBypass(bypassKey)
+        if not callResult[1] then
+            error(callResult[2], 0)
+        end
+        local returned = table.pack(table.unpack(callResult, 2, callResult.n))
         local context = callingContext()
         local remotePath = safePath(remote)
-        pcall(capture, remote, method, rawArguments, returned, context, actionId, remotePath, sequence, observedElapsed)
+        pcall(capture, remote, method, rawArguments, returned, context, actionId, remotePath, sequence, observedElapsed, "__namecall")
         return table.unpack(returned, 1, returned.n)
     end))
     Environment.__UniversalTDProbeV2HookInstalled = true
     return true, "installed"
+end
+
+local function installDirectMethodHook(className, methodName, installedKey)
+    if Environment[installedKey] then
+        return true, "reused"
+    end
+    if type(hookfunction) ~= "function" or type(newcclosure) ~= "function" then
+        return false, "executor_missing_hookfunction"
+    end
+
+    local sample = Instance.new(className)
+    local readOk, targetMethod = pcall(function()
+        return sample[methodName]
+    end)
+    sample:Destroy()
+    if not readOk or type(targetMethod) ~= "function" then
+        return false, "method_unavailable"
+    end
+
+    local originalMethod
+    local hookOk, hookError = pcall(function()
+        originalMethod = hookfunction(targetMethod, newcclosure(function(remote, ...)
+            local callerIsExecutor = type(checkcaller) == "function" and checkcaller()
+            local capture = Environment.__UniversalTDProbeV2Capture
+            local eligible = Environment.__UniversalTDProbeV2Enabled == true
+                and type(capture) == "function"
+                and not callerIsExecutor
+                and not directHookIsBypassed()
+                and typeof(remote) == "Instance"
+
+            if not eligible then
+                return originalMethod(remote, ...)
+            end
+
+            -- Retain cheap references, run the original transport, then defer
+            -- precise serialization and file I/O through captureOutgoing.
+            local rawArguments = table.pack(...)
+            local actionId = activeActionId()
+            local sequence = reserveSequence()
+            local observedElapsed = os.clock() - StartedAt
+            local returned = table.pack(originalMethod(remote, ...))
+            local context = callingContext()
+            local remotePath = safePath(remote)
+            pcall(capture, remote, methodName, rawArguments, returned, context, actionId, remotePath, sequence, observedElapsed, "direct_" .. methodName)
+            return table.unpack(returned, 1, returned.n)
+        end))
+    end)
+
+    if not hookOk or type(originalMethod) ~= "function" then
+        return false, "hookfunction_failed:" .. clampText(hookError)
+    end
+    Environment[installedKey] = true
+    return true, "installed"
+end
+
+local function installOutgoingHooks()
+    Environment.__UniversalTDProbeV2Capture = captureOutgoing
+    Environment.__UniversalTDProbeV2Enabled = true
+
+    local namecallOk, namecallState = installNamecallHook()
+    local invokeOk, invokeState = installDirectMethodHook(
+        "RemoteFunction",
+        "InvokeServer",
+        "__UniversalTDProbeV2DirectInvokeInstalled"
+    )
+    local fireOk, fireState = installDirectMethodHook(
+        "RemoteEvent",
+        "FireServer",
+        "__UniversalTDProbeV2DirectFireInstalled"
+    )
+    local unreliableOk, unreliableState = installDirectMethodHook(
+        "UnreliableRemoteEvent",
+        "FireServer",
+        "__UniversalTDProbeV2DirectUnreliableFireInstalled"
+    )
+
+    local available = namecallOk or invokeOk or fireOk or unreliableOk
+    local coreAvailable = namecallOk and invokeOk and fireOk
+    local state = coreAvailable and "installed_all"
+        or available and "installed_partial"
+        or "unavailable"
+    return available, state, {
+        namecall = { available = namecallOk, state = namecallState },
+        invokeServer = { available = invokeOk, state = invokeState },
+        fireServer = { available = fireOk, state = fireState },
+        unreliableFireServer = { available = unreliableOk, state = unreliableState },
+    }
 end
 
 local function inspectClientClosures()
@@ -1009,7 +1125,7 @@ local function buildSummary(reason)
         limitations = {
             "Correlation is evidence, not a guaranteed server acknowledgement.",
             "Server-only state and non-replicated objects are invisible to any client probe.",
-            "A stopped metamethod hook remains installed but inert and is reused on the next V2 run.",
+            "Stopped outgoing hooks remain installed but inert and are reused on the next V2 run.",
         },
     }
 end
@@ -1087,10 +1203,16 @@ if CanWrite then
 end
 
 local hookOk, hookState = false, "disabled_for_mode"
+local hookDetails = {}
 if Config.CaptureOutgoing then
-    hookOk, hookState = installOutgoingHook()
+    hookOk, hookState, hookDetails = installOutgoingHooks()
 end
-Probe.Hook = { enabled = Config.CaptureOutgoing, available = hookOk, state = hookState }
+Probe.Hook = {
+    enabled = Config.CaptureOutgoing,
+    available = hookOk,
+    state = hookState,
+    paths = hookDetails,
+}
 
 emit("session_started", {
     placeId = game.PlaceId,
@@ -1209,5 +1331,14 @@ end)
 
 flush()
 print("[Universal TD Probe] Running in", Config.Mode, "mode.")
+if Config.CaptureOutgoing then
+    local paths = Probe.Hook.paths or {}
+    print(
+        "[Universal TD Probe] Hooks:",
+        "__namecall=" .. tostring(paths.namecall and paths.namecall.state or "unavailable"),
+        "InvokeServer=" .. tostring(paths.invokeServer and paths.invokeServer.state or "unavailable"),
+        "FireServer=" .. tostring(paths.fireServer and paths.fireServer.state or "unavailable")
+    )
+end
 print("[Universal TD Probe] Play normally, then run: getgenv().UniversalTDProbe.Stop()")
 print("[Universal TD Probe] Files:", JsonlFile, SummaryFile)
