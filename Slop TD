@@ -168,7 +168,7 @@ local State = {
     UpgradeSlotMax = { 10, 10, 10, 10, 10, 10 },
     RoutePercent = 50,
     PlacementRadius = 12,
-    PlacementSpacing = 4,
+    PlacementSpacing = 0.75,
     PlacementWave = 1,
     PlacementDelay = 0.75,
     PlacementPriority = "Place First",
@@ -176,6 +176,11 @@ local State = {
     PlacementNode = nil,
     PlacementRoute = nil,
     PlacementRouteMap = nil,
+    PlacementRejectedPoints = {},
+    LoadoutIdentity = {},
+    LoadoutIdentityAt = -math.huge,
+    LoadoutIdentityReady = false,
+    LoadoutIdentityBusy = false,
     UpgradeWave = 1,
     UpgradeDelay = 0.5,
     AutoPlayBusy = false,
@@ -1015,7 +1020,10 @@ local function FindNewTower(before, unit, cframe)
         if not TowersFolder then return false end
         local candidates = {}
         for _, tower in ipairs(TowersFolder:GetChildren()) do
-            if not before[tower] and IsOwnTower(tower) and GetTowerName(tower) == unit then
+            local towerName = GetTowerName(tower)
+            local sameUnit = towerName == unit
+                or ResolveBaseUnitName(towerName) == ResolveBaseUnitName(unit)
+            if not before[tower] and IsOwnTower(tower) and sameUnit then
                 local pivot = GetTowerCFrame(tower)
                 local distance = pivot and (pivot.Position - cframe.Position).Magnitude or math.huge
                 if distance <= 2 then
@@ -1384,7 +1392,11 @@ State.UpgradeSlotPriority = LoadSlotNumbers(Config.UpgradeSlotPriority, State.Up
 State.UpgradeSlotMax = LoadSlotNumbers(Config.UpgradeSlotMax, State.UpgradeSlotMax, 1, 10)
 State.RoutePercent = math.clamp(math.floor(tonumber(Config.RoutePercent) or 50), 0, 100)
 State.PlacementRadius = math.clamp(tonumber(Config.PlacementRadius) or 12, 2, 40)
-State.PlacementSpacing = math.clamp(tonumber(Config.PlacementSpacing) or 4, 1, 12)
+State.PlacementSpacing = math.clamp(
+    tonumber(Config.PlacementSpacing) == 4 and 0.75 or tonumber(Config.PlacementSpacing) or 0.75,
+    0.25,
+    8
+)
 State.PlacementWave = math.clamp(tonumber(Config.PlacementWave) or 1, 0, 100)
 State.PlacementDelay = math.clamp(tonumber(Config.PlacementDelay) or 0.75, 0.2, 5)
 State.PlacementPriority = table.find({ "Place First", "Upgrade First", "Balanced" }, Config.PlacementPriority)
@@ -2438,6 +2450,34 @@ end
 RebuildMutatorPriorityControls()
 
 local function GetLoadoutUnit(slot)
+    local now = os.clock()
+    if not State.LoadoutIdentityBusy
+        and (not State.LoadoutIdentityReady or now - State.LoadoutIdentityAt >= 5) then
+        State.LoadoutIdentityBusy = true
+        RefreshObjects()
+        local ok, playerData = Invoke(Remotes.GetPlayerData)
+        State.LoadoutIdentityBusy = false
+        State.LoadoutIdentityAt = now
+        if ok and type(playerData) == "table" and type(playerData.Towers) == "table" then
+            local identities = {}
+            for identity, towerData in pairs(playerData.Towers) do
+                local equippedSlot = type(towerData) == "table" and tonumber(towerData.Equipped) or nil
+                if equippedSlot and equippedSlot >= 1 and equippedSlot <= 6 then
+                    identities[equippedSlot] = {
+                        Variant = tostring(identity),
+                        Base = tostring(towerData.Name or ResolveBaseUnitName(identity)),
+                    }
+                end
+            end
+            State.LoadoutIdentity = identities
+            State.LoadoutIdentityReady = true
+        end
+    end
+
+    local identity = State.LoadoutIdentity[slot]
+    if identity and tostring(identity.Variant or "") ~= "" then
+        return tostring(identity.Variant)
+    end
     local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
     local towers = gameGui and gameGui:FindFirstChild("Towers")
@@ -2537,6 +2577,7 @@ local function RefreshPlacementRoutes(force)
         State.PlacementRoute = routes[1]
         State.PlacementRouteMap = map
         State.PlacementAttempt = 0
+        State.PlacementRejectedPoints = {}
     end
     State.PlacementRouteReason = nil
     State.PlacementNode = InterpolateRoute(State.PlacementRoute, State.RoutePercent)
@@ -2680,9 +2721,9 @@ PlacementTab:Slider({
 PlacementTab:Slider({
     Title = "Tower Spacing",
     Step = 0.25,
-    Value = { Min = 1, Max = 12, Default = State.PlacementSpacing },
+    Value = { Min = 0.25, Max = 8, Default = State.PlacementSpacing },
     Callback = function(value)
-        State.PlacementSpacing = math.clamp(tonumber(value) or 4, 1, 12)
+        State.PlacementSpacing = math.clamp(tonumber(value) or 0.75, 0.25, 8)
         QueueSave()
     end,
 })
@@ -3385,39 +3426,132 @@ local function GetPlacementCandidate(unitName)
     if not center then return nil, "Waiting for the map waypoint route" end
     local attempt = tonumber(State.PlacementAttempt) or 0
     local routes = State.PlacementRoutes or {}
-    if #routes > 1 then
-        local route = routes[(attempt % #routes) + 1]
-        center = InterpolateRoute(route, State.RoutePercent) or center
+    local map = State.PlacementRouteMap or GetCurrentMapModel()
+    -- Slop TD exposes the server-approved placement floor under TowerArea.
+    -- Build mostly contains map geometry/decorations and is not necessarily
+    -- placeable, so selecting points from it causes valid-looking requests to
+    -- be rejected by the server.
+    local towerArea = map and map:FindFirstChild("TowerArea")
+    local build = map and map:FindFirstChild("Build")
+    local placementSurface = towerArea or build
+    local blockedFolders = {}
+    for _, name in ipairs({ "Path", "Waypoints", "UnitsWaypoints" }) do
+        local folder = map and map:FindFirstChild(name)
+        if folder then table.insert(blockedFolders, folder) end
     end
-    local radius = math.min(State.PlacementRadius, State.PlacementSpacing * math.sqrt(attempt + 1))
-    local angle = attempt * 2.399963229728653
-    local x = center.X + math.cos(angle) * radius
-    local z = center.Z + math.sin(angle) * radius
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {
-        LocalPlayer.Character,
-        TowersFolder,
-        State.PlacementVisual,
-    }
-    local hit = Workspace:Raycast(Vector3.new(x, center.Y + 100, z), Vector3.new(0, -250, 0), params)
-    if not hit then return nil, "No map surface under this point" end
-
     RefreshObjects()
-    if TowersFolder then
-        for _, tower in ipairs(TowersFolder:GetChildren()) do
-            local pivot = GetTowerCFrame(tower)
-            if pivot then
-                local flatDistance = (Vector2.new(pivot.Position.X, pivot.Position.Z)
-                    - Vector2.new(hit.Position.X, hit.Position.Z)).Magnitude
-                if flatDistance < State.PlacementSpacing then
-                    return nil, "Point is too close to another tower"
+    local params = RaycastParams.new()
+    if placementSurface then
+        -- Raycast directly against the authoritative placement geometry. This
+        -- also lets the ray pass through paths, decorations, units and towers
+        -- that may visually sit above TowerArea.
+        params.FilterType = Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances = { placementSurface }
+    else
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local excluded = {}
+        if LocalPlayer.Character then table.insert(excluded, LocalPlayer.Character) end
+        if TowersFolder then table.insert(excluded, TowersFolder) end
+        if State.PlacementVisual then table.insert(excluded, State.PlacementVisual) end
+        params.FilterDescendantsInstances = excluded
+    end
+
+    -- Check a small footprint instead of only the exact center so every side
+    -- of the tower base remains supported by the allowed placement area.
+    local footprintRadius = math.clamp(State.PlacementSpacing * 0.5, 0.65, 1.35)
+    local template = GetTowerTemplate(unitName)
+    if template and template:IsA("Model") then
+        local ok, _, size = pcall(template.GetBoundingBox, template)
+        if ok and size then
+            footprintRadius = math.max(footprintRadius, math.clamp(math.min(size.X, size.Z) * 0.18, 0.65, 1.5))
+        end
+    end
+    local function castSurface(x, z, referenceY)
+        local hit = Workspace:Raycast(
+            Vector3.new(x, referenceY + 100, z),
+            Vector3.new(0, -250, 0),
+            params
+        )
+        if not hit or hit.Normal.Y < 0.55 then return nil end
+        for _, folder in ipairs(blockedFolders) do
+            if hit.Instance:IsDescendantOf(folder) then return nil end
+        end
+        if placementSurface and not hit.Instance:IsDescendantOf(placementSurface) then return nil end
+        return hit
+    end
+    local supportOffsets = {
+        Vector2.new(footprintRadius, 0),
+        Vector2.new(-footprintRadius, 0),
+        Vector2.new(0, footprintRadius),
+        Vector2.new(0, -footprintRadius),
+    }
+
+    for scan = 0, 31 do
+        local candidateAttempt = attempt + scan
+        local candidateCenter = center
+        local routeCount = math.max(1, #routes)
+        local routeIndex = (candidateAttempt % routeCount) + 1
+        if #routes > 1 then
+            local route = routes[routeIndex]
+            candidateCenter = InterpolateRoute(route, State.RoutePercent) or center
+        end
+
+        -- Two irrational sequences spread every consecutive batch across the
+        -- whole disk. The previous expanding spiral eventually clamped to the
+        -- outer rim and could retry that rim forever after several failures.
+        local spatialAttempt = math.floor(candidateAttempt / routeCount)
+        local radialUnit = (spatialAttempt * 0.7548776662466927) % 1
+        local angularUnit = (spatialAttempt * 0.5698402909980532) % 1
+        local radius = State.PlacementRadius * math.sqrt(radialUnit)
+        local angle = angularUnit * math.pi * 2
+        local x = candidateCenter.X + math.cos(angle) * radius
+        local z = candidateCenter.Z + math.sin(angle) * radius
+        local hit = castSurface(x, z, candidateCenter.Y)
+        local valid = hit ~= nil
+
+        if valid then
+            for _, offset in ipairs(supportOffsets) do
+                local support = castSurface(x + offset.X, z + offset.Y, candidateCenter.Y)
+                if not support or math.abs(support.Position.Y - hit.Position.Y) > 2.5 then
+                    valid = false
+                    break
                 end
             end
         end
+
+        if valid then
+            local point2 = Vector2.new(hit.Position.X, hit.Position.Z)
+            for _, rejected in ipairs(State.PlacementRejectedPoints) do
+                local rejected2 = Vector2.new(rejected.X, rejected.Z)
+                if (point2 - rejected2).Magnitude < math.max(0.5, State.PlacementSpacing) then
+                    valid = false
+                    break
+                end
+            end
+            if valid and TowersFolder then
+                for _, tower in ipairs(TowersFolder:GetChildren()) do
+                    local pivot = GetTowerCFrame(tower)
+                    if pivot then
+                        local tower2 = Vector2.new(pivot.Position.X, pivot.Position.Z)
+                        if (tower2 - point2).Magnitude < State.PlacementSpacing then
+                            valid = false
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
+        if valid then
+            State.PlacementAttempt = candidateAttempt
+            local y = hit.Position.Y + GetTemplateBottomOffset(unitName)
+            return CFrame.new(hit.Position.X, y, hit.Position.Z)
+        end
     end
-    local y = hit.Position.Y + GetTemplateBottomOffset(unitName)
-    return CFrame.new(hit.Position.X, y, hit.Position.Z)
+    State.PlacementAttempt = attempt + 32
+    return nil, towerArea
+        and "No valid TowerArea surface was found inside the range"
+        or "No valid placement surface was found inside the range"
 end
 
 local function UnitNamesMatch(left, right)
@@ -3481,7 +3615,8 @@ local function TryAutoPlace()
         if Gui.PlacementNode then Gui.PlacementNode:SetDesc("All equipped slots reached Max Placement") end
         return false, "complete"
     end
-    local baseUnit = ResolveBaseUnitName(variantUnit)
+    local identity = State.LoadoutIdentity[slot]
+    local baseUnit = identity and tostring(identity.Base or "") or ResolveBaseUnitName(variantUnit)
     if baseUnit == "" then return false, "unit" end
     local cframe, pointReason = GetPlacementCandidate(variantUnit)
     if not cframe then
@@ -3505,6 +3640,8 @@ local function TryAutoPlace()
     task.wait(0.05)
     local placedOk, spawned = Invoke(Remotes.Place, baseUnit, cframe, false, variantUnit, metadata)
     if not placedOk or spawned == false then
+        table.insert(State.PlacementRejectedPoints, cframe.Position)
+        if #State.PlacementRejectedPoints > 80 then table.remove(State.PlacementRejectedPoints, 1) end
         State.PlacementAttempt = (tonumber(State.PlacementAttempt) or 0) + 1
         if Gui.PlacementNode then Gui.PlacementNode:SetDesc("Searching for a valid point inside the range") end
         return false, "position"
@@ -3514,6 +3651,8 @@ local function TryAutoPlace()
         tower = FindNewTower(before, variantUnit, cframe)
     end
     if not tower then
+        table.insert(State.PlacementRejectedPoints, cframe.Position)
+        if #State.PlacementRejectedPoints > 80 then table.remove(State.PlacementRejectedPoints, 1) end
         if Gui.PlacementNode then Gui.PlacementNode:SetDesc("SpawnTower returned without a confirmed tower") end
         return false, "unconfirmed"
     end
@@ -3999,6 +4138,10 @@ task.spawn(function()
             State.PlaybackSerial = -1
             State.FirstPlaybackActionDone = false
             State.PlacementAttempt = 0
+            State.PlacementRejectedPoints = {}
+            State.LoadoutIdentity = {}
+            State.LoadoutIdentityReady = false
+            State.LoadoutIdentityAt = -math.huge
             RefreshPlacementRoutes(true)
             State.AutoPlayTurn = "Place"
             State.AutoPlayMaxed = setmetatable({}, { __mode = "k" })
