@@ -177,6 +177,7 @@ local State = {
     PlacementRoute = nil,
     PlacementRouteMap = nil,
     PlacementRejectedPoints = {},
+    AutoPlaceSlotFailures = {},
     LoadoutIdentity = {},
     LoadoutIdentityAt = -math.huge,
     LoadoutIdentityReady = false,
@@ -2469,8 +2470,19 @@ local function GetLoadoutUnit(slot)
                     }
                 end
             end
+            local changed = false
+            for equippedSlot = 1, 6 do
+                local previous = State.LoadoutIdentity[equippedSlot]
+                local current = identities[equippedSlot]
+                if tostring(previous and previous.Variant or "") ~= tostring(current and current.Variant or "")
+                    or tostring(previous and previous.Base or "") ~= tostring(current and current.Base or "") then
+                    changed = true
+                    break
+                end
+            end
             State.LoadoutIdentity = identities
             State.LoadoutIdentityReady = true
+            if changed then State.AutoPlaceSlotFailures = {} end
         end
     end
 
@@ -2681,6 +2693,7 @@ PlacementTab:Toggle({
         State.AutoPlace = value == true
         if State.AutoPlace then
             State.PlacementAttempt = 0
+            State.AutoPlaceSlotFailures = {}
             RefreshPlacementRoutes(true)
         end
         QueueSave()
@@ -2770,6 +2783,7 @@ for slot = 1, 6 do
         Value = { Min = 1, Max = 10, Default = State.PlaceSlotMax[slotIndex] },
         Callback = function(value)
             State.PlaceSlotMax[slotIndex] = math.clamp(math.floor(tonumber(value) or 1), 1, 10)
+            State.AutoPlaceSlotFailures[slotIndex] = nil
             QueueSave()
         end,
     })
@@ -2780,6 +2794,7 @@ for slot = 1, 6 do
         Value = { Min = 1, Max = 6, Default = State.PlaceSlotPriority[slotIndex] },
         Callback = function(value)
             State.PlaceSlotPriority[slotIndex] = math.clamp(math.floor(tonumber(value) or slotIndex), 1, 6)
+            State.AutoPlaceSlotFailures = {}
             QueueSave()
         end,
     })
@@ -3595,33 +3610,74 @@ local function CountPlacedBySlot()
     return counts
 end
 
-local function FindPlacementSlot()
+local function FindPlacementSlots()
     local counts = CountPlacedBySlot()
+    local candidates = {}
     for _, slot in ipairs(GetPrioritySlots(State.PlaceSlotPriority)) do
         local unit = GetLoadoutUnit(slot)
         local maximum = tonumber(State.PlaceSlotMax[slot]) or 1
         if unit ~= "" and counts[slot] < maximum then
-            return slot, unit, counts[slot], maximum
+            table.insert(candidates, {
+                Slot = slot,
+                Unit = unit,
+                Count = counts[slot],
+                Maximum = maximum,
+            })
         end
     end
-    return nil
+    return candidates
 end
 
-local function TryAutoPlace()
-    if not State.AutoPlace then return false, "disabled" end
-    if GetWave() < State.PlacementWave then return false, "wave" end
-    local slot, variantUnit, placedCount, maximum = FindPlacementSlot()
-    if not slot then
-        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("All equipped slots reached Max Placement") end
-        return false, "complete"
+State.PlacementFailureDelay = {
+    unit = 4,
+    request = 2,
+    point = 0.4,
+    position = 0.75,
+    unconfirmed = 2,
+}
+
+State.MarkPlacementSlotFailure = function(slot, variantUnit, reason)
+    local previous = State.AutoPlaceSlotFailures[slot]
+    local count = 1
+    if previous and previous.Unit == variantUnit and previous.Reason == reason then
+        count = (tonumber(previous.Count) or 0) + 1
     end
+    local baseDelay = State.PlacementFailureDelay[reason] or 1
+    local retryDelay = math.min(baseDelay * (2 ^ math.min(count - 1, 3)), 8)
+    State.AutoPlaceSlotFailures[slot] = {
+        Unit = variantUnit,
+        Reason = reason,
+        Count = count,
+        RetryAt = os.clock() + retryDelay,
+    }
+    return retryDelay
+end
+
+State.IsPlacementSlotReady = function(candidate)
+    local failure = State.AutoPlaceSlotFailures[candidate.Slot]
+    if not failure then return true end
+    if failure.Unit ~= candidate.Unit then
+        State.AutoPlaceSlotFailures[candidate.Slot] = nil
+        return true
+    end
+    return os.clock() >= (tonumber(failure.RetryAt) or 0)
+end
+
+State.TryPlacementCandidate = function(candidate)
+    local slot = candidate.Slot
+    local variantUnit = candidate.Unit
+    local placedCount = candidate.Count
+    local maximum = candidate.Maximum
     local identity = State.LoadoutIdentity[slot]
     local baseUnit = identity and tostring(identity.Base or "") or ResolveBaseUnitName(variantUnit)
-    if baseUnit == "" then return false, "unit" end
+    if baseUnit == "" then
+        State.MarkPlacementSlotFailure(slot, variantUnit, "unit")
+        return false, "unit"
+    end
     local cframe, pointReason = GetPlacementCandidate(variantUnit)
     if not cframe then
         State.PlacementAttempt = (tonumber(State.PlacementAttempt) or 0) + 1
-        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("Slot " .. slot .. " | " .. tostring(pointReason)) end
+        State.MarkPlacementSlotFailure(slot, variantUnit, "point")
         return false, "point"
     end
 
@@ -3633,7 +3689,7 @@ local function TryAutoPlace()
     end
     local ok, accepted, metadata = Invoke(Remotes.Request, { variantUnit, baseUnit }, false, true)
     if not ok or accepted == false then
-        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("Slot " .. slot .. " | RequestTower rejected " .. variantUnit) end
+        State.MarkPlacementSlotFailure(slot, variantUnit, "request")
         return false, "request"
     end
     if type(metadata) ~= "table" then metadata = {} end
@@ -3643,7 +3699,7 @@ local function TryAutoPlace()
         table.insert(State.PlacementRejectedPoints, cframe.Position)
         if #State.PlacementRejectedPoints > 80 then table.remove(State.PlacementRejectedPoints, 1) end
         State.PlacementAttempt = (tonumber(State.PlacementAttempt) or 0) + 1
-        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("Searching for a valid point inside the range") end
+        State.MarkPlacementSlotFailure(slot, variantUnit, "position")
         return false, "position"
     end
     local tower = typeof(spawned) == "Instance" and spawned or nil
@@ -3653,15 +3709,50 @@ local function TryAutoPlace()
     if not tower then
         table.insert(State.PlacementRejectedPoints, cframe.Position)
         if #State.PlacementRejectedPoints > 80 then table.remove(State.PlacementRejectedPoints, 1) end
-        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("SpawnTower returned without a confirmed tower") end
+        State.MarkPlacementSlotFailure(slot, variantUnit, "unconfirmed")
         return false, "unconfirmed"
     end
+    State.AutoPlaceSlotFailures[slot] = nil
     State.PlacementAttempt = (tonumber(State.PlacementAttempt) or 0) + 1
     if Gui.PlacementNode then
         Gui.PlacementNode:SetDesc(string.format("Slot %d | %s | %d/%d placed",
             slot, variantUnit, placedCount + 1, maximum))
     end
     return true
+end
+
+local function TryAutoPlace()
+    if not State.AutoPlace then return false, "disabled" end
+    if GetWave() < State.PlacementWave then return false, "wave" end
+    local candidates = FindPlacementSlots()
+    if #candidates == 0 then
+        if Gui.PlacementNode then Gui.PlacementNode:SetDesc("All equipped slots reached Max Placement") end
+        return false, "complete"
+    end
+
+    local failures = {}
+    local coolingDown = 0
+    for _, candidate in ipairs(candidates) do
+        if State.IsPlacementSlotReady(candidate) then
+            local didPlace, reason = State.TryPlacementCandidate(candidate)
+            if didPlace then return true end
+            table.insert(failures, string.format("S%d %s", candidate.Slot, tostring(reason)))
+            task.wait(0.03)
+        else
+            coolingDown = coolingDown + 1
+        end
+    end
+
+    if Gui.PlacementNode then
+        if #failures > 0 then
+            Gui.PlacementNode:SetDesc("No slot placed | " .. table.concat(failures, ", "))
+        elseif coolingDown > 0 then
+            Gui.PlacementNode:SetDesc("Rejected slots cooling down; retrying automatically")
+        else
+            Gui.PlacementNode:SetDesc("Waiting for an eligible loadout slot")
+        end
+    end
+    return false, "slots"
 end
 
 local function HasNextUpgrade(tower)
@@ -4139,6 +4230,7 @@ task.spawn(function()
             State.FirstPlaybackActionDone = false
             State.PlacementAttempt = 0
             State.PlacementRejectedPoints = {}
+            State.AutoPlaceSlotFailures = {}
             State.LoadoutIdentity = {}
             State.LoadoutIdentityReady = false
             State.LoadoutIdentityAt = -math.huge
