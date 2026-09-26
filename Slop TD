@@ -131,8 +131,6 @@ local State = {
     MutatorVoteSerial = 0,
     MutatorLastVoteSerial = -1,
     MutatorLastVoteId = nil,
-    MutatorLastVoteAt = -math.huge,
-    MutatorVoteAttempts = 0,
     ActiveMutator = nil,
     MutatorConnection = nil,
     MutatorBoundRemote = nil,
@@ -140,12 +138,21 @@ local State = {
     AutoSellWave = 100,
     AutoSellBusy = false,
     AutoSellTriggeredSerial = -1,
+    AutoAbility = false,
+    AutoAbilityWaveEnabled = false,
+    AutoAbilityWave = 1,
+    AutoAbilityBoss = false,
+    AbilityReady = setmetatable({}, { __mode = "k" }),
+    AbilityLastAttempt = setmetatable({}, { __mode = "k" }),
+    AbilityLastQuery = setmetatable({}, { __mode = "k" }),
+    AbilityWaveFired = setmetatable({}, { __mode = "k" }),
+    AbilityCooldownConnection = nil,
+    AbilityCooldownRemote = nil,
     EndAction = "None",
     WebhookEnabled = false,
     WebhookURL = "",
     WebhookMatchEnd = true,
     LastKnownGem = nil,
-    MatchRewardXP = nil,
     AutoLobby = false,
     LobbyPlayers = 1,
     AutoSummon = false,
@@ -207,6 +214,7 @@ end
 
 local Gui = {}
 local Remotes = {}
+local Ability = {}
 local TowersFolder
 local InfoFolder
 
@@ -253,6 +261,9 @@ local function RefreshObjects()
     Remotes.Sell = functions and functions:FindFirstChild("SellTower")
     Remotes.Skip = functions and functions:FindFirstChild("VoteSkip")
     Remotes.Speed = functions and functions:FindFirstChild("ChangeSpeed")
+    Remotes.GetAbilityCooldown = functions and functions:FindFirstChild("GetAbilityCooldown")
+    Remotes.ActivateAbility = events and events:FindFirstChild("ActivateAbility")
+    Remotes.AbilityCooldownUpdate = events and events:FindFirstChild("AbilityCooldownUpdate")
     Remotes.VoteMap = events and events:FindFirstChild("VoteForMap")
     Remotes.VoteComplication = events and events:FindFirstChild("VoteForComplication")
     Remotes.SlopMutator = events and events:FindFirstChild("SlopMutator")
@@ -404,6 +415,13 @@ local function GetConfig(tower)
     return tower and tower:FindFirstChild("Config")
 end
 
+function Ability.GetName(tower)
+    local config = GetConfig(tower)
+    local ability = config and config:FindFirstChild("Ability")
+    local name = ability and ability:IsA("ValueBase") and tostring(ability.Value) or ""
+    return name ~= "" and name or nil
+end
+
 local function IsOwnTower(tower)
     local config = GetConfig(tower)
     local owner = config and config:FindFirstChild("Owner")
@@ -510,7 +528,7 @@ local function ValidateActions(actions)
             end
             seenHandles[handle] = true
             liveHandles[handle] = true
-        elseif kind == "Upgrade" or kind == "Target" or kind == "Sell" then
+        elseif kind == "Upgrade" or kind == "Target" or kind == "Sell" or kind == "Ability" then
             if not liveHandles[handle] then
                 return false, string.format("Action %d references an unknown tower handle", index)
             end
@@ -519,6 +537,9 @@ local function ValidateActions(actions)
             end
             if kind == "Target" and tostring(action.Mode or "") == "" then
                 return false, string.format("Action %d has an invalid target mode", index)
+            end
+            if kind == "Ability" and tostring(action.Ability or "") == "" then
+                return false, string.format("Action %d has an invalid ability name", index)
             end
             if kind == "Sell" then liveHandles[handle] = nil end
         else
@@ -665,6 +686,38 @@ local function AddAction(action)
     table.insert(State.Actions, action)
     RefreshActions()
     SetStatus("Recording", string.format("Captured %s at wave %d", action.Type, action.Wave))
+end
+
+function Ability.BindCooldown()
+    local remote = Remotes.AbilityCooldownUpdate
+    if remote == State.AbilityCooldownRemote then return end
+    if State.AbilityCooldownConnection then
+        pcall(function() State.AbilityCooldownConnection:Disconnect() end)
+        State.AbilityCooldownConnection = nil
+    end
+    State.AbilityCooldownRemote = remote
+    if not remote or not remote:IsA("RemoteEvent") then return end
+    State.AbilityCooldownConnection = AddConnection(State.Connections, remote.OnClientEvent:Connect(function(tower, ready, remaining)
+        if typeof(tower) ~= "Instance" then return end
+        local wasReady = State.AbilityReady[tower]
+        local isReady = ready == true or tonumber(remaining) == 0
+        State.AbilityReady[tower] = isReady
+
+        -- A ready -> cooldown transition is the server-confirmed ability use.
+        -- Recording from this event avoids saving rejected FireServer attempts.
+        if State.Recording and wasReady == true and not isReady then
+            local meta = State.TowerMeta[tower]
+            local abilityName = Ability.GetName(tower)
+            if meta and abilityName then
+                AddAction({
+                    Type = "Ability",
+                    Handle = meta.Handle,
+                    Unit = GetTowerName(tower),
+                    Ability = abilityName,
+                })
+            end
+        end
+    end))
 end
 
 local function AttachTower(tower, recordPlacement)
@@ -834,6 +887,70 @@ local function Fire(remote, ...)
     return ok, reason
 end
 
+function Ability.QueryReady(tower, force)
+    if not tower or not tower.Parent or not Ability.GetName(tower) then return false end
+    local now = os.clock()
+    if force or State.AbilityReady[tower] == nil
+        or now - (State.AbilityLastQuery[tower] or -math.huge) >= 2 then
+        State.AbilityLastQuery[tower] = now
+        task.spawn(function()
+            local ok, ready, remaining = Invoke(Remotes.GetAbilityCooldown, tower)
+            if ok and tower.Parent and (ready ~= nil or remaining ~= nil) then
+                State.AbilityReady[tower] = ready == true or tonumber(remaining) == 0
+            end
+        end)
+    end
+    return State.AbilityReady[tower] == true
+end
+
+function Ability.IsBoss(mob)
+    if not mob or not mob.Parent then return false end
+    local marker = mob:FindFirstChild("IsABoss")
+    if marker and (not marker:IsA("BoolValue") or marker.Value) then return true end
+    return mob:GetAttribute("IsABoss") == true
+end
+
+function Ability.IsMobAlive(mob)
+    if not mob or not mob.Parent then return false end
+    local humanoid = mob:FindFirstChildOfClass("Humanoid")
+    if humanoid then return humanoid.Health > 0 end
+    local health = mob:FindFirstChild("Health") or mob:FindFirstChild("HP")
+    return not health or not health:IsA("ValueBase") or tonumber(health.Value) == nil
+        or tonumber(health.Value) > 0
+end
+
+function Ability.FindMobInRange(tower, bossOnly)
+    local towerCFrame = GetTowerCFrame(tower)
+    local config = GetConfig(tower)
+    local range = tonumber(GetValue(config, "Range", nil))
+    local mobs = Workspace:FindFirstChild("Mobs")
+    if not towerCFrame or not range or range <= 0 or not mobs then return nil end
+    local closest, closestDistance
+    for _, mob in ipairs(mobs:GetChildren()) do
+        if Ability.IsMobAlive(mob) and (not bossOnly or Ability.IsBoss(mob)) then
+            local mobCFrame = GetTowerCFrame(mob)
+            local distance = mobCFrame and (mobCFrame.Position - towerCFrame.Position).Magnitude
+            if distance and distance <= range and (not closestDistance or distance < closestDistance) then
+                closest, closestDistance = mob, distance
+            end
+        end
+    end
+    return closest
+end
+
+function Ability.Request(tower)
+    if not tower or not tower.Parent then return false, "tower missing" end
+    local abilityName = Ability.GetName(tower)
+    if not abilityName then return false, "no ability" end
+    if not Ability.QueryReady(tower) then return false, "cooldown" end
+    if os.clock() - (State.AbilityLastAttempt[tower] or -math.huge) < 1 then
+        return false, "pending"
+    end
+    State.AbilityLastAttempt[tower] = os.clock()
+    local ok, reason = Fire(Remotes.ActivateAbility, tower)
+    return ok, ok and abilityName or reason
+end
+
 local function FormatNumber(value)
     local number = tonumber(value)
     if not number then return "Unknown" end
@@ -846,43 +963,6 @@ end
 local function ParseNumber(value)
     local cleaned = tostring(value or ""):gsub(",", ""):gsub("%s", "")
     return tonumber(cleaned)
-end
-
-local function ParseRewardAmount(value)
-    local cleaned = tostring(value or ""):gsub(",", "")
-    local number = cleaned:match("^%s*[xX]?%s*([%d]+%.?%d*)%s*$")
-    return tonumber(number)
-end
-
-local function ReadRewardLabel(root, category, label)
-    local frame = root and root:FindFirstChild(category)
-    local object = frame and frame:FindFirstChild(label)
-    if object and (object:IsA("TextLabel") or object:IsA("TextButton")) then
-        return ParseRewardAmount(object.Text)
-    end
-    return nil
-end
-
-local function CaptureMatchRewardXP()
-    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
-    local voting = gameGui and gameGui:FindFirstChild("Voting")
-    local rewards = voting and voting:FindFirstChild("Rewards")
-    local items = rewards and rewards:FindFirstChild("Items")
-    local amount = ReadRewardLabel(items, "XP", "Amount")
-    if amount ~= nil then State.MatchRewardXP = amount end
-end
-
-local function GetMatchRewards()
-    local endScreen = GetEndScreen()
-    local stats = endScreen and endScreen:FindFirstChild("Stats")
-    return {
-        Cash = ReadRewardLabel(stats, "Coins", "Total"),
-        Gems = ReadRewardLabel(stats, "Gems", "Total"),
-        EXP = ReadRewardLabel(stats, "XP", "Total") or State.MatchRewardXP,
-        Crates = ReadRewardLabel(stats, "Chests", "Total"),
-        Crystals = ReadRewardLabel(stats, "Crystals", "Total"),
-    }
 end
 
 local function GetLiveGemBalance()
@@ -986,6 +1066,50 @@ local function SendDiscordWebhook(title, description, color, fields, imageURL, f
     return true
 end
 
+Hub.RewardDisplay = {
+    Coins = { Order = 1, Label = "💵 Cash" },
+    Gems = { Order = 2, Label = "💎 Gems" },
+    Chests = { Order = 3, Label = "📦 Crates" },
+    Crystals = { Order = 4, Label = "🔮 Crystals" },
+    Kills = { Order = 5, Label = "⚔️ Kills" },
+    Chi = { Order = 6, Label = "☯️ Chi" },
+    Bones = { Order = 7, Label = "🦴 Bones" },
+    Cogs = { Order = 8, Label = "⚙️ Cogs" },
+    Suns = { Order = 9, Label = "☀️ Suns" },
+    Sheckles = { Order = 10, Label = "¢ Sheckles" },
+    Stars = { Order = 11, Label = "⭐ Stars" },
+}
+
+function Hub.GetMatchRewardText()
+    local endScreen = GetEndScreen()
+    local stats = endScreen and endScreen:FindFirstChild("Stats")
+    if not stats then return "Reward data is unavailable" end
+    local rewards = {}
+    for _, frame in ipairs(stats:GetChildren()) do
+        local total = frame:FindFirstChild("Total")
+        local frameVisible = not frame:IsA("GuiObject") or frame.Visible
+        if total and (total:IsA("TextLabel") or total:IsA("TextButton"))
+            and total.Visible and frameVisible then
+            local text = tostring(total.Text or ""):gsub("^x%s*", "")
+            if text ~= "" and not text:lower():find("only wave", 1, true) then
+                local display = Hub.RewardDisplay[frame.Name]
+                table.insert(rewards, {
+                    Order = display and display.Order or 100,
+                    Name = frame.Name,
+                    Text = string.format("%s: %s", display and display.Label or frame.Name, text),
+                })
+            end
+        end
+    end
+    table.sort(rewards, function(a, b)
+        if a.Order ~= b.Order then return a.Order < b.Order end
+        return a.Name < b.Name
+    end)
+    local lines = {}
+    for _, reward in ipairs(rewards) do table.insert(lines, reward.Text) end
+    return #lines > 0 and table.concat(lines, "\n") or "No visible rewards"
+end
+
 local function SendMatchEndWebhook()
     if not State.WebhookEnabled or not State.WebhookMatchEnd then
         return false, "Match notifications are disabled"
@@ -996,7 +1120,6 @@ local function SendMatchEndWebhook()
         or result == "Defeat" and 16711680
         or 16776960
     local player = Players.LocalPlayer or LocalPlayer
-    local rewards = GetMatchRewards()
     local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
     local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
     local fields = {
@@ -1011,14 +1134,7 @@ local function SendMatchEndWebhook()
         },
         {
             name = "Match Rewards",
-            value = string.format(
-                "💵 Cash: %s\n💎 Gems: %s\n✨ EXP: %s\n📦 Crates: %s\n🔮 Crystals: %s",
-                FormatNumber(rewards.Cash),
-                FormatNumber(rewards.Gems),
-                FormatNumber(rewards.EXP),
-                FormatNumber(rewards.Crates),
-                FormatNumber(rewards.Crystals)
-            ),
+            value = Hub.GetMatchRewardText(),
             inline = false,
         },
     }
@@ -1179,6 +1295,24 @@ local function ExecuteAction(action)
         local confirmed = WaitUntil(function() return not tower.Parent end, 5, 0.05)
         if confirmed then State.RuntimeHandles[tostring(action.Handle)] = nil end
         return confirmed, confirmed and nil or "Sell was not confirmed"
+    elseif kind == "Ability" then
+        local abilityName = Ability.GetName(tower)
+        if not abilityName then return false, "Tower has no ability" end
+        if tostring(action.Ability or "") ~= abilityName then
+            return false, string.format("Ability mismatch: expected %s, got %s", tostring(action.Ability), abilityName)
+        end
+        Ability.QueryReady(tower, true)
+        local ready = WaitUntil(function()
+            Ability.QueryReady(tower)
+            return State.AbilityReady[tower] == true
+        end, 120, 0.2)
+        if not ready then return false, "Ability cooldown did not become ready" end
+        local ok, reason = Ability.Request(tower)
+        if not ok then return false, "ActivateAbility: " .. tostring(reason) end
+        local confirmed = WaitUntil(function()
+            return not tower.Parent or State.AbilityReady[tower] == false
+        end, 3, 0.05)
+        return confirmed, confirmed and nil or "Ability activation was not confirmed"
     end
     return false, "Unknown action type: " .. kind
 end
@@ -1388,6 +1522,10 @@ State.MutatorAutoPick = table.find(
 ) and Config.MutatorAutoPick or "Priority"
 State.AutoSellAll = Config.AutoSellAll == true
 State.AutoSellWave = math.clamp(math.floor(tonumber(Config.AutoSellWave) or 100), 1, 500)
+State.AutoAbility = Config.AutoAbility == true
+State.AutoAbilityWaveEnabled = Config.AutoAbilityWaveEnabled == true
+State.AutoAbilityWave = math.clamp(math.floor(tonumber(Config.AutoAbilityWave) or 1), 1, 500)
+State.AutoAbilityBoss = Config.AutoAbilityBoss == true
 local validEndActions = { ["None"] = true, ["Replay"] = true, ["New Map"] = true, ["Return Lobby"] = true }
 local configuredEndAction = tostring(Config.EndAction or "")
 if not validEndActions[configuredEndAction] then
@@ -1473,6 +1611,10 @@ local function SaveConfig()
         MutatorCatalog = State.MutatorCatalog,
         AutoSellAll = State.AutoSellAll,
         AutoSellWave = State.AutoSellWave,
+        AutoAbility = State.AutoAbility,
+        AutoAbilityWaveEnabled = State.AutoAbilityWaveEnabled,
+        AutoAbilityWave = State.AutoAbilityWave,
+        AutoAbilityBoss = State.AutoAbilityBoss,
         EndAction = State.EndAction,
         SelectedMap = State.SelectedMap,
         Complication = State.Complication,
@@ -2113,23 +2255,14 @@ TryAutoVoteMutator = function(force)
         SetMutatorStatus("No valid choice", reason)
         return false
     end
-    local repeatedChoice = State.MutatorLastVoteSerial == State.MutatorVoteSerial
-        and State.MutatorLastVoteId == id
-    if not force and repeatedChoice then
-        -- FireServer only confirms that the packet was sent; it does not confirm that
-        -- the server accepted the vote. Retry a few times while the offer is open so
-        -- a vote sent during a match-reset race is not silently lost.
-        if State.MutatorVoteAttempts >= 5
-            or os.clock() - State.MutatorLastVoteAt < 0.8 then
-            return true
-        end
+    if not force and State.MutatorLastVoteSerial == State.MutatorVoteSerial
+        and State.MutatorLastVoteId == id then
+        return true
     end
     local ok, failure = Fire(Remotes.SlopMutator, "Vote", id)
     if ok then
         State.MutatorLastVoteSerial = State.MutatorVoteSerial
         State.MutatorLastVoteId = id
-        State.MutatorLastVoteAt = os.clock()
-        State.MutatorVoteAttempts = repeatedChoice and State.MutatorVoteAttempts + 1 or 1
         local title = State.MutatorCatalog[id] and State.MutatorCatalog[id].Title or id
         SetMutatorStatus("Vote requested: " .. tostring(title), reason)
         return true
@@ -2370,6 +2503,50 @@ MatchTab:Toggle({
             State.AutoSellAll and string.format("Waiting for wave %d", State.AutoSellWave)
                 or "Towers will not be sold automatically"
         )
+        QueueSave()
+    end,
+})
+
+MatchTab:Section({ Title = "Abilities" })
+Gui.AbilityStatus = WrapParagraph(MatchTab:Paragraph({
+    Title = "Auto Ability",
+    Desc = "Waiting for an owned tower with a ready ability",
+}))
+MatchTab:Toggle({
+    Title = "Auto Ability",
+    Desc = "Uses ready abilities when an enemy is in range",
+    Value = State.AutoAbility,
+    Callback = function(value)
+        State.AutoAbility = value == true
+        QueueSave()
+    end,
+})
+MatchTab:Toggle({
+    Title = "Auto Ability On X Wave",
+    Desc = "Uses each ready ability once on the selected wave",
+    Value = State.AutoAbilityWaveEnabled,
+    Callback = function(value)
+        State.AutoAbilityWaveEnabled = value == true
+        State.AbilityWaveFired = setmetatable({}, { __mode = "k" })
+        QueueSave()
+    end,
+})
+MatchTab:Slider({
+    Title = "Ability Wave",
+    Step = 1,
+    Value = { Min = 1, Max = 500, Default = State.AutoAbilityWave },
+    Callback = function(value)
+        State.AutoAbilityWave = math.clamp(math.floor(tonumber(value) or 1), 1, 500)
+        State.AbilityWaveFired = setmetatable({}, { __mode = "k" })
+        QueueSave()
+    end,
+})
+MatchTab:Toggle({
+    Title = "Auto Ability On Boss",
+    Desc = "Requires a live IsABoss enemy inside the tower's range",
+    Value = State.AutoAbilityBoss,
+    Callback = function(value)
+        State.AutoAbilityBoss = value == true
         QueueSave()
     end,
 })
@@ -3270,8 +3447,6 @@ local function BindMutatorRemote()
                 State.MutatorVoteSerial = State.MutatorVoteSerial + 1
                 State.MutatorLastVoteSerial = -1
                 State.MutatorLastVoteId = nil
-                State.MutatorLastVoteAt = -math.huge
-                State.MutatorVoteAttempts = 0
                 State.MutatorVoteDeadline = tonumber(deadline)
 
                 local titles = {}
@@ -3302,7 +3477,6 @@ local function BindMutatorRemote()
                 State.ActiveMutator = id
                 State.CurrentMutatorOffer = {}
                 State.MutatorVoteDeadline = nil
-                State.MutatorVoteAttempts = 0
                 local entry = State.MutatorCatalog[id]
                 SetMutatorStatus(
                     "Active: " .. tostring(entry and entry.Title or id),
@@ -3314,25 +3488,10 @@ local function BindMutatorRemote()
 end
 
 BindMutatorRemote()
-AddConnection(State.Connections, ReplicatedStorage.DescendantAdded:Connect(function(descendant)
-    -- Some replay paths recreate Events/SlopMutator immediately before opening the
-    -- next vote. Bind on replication instead of relying only on the one-second poll.
-    if descendant.Name == "SlopMutator" and descendant:IsA("RemoteEvent") then
-        BindMutatorRemote()
-    end
-end))
 task.spawn(function()
     while State.Running do
         BindMutatorRemote()
         task.wait(1)
-    end
-end)
-task.spawn(function()
-    while State.Running do
-        if State.AutoVoteMutator and #State.CurrentMutatorOffer > 0 then
-            TryAutoVoteMutator()
-        end
-        task.wait(0.25)
     end
 end)
 
@@ -4228,6 +4387,88 @@ task.spawn(function()
 end)
 end
 
+function Ability.SetStatus(title, description)
+    if not Gui.AbilityStatus then return end
+    Gui.AbilityStatus:SetTitle(tostring(title))
+    Gui.AbilityStatus:SetDesc(tostring(description or ""))
+end
+
+function Ability.RunAutoStep()
+    if not TowersFolder then return false end
+    local wave = GetWave()
+    local foundAbility = false
+    local foundReady = false
+    local waitingForTarget = false
+
+    for _, tower in ipairs(TowersFolder:GetChildren()) do
+        local abilityName = IsOwnTower(tower) and Ability.GetName(tower) or nil
+        if abilityName then
+            foundAbility = true
+            local ready = Ability.QueryReady(tower)
+            if ready then
+                foundReady = true
+                local target
+                local trigger = ""
+
+                if State.AutoAbility then
+                    target = Ability.FindMobInRange(tower, false)
+                    trigger = "Auto"
+                end
+                if not target and State.AutoAbilityBoss then
+                    target = Ability.FindMobInRange(tower, true)
+                    trigger = "Boss"
+                end
+                if not target and State.AutoAbilityWaveEnabled
+                    and wave == State.AutoAbilityWave and not State.AbilityWaveFired[tower] then
+                    target = Ability.FindMobInRange(tower, false)
+                    trigger = "Wave " .. tostring(wave)
+                end
+
+                if target then
+                    local ok, detail = Ability.Request(tower)
+                    if ok then
+                        if trigger == ("Wave " .. tostring(wave)) then
+                            State.AbilityWaveFired[tower] = true
+                        end
+                        Ability.SetStatus(
+                            "Ability requested",
+                            string.format("%s | %s | %s", abilityName, trigger, target.Name)
+                        )
+                        return true
+                    elseif detail ~= "cooldown" and detail ~= "pending" then
+                        Ability.SetStatus("Ability unavailable", tostring(detail))
+                    end
+                else
+                    waitingForTarget = true
+                end
+            end
+        end
+    end
+
+    if not foundAbility then
+        Ability.SetStatus("Auto Ability", "No owned tower currently has an ability")
+    elseif not foundReady then
+        Ability.SetStatus("Auto Ability", "Waiting for ability cooldown")
+    elseif waitingForTarget then
+        Ability.SetStatus("Auto Ability", "Waiting for an in-range enemy or boss")
+    end
+    return false
+end
+
+task.spawn(function()
+    while State.Running do
+        RefreshObjects()
+        Ability.BindCooldown()
+        local enabled = State.AutoAbility or State.AutoAbilityWaveEnabled or State.AutoAbilityBoss
+        if enabled and IsMatchActive() and not State.Recording and not State.Playing then
+            Ability.RunAutoStep()
+            task.wait(0.2)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
 local MatchRuntime = {
     LastMatchActive = IsMatchActive(),
     LastMapVoting = IsMapVoting(),
@@ -4290,14 +4531,8 @@ task.spawn(function()
         local complicationVoting = IsComplicationVoting()
         local currentEndScreenVisible = IsEndScreenVisible()
 
-        if mapVoting and not MatchRuntime.LastMapVoting then
-            MatchRuntime.VotedMap = false
-            State.MatchRewardXP = nil
-        end
+        if mapVoting and not MatchRuntime.LastMapVoting then MatchRuntime.VotedMap = false end
         if complicationVoting and not MatchRuntime.LastComplicationVoting then MatchRuntime.VotedComplication = false end
-        if not currentEndScreenVisible and (mapVoting or complicationVoting or running) then
-            CaptureMatchRewardXP()
-        end
 
         if active and not MatchRuntime.LastMatchActive then
             State.MatchSerial = State.MatchSerial + 1
@@ -4313,6 +4548,10 @@ task.spawn(function()
             State.AutoPlayTurn = "Place"
             State.AutoPlayMaxed = setmetatable({}, { __mode = "k" })
             State.AutoPlayUpgradeFailures = setmetatable({}, { __mode = "k" })
+            State.AbilityReady = setmetatable({}, { __mode = "k" })
+            State.AbilityLastAttempt = setmetatable({}, { __mode = "k" })
+            State.AbilityLastQuery = setmetatable({}, { __mode = "k" })
+            State.AbilityWaveFired = setmetatable({}, { __mode = "k" })
             MatchRuntime.MatchEndedAt = nil
             MatchRuntime.LastSpeedRequest = -math.huge
         elseif not active and MatchRuntime.LastMatchActive then
@@ -4405,8 +4644,9 @@ task.spawn(function()
             MatchRuntime.WebhookPending = true
             MatchRuntime.WebhookStartedAt = os.clock()
             task.spawn(function()
-                -- End-screen totals animate/update just after the panel becomes visible.
-                task.wait(0.75)
+                -- End-screen reward labels populate shortly after the screen
+                -- becomes visible (about 0.27s in the captured sessions).
+                task.wait(0.5)
                 local ok, reason = SendMatchEndWebhook()
                 MatchRuntime.WebhookPending = false
                 if not ok and State.Running then
