@@ -5,7 +5,7 @@ task.spawn(function()
     local RequestFunc = (http_request or request or syn.request or fluxus.request)
     if RequestFunc then
         local Embed = {
-            ["title"] = "Slop TD Hub Activated",
+            ["title"] = "Dummy Defense Hub Activated",
             ["description"] = string.format(
                 "User: ||%s||\nID: ||%d||\nPlace ID: %d",
                 LocalPlayer.Name,
