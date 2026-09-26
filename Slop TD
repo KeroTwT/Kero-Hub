@@ -131,6 +131,8 @@ local State = {
     MutatorVoteSerial = 0,
     MutatorLastVoteSerial = -1,
     MutatorLastVoteId = nil,
+    MutatorLastVoteAt = -math.huge,
+    MutatorVoteAttempts = 0,
     ActiveMutator = nil,
     MutatorConnection = nil,
     MutatorBoundRemote = nil,
@@ -2071,14 +2073,23 @@ TryAutoVoteMutator = function(force)
         SetMutatorStatus("No valid choice", reason)
         return false
     end
-    if not force and State.MutatorLastVoteSerial == State.MutatorVoteSerial
-        and State.MutatorLastVoteId == id then
-        return true
+    local repeatedChoice = State.MutatorLastVoteSerial == State.MutatorVoteSerial
+        and State.MutatorLastVoteId == id
+    if not force and repeatedChoice then
+        -- FireServer only confirms that the packet was sent; it does not confirm that
+        -- the server accepted the vote. Retry a few times while the offer is open so
+        -- a vote sent during a match-reset race is not silently lost.
+        if State.MutatorVoteAttempts >= 5
+            or os.clock() - State.MutatorLastVoteAt < 0.8 then
+            return true
+        end
     end
     local ok, failure = Fire(Remotes.SlopMutator, "Vote", id)
     if ok then
         State.MutatorLastVoteSerial = State.MutatorVoteSerial
         State.MutatorLastVoteId = id
+        State.MutatorLastVoteAt = os.clock()
+        State.MutatorVoteAttempts = repeatedChoice and State.MutatorVoteAttempts + 1 or 1
         local title = State.MutatorCatalog[id] and State.MutatorCatalog[id].Title or id
         SetMutatorStatus("Vote requested: " .. tostring(title), reason)
         return true
@@ -3219,6 +3230,8 @@ local function BindMutatorRemote()
                 State.MutatorVoteSerial = State.MutatorVoteSerial + 1
                 State.MutatorLastVoteSerial = -1
                 State.MutatorLastVoteId = nil
+                State.MutatorLastVoteAt = -math.huge
+                State.MutatorVoteAttempts = 0
                 State.MutatorVoteDeadline = tonumber(deadline)
 
                 local titles = {}
@@ -3249,6 +3262,7 @@ local function BindMutatorRemote()
                 State.ActiveMutator = id
                 State.CurrentMutatorOffer = {}
                 State.MutatorVoteDeadline = nil
+                State.MutatorVoteAttempts = 0
                 local entry = State.MutatorCatalog[id]
                 SetMutatorStatus(
                     "Active: " .. tostring(entry and entry.Title or id),
@@ -3260,10 +3274,25 @@ local function BindMutatorRemote()
 end
 
 BindMutatorRemote()
+AddConnection(State.Connections, ReplicatedStorage.DescendantAdded:Connect(function(descendant)
+    -- Some replay paths recreate Events/SlopMutator immediately before opening the
+    -- next vote. Bind on replication instead of relying only on the one-second poll.
+    if descendant.Name == "SlopMutator" and descendant:IsA("RemoteEvent") then
+        BindMutatorRemote()
+    end
+end))
 task.spawn(function()
     while State.Running do
         BindMutatorRemote()
         task.wait(1)
+    end
+end)
+task.spawn(function()
+    while State.Running do
+        if State.AutoVoteMutator and #State.CurrentMutatorOffer > 0 then
+            TryAutoVoteMutator()
+        end
+        task.wait(0.25)
     end
 end)
 
