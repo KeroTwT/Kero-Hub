@@ -131,6 +131,11 @@ local State = {
     MutatorVoteSerial = 0,
     MutatorLastVoteSerial = -1,
     MutatorLastVoteId = nil,
+    MutatorVoteConfirmed = false,
+    MutatorLastVoteAttemptAt = -math.huge,
+    MutatorOfferAt = 0,
+    MutatorGuiWasOpen = false,
+    MutatorGuiSignature = nil,
     ActiveMutator = nil,
     MutatorConnection = nil,
     MutatorBoundRemote = nil,
@@ -2191,9 +2196,154 @@ end
 
 local function SetMutatorStatus(title, detail)
     if Gui.MutatorStatus then
-        Gui.MutatorStatus:SetTitle(tostring(title))
-        Gui.MutatorStatus:SetDesc(tostring(detail or ""))
+        pcall(function() Gui.MutatorStatus:SetTitle(tostring(title)) end)
+        pcall(function() Gui.MutatorStatus:SetDesc(tostring(detail or "")) end)
     end
+end
+
+function Hub.RegisterMutatorOffer(rawOffer, deadline, source)
+    if type(rawOffer) ~= "table" then return false end
+    local offer, discovered, signatureIds = {}, {}, {}
+    for _, raw in ipairs(rawOffer) do
+        if type(raw) == "table" then
+            local id = tostring(raw.Id or "")
+            if id ~= "" then
+                local previous = State.MutatorCatalog[id]
+                local entry = {
+                    Id = id,
+                    Title = tostring(raw.Title or (previous and previous.Title) or id),
+                    Bad = tostring(raw.Bad or (previous and previous.Bad) or "Unknown drawback"),
+                    Good = tostring(raw.Good or (previous and previous.Good) or "Unknown reward"),
+                }
+                table.insert(offer, entry)
+                table.insert(signatureIds, id)
+                if not previous or previous.Title ~= entry.Title
+                    or previous.Bad ~= entry.Bad or previous.Good ~= entry.Good then
+                    State.MutatorCatalog[id] = table.clone(entry)
+                    table.insert(discovered, entry.Title)
+                end
+            end
+        end
+    end
+    if #offer == 0 then return false end
+
+    table.sort(signatureIds)
+    local signature = table.concat(signatureIds, "|")
+    if #State.CurrentMutatorOffer > 0 and State.MutatorGuiSignature == signature then
+        State.CurrentMutatorOffer = offer
+        if tonumber(deadline) then State.MutatorVoteDeadline = tonumber(deadline) end
+        return false
+    end
+
+    State.CurrentMutatorOffer = offer
+    State.MutatorGuiSignature = signature
+    State.MutatorVoteSerial = State.MutatorVoteSerial + 1
+    State.MutatorLastVoteSerial = -1
+    State.MutatorLastVoteId = nil
+    State.MutatorVoteConfirmed = false
+    State.MutatorLastVoteAttemptAt = -math.huge
+    State.MutatorVoteDeadline = tonumber(deadline)
+    State.MutatorOfferAt = os.clock()
+    State.ActiveMutator = nil
+
+    local titles = {}
+    for _, entry in ipairs(offer) do table.insert(titles, entry.Title) end
+    SetMutatorStatus(
+        source == "GUI" and "Mutator vote recovered" or "Mutator vote open",
+        table.concat(titles, ", ")
+    )
+    if #discovered > 0 then
+        QueueSave()
+        if RefreshMutatorControls then RefreshMutatorControls() end
+        Notify("New Mutator discovered", table.concat(discovered, ", "))
+    end
+    task.defer(TryAutoVoteMutator)
+    return true
+end
+
+function Hub.RecoverMutatorOfferFromGui()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local root = playerGui and playerGui:FindFirstChild("SlopMutatorGui")
+    local voting = root and root:FindFirstChild("MutatorVoting", true)
+    local offer, anyVisible = {}, false
+
+    local function isEffectivelyVisible(object)
+        if not object then return false end
+        local cursor = object
+        while cursor and cursor ~= playerGui do
+            if cursor:IsA("GuiObject") and not cursor.Visible then return false end
+            if cursor:IsA("LayerCollector") and not cursor.Enabled then return false end
+            cursor = cursor.Parent
+        end
+        return cursor == playerGui
+    end
+
+    if voting and isEffectivelyVisible(voting) then
+        for _, card in ipairs(voting:GetChildren()) do
+            local good = card:FindFirstChild("Good", true)
+            local bad = card:FindFirstChild("Bad", true)
+            local title = card:FindFirstChild("TextLabel", true) or card:FindFirstChild("Title", true)
+            if isEffectivelyVisible(card) and (good or bad) then
+                anyVisible = true
+                local known = State.MutatorCatalog[card.Name]
+                table.insert(offer, {
+                    Id = card.Name,
+                    Title = title and title:IsA("TextLabel") and title.Text
+                        or (known and known.Title) or card.Name,
+                    Bad = bad and bad:IsA("TextLabel") and bad.Text
+                        or (known and known.Bad) or "Unknown drawback",
+                    Good = good and good:IsA("TextLabel") and good.Text
+                        or (known and known.Good) or "Unknown reward",
+                })
+            end
+        end
+    end
+
+    local open = anyVisible and #offer > 0
+    if not open then
+        if State.MutatorGuiWasOpen then
+            State.CurrentMutatorOffer = {}
+            State.MutatorVoteDeadline = nil
+            State.MutatorVoteConfirmed = false
+            State.MutatorGuiSignature = nil
+        end
+        State.MutatorGuiWasOpen = false
+
+        local active = root and root:FindFirstChild("ActiveMutator", true)
+        local activeVisible = isEffectivelyVisible(active)
+        local titleLabel = active and (active:FindFirstChild("Title") or active:FindFirstChild("TextLabel"))
+        local titleText = titleLabel and (titleLabel:IsA("TextLabel") or titleLabel:IsA("TextButton"))
+            and tostring(titleLabel.Text or "") or ""
+        local activeTitle = titleText:gsub("^%s*Mutator:%s*", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if activeVisible and activeTitle ~= "" and activeTitle ~= titleText then
+            local id = MutatorIdFromTitle(activeTitle) or activeTitle
+            local known = State.MutatorCatalog[id]
+            local bad = active:FindFirstChild("Bad")
+            local good = active:FindFirstChild("Good")
+            State.ActiveMutator = id
+            SetMutatorStatus(
+                "Active: " .. activeTitle,
+                string.format(
+                    "%s | %s",
+                    bad and bad:IsA("TextLabel") and bad.Text or (known and known.Bad) or "",
+                    good and good:IsA("TextLabel") and good.Text or (known and known.Good) or ""
+                )
+            )
+        end
+        return false
+    end
+
+    local newCycle = not State.MutatorGuiWasOpen
+    State.MutatorGuiWasOpen = true
+    if newCycle then
+        State.ActiveMutator = nil
+        if #State.CurrentMutatorOffer == 0 then
+            State.MutatorGuiSignature = nil
+        end
+    end
+    if State.ActiveMutator ~= nil then return false end
+    Hub.RegisterMutatorOffer(offer, State.MutatorVoteDeadline, "GUI")
+    return true
 end
 
 local function MutatorRewardScore(entry)
@@ -2216,7 +2366,8 @@ local function PickMutatorFromOffer()
     for _, id in ipairs(State.SelectedMutators) do selected[id] = true end
     local best, bestValue
     for index, entry in ipairs(State.CurrentMutatorOffer) do
-        if entry.Id ~= "None" and selected[entry.Id] then
+        local eligible = State.MutatorAutoPick == "Highest Reward" or selected[entry.Id]
+        if entry.Id ~= "None" and eligible then
             local value = State.MutatorAutoPick == "Highest Reward"
                 and -MutatorRewardScore(entry)
                 or (tonumber(State.MutatorPriorities[entry.Id]) or 20)
@@ -2242,6 +2393,7 @@ end
 
 TryAutoVoteMutator = function(force)
     if not State.AutoVoteMutator or #State.CurrentMutatorOffer == 0 then return false end
+    if not force and os.clock() - State.MutatorOfferAt < 0.15 then return false end
     if State.MutatorVoteDeadline then
         local ok, serverNow = pcall(Workspace.GetServerTimeNow, Workspace)
         if ok and tonumber(serverNow) and serverNow >= State.MutatorVoteDeadline then
@@ -2255,16 +2407,24 @@ TryAutoVoteMutator = function(force)
         SetMutatorStatus("No valid choice", reason)
         return false
     end
-    if not force and State.MutatorLastVoteSerial == State.MutatorVoteSerial
+    if not force and State.MutatorVoteConfirmed
+        and State.MutatorLastVoteSerial == State.MutatorVoteSerial
         and State.MutatorLastVoteId == id then
         return true
+    end
+    if not force and State.MutatorLastVoteSerial == State.MutatorVoteSerial
+        and State.MutatorLastVoteId == id
+        and os.clock() - State.MutatorLastVoteAttemptAt < 0.75 then
+        return false
     end
     local ok, failure = Fire(Remotes.SlopMutator, "Vote", id)
     if ok then
         State.MutatorLastVoteSerial = State.MutatorVoteSerial
         State.MutatorLastVoteId = id
+        State.MutatorVoteConfirmed = false
+        State.MutatorLastVoteAttemptAt = os.clock()
         local title = State.MutatorCatalog[id] and State.MutatorCatalog[id].Title or id
-        SetMutatorStatus("Vote requested: " .. tostring(title), reason)
+        SetMutatorStatus("Vote sent: " .. tostring(title), reason .. " | waiting for confirmation")
         return true
     end
     SetMutatorStatus("Vote failed", tostring(failure))
@@ -3407,8 +3567,11 @@ MiscTab:Toggle({
 local function BindMutatorRemote()
     RefreshObjects()
     local remote = Remotes.SlopMutator
-    if remote == State.MutatorBoundRemote and State.MutatorConnection
-        and State.MutatorConnection.Connected then
+    local connectionAlive = false
+    if State.MutatorConnection then
+        pcall(function() connectionAlive = State.MutatorConnection.Connected end)
+    end
+    if remote == State.MutatorBoundRemote and connectionAlive then
         return
     end
     if State.MutatorConnection then
@@ -3422,42 +3585,7 @@ local function BindMutatorRemote()
         function(action, payload, deadline)
             action = tostring(action or "")
             if action == "Vote" and type(payload) == "table" then
-                local offer, discovered = {}, {}
-                for _, raw in ipairs(payload) do
-                    if type(raw) == "table" then
-                        local id = tostring(raw.Id or "")
-                        if id ~= "" then
-                            local entry = {
-                                Id = id,
-                                Title = tostring(raw.Title or id),
-                                Bad = tostring(raw.Bad or "Unknown drawback"),
-                                Good = tostring(raw.Good or "Unknown reward"),
-                            }
-                            table.insert(offer, entry)
-                            local previous = State.MutatorCatalog[id]
-                            if not previous or previous.Title ~= entry.Title
-                                or previous.Bad ~= entry.Bad or previous.Good ~= entry.Good then
-                                State.MutatorCatalog[id] = table.clone(entry)
-                                table.insert(discovered, entry.Title)
-                            end
-                        end
-                    end
-                end
-                State.CurrentMutatorOffer = offer
-                State.MutatorVoteSerial = State.MutatorVoteSerial + 1
-                State.MutatorLastVoteSerial = -1
-                State.MutatorLastVoteId = nil
-                State.MutatorVoteDeadline = tonumber(deadline)
-
-                local titles = {}
-                for _, entry in ipairs(offer) do table.insert(titles, entry.Title) end
-                SetMutatorStatus("Mutator vote open", table.concat(titles, ", "))
-                if #discovered > 0 then
-                    QueueSave()
-                    if RefreshMutatorControls then RefreshMutatorControls() end
-                    Notify("New Mutator discovered", table.concat(discovered, ", "))
-                end
-                task.defer(TryAutoVoteMutator)
+                Hub.RegisterMutatorOffer(payload, deadline, "Remote")
             elseif action == "Votes" and type(payload) == "table" then
                 local votes = {}
                 for id, count in pairs(payload) do
@@ -3470,13 +3598,27 @@ local function BindMutatorRemote()
                     end
                 end
                 table.sort(votes)
-                if #votes > 0 then SetMutatorStatus("Vote update", table.concat(votes, " | ")) end
+                local chosenCount = State.MutatorLastVoteId
+                    and tonumber(payload[State.MutatorLastVoteId]) or 0
+                if State.MutatorLastVoteSerial == State.MutatorVoteSerial and chosenCount > 0 then
+                    State.MutatorVoteConfirmed = true
+                    local entry = State.MutatorCatalog[State.MutatorLastVoteId]
+                    SetMutatorStatus(
+                        "Vote confirmed: " .. tostring(entry and entry.Title or State.MutatorLastVoteId),
+                        #votes > 0 and table.concat(votes, " | ") or "Server accepted the vote"
+                    )
+                elseif #votes > 0 then
+                    SetMutatorStatus("Vote update", table.concat(votes, " | "))
+                end
             elseif action == "Active" then
                 local id = type(payload) == "table" and tostring(payload.Id or "") or "None"
                 if id == "" then id = "None" end
                 State.ActiveMutator = id
                 State.CurrentMutatorOffer = {}
                 State.MutatorVoteDeadline = nil
+                State.MutatorVoteConfirmed = true
+                State.MutatorGuiWasOpen = false
+                State.MutatorGuiSignature = nil
                 local entry = State.MutatorCatalog[id]
                 SetMutatorStatus(
                     "Active: " .. tostring(entry and entry.Title or id),
@@ -3489,9 +3631,68 @@ end
 
 BindMutatorRemote()
 task.spawn(function()
+    local nextBindAt = 0
     while State.Running do
-        BindMutatorRemote()
-        task.wait(1)
+        -- GUI recovery runs first and inside its own guard. Some executors can
+        -- throw while inspecting/rebinding RBXScriptConnections after replay;
+        -- that must never kill the Mutator worker for the rest of the session.
+        local recovered, recoveryFailure = pcall(Hub.RecoverMutatorOfferFromGui)
+        if not recovered then
+            SetMutatorStatus("Mutator recovery retrying", tostring(recoveryFailure))
+        end
+        if os.clock() >= nextBindAt then
+            local rebound, bindFailure = pcall(BindMutatorRemote)
+            if not rebound then
+                SetMutatorStatus("Mutator listener retrying", tostring(bindFailure))
+            end
+            nextBindAt = os.clock() + 1
+        end
+        if State.AutoVoteMutator and #State.CurrentMutatorOffer > 0
+            and not State.MutatorVoteConfirmed then
+            local voted, voteFailure = pcall(TryAutoVoteMutator, false)
+            if not voted then
+                SetMutatorStatus("Mutator vote retrying", tostring(voteFailure))
+            end
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- Replay can replace or reinitialize its voting UI faster than an executor
+-- delivers the RemoteEvent connection. The match message is an independent
+-- signal, so force several GUI recoveries while the visible vote is opening.
+task.spawn(function()
+    local observedMessage
+    while State.Running do
+        RefreshObjects()
+        local messageValue = InfoFolder and InfoFolder:FindFirstChild("Message")
+        local message = messageValue and tostring(messageValue.Value or "") or ""
+        if message ~= observedMessage then
+            observedMessage = message
+            local lowerMessage = message:lower()
+            if lowerMessage:find("replaying", 1, true) then
+                State.CurrentMutatorOffer = {}
+                State.ActiveMutator = nil
+                State.MutatorVoteDeadline = nil
+                State.MutatorVoteConfirmed = false
+                State.MutatorLastVoteSerial = -1
+                State.MutatorLastVoteId = nil
+                State.MutatorGuiWasOpen = false
+                State.MutatorGuiSignature = nil
+            elseif lowerMessage:find("mutator", 1, true) and lowerMessage:find("vote", 1, true) then
+                task.spawn(function()
+                    for _ = 1, 20 do
+                        if not State.Running then return end
+                        pcall(Hub.RecoverMutatorOfferFromGui)
+                        if State.AutoVoteMutator and #State.CurrentMutatorOffer > 0 then
+                            pcall(TryAutoVoteMutator, false)
+                        end
+                        task.wait(0.15)
+                    end
+                end)
+            end
+        end
+        task.wait(0.1)
     end
 end)
 
@@ -4532,7 +4733,17 @@ task.spawn(function()
         local currentEndScreenVisible = IsEndScreenVisible()
 
         if mapVoting and not MatchRuntime.LastMapVoting then MatchRuntime.VotedMap = false end
-        if complicationVoting and not MatchRuntime.LastComplicationVoting then MatchRuntime.VotedComplication = false end
+        if complicationVoting and not MatchRuntime.LastComplicationVoting then
+            MatchRuntime.VotedComplication = false
+            State.CurrentMutatorOffer = {}
+            State.ActiveMutator = nil
+            State.MutatorVoteDeadline = nil
+            State.MutatorVoteConfirmed = false
+            State.MutatorLastVoteSerial = -1
+            State.MutatorLastVoteId = nil
+            State.MutatorGuiWasOpen = false
+            State.MutatorGuiSignature = nil
+        end
 
         if active and not MatchRuntime.LastMatchActive then
             State.MatchSerial = State.MatchSerial + 1
