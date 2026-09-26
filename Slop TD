@@ -145,6 +145,7 @@ local State = {
     WebhookURL = "",
     WebhookMatchEnd = true,
     LastKnownGem = nil,
+    MatchRewardXP = nil,
     AutoLobby = false,
     LobbyPlayers = 1,
     AutoSummon = false,
@@ -847,6 +848,43 @@ local function ParseNumber(value)
     return tonumber(cleaned)
 end
 
+local function ParseRewardAmount(value)
+    local cleaned = tostring(value or ""):gsub(",", "")
+    local number = cleaned:match("^%s*[xX]?%s*([%d]+%.?%d*)%s*$")
+    return tonumber(number)
+end
+
+local function ReadRewardLabel(root, category, label)
+    local frame = root and root:FindFirstChild(category)
+    local object = frame and frame:FindFirstChild(label)
+    if object and (object:IsA("TextLabel") or object:IsA("TextButton")) then
+        return ParseRewardAmount(object.Text)
+    end
+    return nil
+end
+
+local function CaptureMatchRewardXP()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
+    local voting = gameGui and gameGui:FindFirstChild("Voting")
+    local rewards = voting and voting:FindFirstChild("Rewards")
+    local items = rewards and rewards:FindFirstChild("Items")
+    local amount = ReadRewardLabel(items, "XP", "Amount")
+    if amount ~= nil then State.MatchRewardXP = amount end
+end
+
+local function GetMatchRewards()
+    local endScreen = GetEndScreen()
+    local stats = endScreen and endScreen:FindFirstChild("Stats")
+    return {
+        Cash = ReadRewardLabel(stats, "Coins", "Total"),
+        Gems = ReadRewardLabel(stats, "Gems", "Total"),
+        EXP = ReadRewardLabel(stats, "XP", "Total") or State.MatchRewardXP,
+        Crates = ReadRewardLabel(stats, "Chests", "Total"),
+        Crystals = ReadRewardLabel(stats, "Crystals", "Total"),
+    }
+end
+
 local function GetLiveGemBalance()
     local leaderstats = LocalPlayer and LocalPlayer:FindFirstChild("leaderstats")
     local gems = leaderstats and leaderstats:FindFirstChild("Gems")
@@ -958,7 +996,7 @@ local function SendMatchEndWebhook()
         or result == "Defeat" and 16711680
         or 16776960
     local player = Players.LocalPlayer or LocalPlayer
-    local cash, gem, star = GetAccountCurrencies()
+    local rewards = GetMatchRewards()
     local mainImage = "https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"
     local footerIcon = "https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"
     local fields = {
@@ -972,12 +1010,14 @@ local function SendMatchEndWebhook()
             inline = false,
         },
         {
-            name = "Currencies",
+            name = "Match Rewards",
             value = string.format(
-                "💵 Cash: %s\n💎 Gem: %s\n⭐ Star: %s",
-                FormatNumber(cash),
-                FormatNumber(gem),
-                FormatNumber(star)
+                "💵 Cash: %s\n💎 Gems: %s\n✨ EXP: %s\n📦 Crates: %s\n🔮 Crystals: %s",
+                FormatNumber(rewards.Cash),
+                FormatNumber(rewards.Gems),
+                FormatNumber(rewards.EXP),
+                FormatNumber(rewards.Crates),
+                FormatNumber(rewards.Crystals)
             ),
             inline = false,
         },
@@ -4250,8 +4290,14 @@ task.spawn(function()
         local complicationVoting = IsComplicationVoting()
         local currentEndScreenVisible = IsEndScreenVisible()
 
-        if mapVoting and not MatchRuntime.LastMapVoting then MatchRuntime.VotedMap = false end
+        if mapVoting and not MatchRuntime.LastMapVoting then
+            MatchRuntime.VotedMap = false
+            State.MatchRewardXP = nil
+        end
         if complicationVoting and not MatchRuntime.LastComplicationVoting then MatchRuntime.VotedComplication = false end
+        if not currentEndScreenVisible and (mapVoting or complicationVoting or running) then
+            CaptureMatchRewardXP()
+        end
 
         if active and not MatchRuntime.LastMatchActive then
             State.MatchSerial = State.MatchSerial + 1
@@ -4359,6 +4405,8 @@ task.spawn(function()
             MatchRuntime.WebhookPending = true
             MatchRuntime.WebhookStartedAt = os.clock()
             task.spawn(function()
+                -- End-screen totals animate/update just after the panel becomes visible.
+                task.wait(0.75)
                 local ok, reason = SendMatchEndWebhook()
                 MatchRuntime.WebhookPending = false
                 if not ok and State.Running then
