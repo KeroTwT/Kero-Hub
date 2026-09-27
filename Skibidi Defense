@@ -1,5 +1,5 @@
 -- Skibidi Defense Hub
--- State recorder + verified playback for place/upgrade/sell/target/ability actions.
+-- State recorder + verified playback for place/upgrade/sell/target/ability/boost-link actions.
 -- Ability capture is passive: UI intent is correlated with replicated ATTACK attributes.
 -- No __namecall / FireServer / InvokeServer hook is installed by this hub.
 
@@ -74,7 +74,7 @@ local State = {
     Speed = 1,
     PlaybackMode = "Hybrid",
     ProfileName = "",
-    ProfileVersion = 3,
+    ProfileVersion = 4,
     Actions = {},
     RecordStartedAt = 0,
     NextHandle = 1,
@@ -131,6 +131,7 @@ local function RefreshGameObjects()
     Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
     Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
     Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    Remotes.BoostSelect = ReplicatedStorage:FindFirstChild("BoostSelect")
     local towerScript = ReplicatedStorage:FindFirstChild("TowerScript")
     Remotes.Ability = towerScript and towerScript:FindFirstChild("spawnTowerAbility")
     Remotes.Skip = eventFolder and eventFolder:FindFirstChild("waveSkip")
@@ -735,7 +736,7 @@ local function SaveProfile(name)
     end
 
     local payload = {
-        Version = 3,
+        Version = 4,
         PlaceId = game.PlaceId,
         Name = name,
         RecordedAt = os.time(),
@@ -749,7 +750,7 @@ local function SaveProfile(name)
 
     writefile(ProfilePath(name), encoded)
     State.ProfileName = name
-    State.ProfileVersion = 3
+    State.ProfileVersion = 4
     return true
 end
 
@@ -806,7 +807,11 @@ local function RefreshActionList()
     local first = math.max(1, #State.Actions - 7)
     for index = first, #State.Actions do
         local action = State.Actions[index]
-        table.insert(lines, string.format("%02d | W%s | %s | %s", index, action.Wave or 0, action.Type or "?", action.Unit or action.Handle or ""))
+        local subject = action.Unit or action.Handle or ""
+        if action.Type == "BoostLink" then
+            subject = string.format("%s > %s", action.SourceHandle or "?", action.TargetHandle or "?")
+        end
+        table.insert(lines, string.format("%02d | W%s | %s | %s", index, action.Wave or 0, action.Type or "?", subject))
     end
     Gui.ActionSummary:SetTitle(string.format("Recorded actions: %d", #State.Actions))
     Gui.ActionSummary:SetDesc(#lines > 0 and table.concat(lines, "\n") or "No actions loaded")
@@ -849,6 +854,59 @@ Hub.RecordAbilityAction = function(towerId, abilityIndex, marker)
     meta.LastAbilityAction = action
     meta.LastAbilityRecordedAt = now
     AddAction(action)
+    return true
+end
+
+Hub.RecordBoostLinkAction = function(sourceId, targetId)
+    if not State.Recording or not TowerDataFolder then return false end
+
+    local sourceTower = typeof(sourceId) == "Instance"
+        and sourceId
+        or TowerDataFolder:FindFirstChild(tostring(sourceId or ""))
+    local targetTower = typeof(targetId) == "Instance"
+        and targetId
+        or TowerDataFolder:FindFirstChild(tostring(targetId or ""))
+    local sourceMeta = sourceTower and State.TowerMeta[sourceTower]
+    local targetMeta = targetTower and State.TowerMeta[targetTower]
+    if not sourceMeta or not targetMeta or sourceTower == targetTower then
+        return false
+    end
+
+    if not sourceMeta.PlaceRecorded or not targetMeta.PlaceRecorded then
+        if targetMeta.PendingBoostSourceHandle == sourceMeta.Handle then
+            return true
+        end
+        targetMeta.PendingBoostSourceHandle = sourceMeta.Handle
+        task.spawn(function()
+            local ready = WaitUntil(function()
+                return not State.Recording
+                    or (sourceMeta.PlaceRecorded and targetMeta.PlaceRecorded)
+            end, 3, 0.03)
+            if targetMeta.PendingBoostSourceHandle == sourceMeta.Handle then
+                targetMeta.PendingBoostSourceHandle = nil
+            end
+            if ready and State.Recording
+                and sourceTower.Parent == TowerDataFolder
+                and targetTower.Parent == TowerDataFolder then
+                Hub.RecordBoostLinkAction(sourceTower, targetTower)
+            end
+        end)
+        return true
+    end
+
+    local now = os.clock()
+    if targetMeta.LastBoostSourceHandle == sourceMeta.Handle
+        and now - (targetMeta.LastBoostRecordedAt or -math.huge) <= 0.5 then
+        return true
+    end
+
+    targetMeta.LastBoostSourceHandle = sourceMeta.Handle
+    targetMeta.LastBoostRecordedAt = now
+    AddAction({
+        Type = "BoostLink",
+        SourceHandle = sourceMeta.Handle,
+        TargetHandle = targetMeta.Handle,
+    })
     return true
 end
 
@@ -949,6 +1007,11 @@ local function AttachTowerRecorder(tower, handle)
         AbilityMarkers = {},
         LastAbilityAction = nil,
         LastAbilityRecordedAt = -math.huge,
+        ClockBoost = tower:GetAttribute("ClockBoost"),
+        LastBoostSourceHandle = nil,
+        LastBoostRecordedAt = -math.huge,
+        PendingBoostSourceHandle = nil,
+        PlaceRecorded = false,
     }
     for attribute, value in pairs(tower:GetAttributes()) do
         if tostring(attribute):match("^ATTACK") then
@@ -998,6 +1061,24 @@ local function AttachTowerRecorder(tower, handle)
         meta.TargetMode = newMode
     end))
 
+    AddConnection(State.RecorderConnections, tower:GetAttributeChangedSignal("ClockBoost"):Connect(function()
+        local previous = meta.ClockBoost
+        local sourceId = tower:GetAttribute("ClockBoost")
+        meta.ClockBoost = sourceId
+        if not State.Recording
+            or sourceId == nil
+            or tostring(sourceId) == ""
+            or tostring(sourceId) == "0"
+            or tostring(sourceId) == tostring(previous) then
+            return
+        end
+
+        -- BoostSelect is deliberately recorded from replicated state rather
+        -- than a remote hook. The target's ClockBoost attribute contains the
+        -- live server ID of the Clock Woman that was linked to it.
+        Hub.RecordBoostLinkAction(sourceId, tower)
+    end))
+
     AddConnection(State.RecorderConnections, tower.AttributeChanged:Connect(function(attribute)
         if not tostring(attribute):match("^ATTACK") then
             return
@@ -1038,7 +1119,7 @@ local function StartRecording(profileName)
     DisconnectAll(State.RecorderConnections)
     State.Actions = {}
     State.ProfileName = profileName
-    State.ProfileVersion = 3
+    State.ProfileVersion = 4
     State.RecordStartedAt = os.clock()
     State.NextHandle = 1
     State.TowerMeta = setmetatable({}, { __mode = "k" })
@@ -1112,6 +1193,10 @@ local function StartRecording(profileName)
                 CFrame = CFrameToArray(placement),
                 EstimatedCost = sellPrice * 2,
             })
+            local meta = State.TowerMeta[tower]
+            if meta then
+                meta.PlaceRecorded = true
+            end
         end)
     end))
 
@@ -1439,6 +1524,48 @@ local function PlayAbility(action)
     return confirmed, confirmed and nil or "Ability was not confirmed"
 end
 
+local function PlayBoostLink(action)
+    local sourceTower = ResolveHandle(action.SourceHandle)
+    local targetTower = ResolveHandle(action.TargetHandle)
+    if not sourceTower then
+        return false, "Boost source handle is missing: " .. tostring(action.SourceHandle)
+    end
+    if not targetTower then
+        return false, "Boost target handle is missing: " .. tostring(action.TargetHandle)
+    end
+    if not Remotes.BoostSelect or not Remotes.BoostSelect:IsA("RemoteEvent") then
+        return false, "BoostSelect is unavailable"
+    end
+
+    local sourceId = tonumber(sourceTower.Name)
+    local targetId = tostring(targetTower.Name)
+    if not sourceId then
+        return false, "Boost source has an invalid server ID"
+    end
+
+    if tostring(targetTower:GetAttribute("ClockBoost")) == tostring(sourceId) then
+        return true
+    end
+
+    -- Captured transport: BoostSelect:FireServer(number sourceId, string targetId).
+    -- Send once, then trust only the replicated ClockBoost confirmation.
+    Remotes.BoostSelect:FireServer(sourceId, targetId)
+    local confirmed = WaitUntil(function()
+        return not State.Playing
+            or sourceTower.Parent ~= TowerDataFolder
+            or targetTower.Parent ~= TowerDataFolder
+            or tostring(targetTower:GetAttribute("ClockBoost")) == tostring(sourceId)
+    end, 5, 0.05)
+
+    if not State.Playing then
+        return false, "Playback stopped while linking boost"
+    end
+    if sourceTower.Parent ~= TowerDataFolder or targetTower.Parent ~= TowerDataFolder then
+        return false, "Boost tower disappeared"
+    end
+    return confirmed, confirmed and nil or "Boost link was not confirmed"
+end
+
 local function StopPlayback(reason)
     State.Playing = false
     if reason then
@@ -1517,6 +1644,8 @@ local function StartPlayback()
                 end
             elseif action.Type == "Ability" then
                 success, message = PlayAbility(action)
+            elseif action.Type == "BoostLink" then
+                success, message = PlayBoostLink(action)
             else
                 success, message = false, "Unknown action type: " .. tostring(action.Type)
             end
