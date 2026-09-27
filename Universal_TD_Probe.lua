@@ -45,6 +45,9 @@ local Config = {
     PreciseMaxDepth = math.max(3, tonumber(userConfig.PreciseMaxDepth) or 8),
     PreciseMaxItems = math.max(50, tonumber(userConfig.PreciseMaxItems) or 500),
     CaptureOutgoing = userConfig.CaptureOutgoing ~= false and isPerfect,
+    -- Brutal_Perfect is also used to diagnose hub playback. Include calls
+    -- made by the executor so failed/missing automation is visible in JSONL.
+    CaptureExecutorCalls = userConfig.CaptureExecutorCalls ~= false and isBrutalPerfectRequest,
     CaptureCallingScript = userConfig.CaptureCallingScript ~= false,
     CaptureKeyboard = userConfig.CaptureKeyboard ~= false and isPerfect,
     Introspect = userConfig.Introspect == true,
@@ -883,7 +886,7 @@ local function installNamecallHook()
         local capture = Environment.__UniversalTDProbeV2Capture
         local eligible = Environment.__UniversalTDProbeV2Enabled == true
             and type(capture) == "function"
-            and not callerIsExecutor
+            and (Config.CaptureExecutorCalls or not callerIsExecutor)
             and typeof(remote) == "Instance"
             and (method == "FireServer" or method == "InvokeServer")
         if not eligible then
@@ -936,7 +939,7 @@ local function installDirectMethodHook(className, methodName, installedKey)
             local capture = Environment.__UniversalTDProbeV2Capture
             local eligible = Environment.__UniversalTDProbeV2Enabled == true
                 and type(capture) == "function"
-                and not callerIsExecutor
+                and (Config.CaptureExecutorCalls or not callerIsExecutor)
                 and not directHookIsBypassed()
                 and typeof(remote) == "Instance"
 
