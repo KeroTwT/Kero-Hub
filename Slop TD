@@ -104,7 +104,12 @@ local State = {
     AutoSkip = false,
     AutoSpeed = false,
     AutoJump = false,
+    WalkAround = false,
+    WalkAroundSerial = 0,
+    WalkAroundCenter = nil,
+    WalkAroundCharacter = nil,
     AutoAntiMacro = false,
+    HideName = false,
     AutoExec = false,
     AutoExecQueued = false,
     FpsBoost = false,
@@ -235,6 +240,225 @@ local function DisconnectAll(bucket)
         end)
     end
     table.clear(bucket)
+end
+
+-- Embedded from Universal_Name_Hider.lua so the privacy overlay can be
+-- controlled directly by the hub instead of requiring a second script.
+local NameHider = {
+    Initialized = false,
+    Enabled = false,
+    Connections = {},
+    TextConnections = setmetatable({}, { __mode = "k" }),
+    TextStates = setmetatable({}, { __mode = "k" }),
+    HumanoidConnections = setmetatable({}, { __mode = "k" }),
+    HumanoidStates = setmetatable({}, { __mode = "k" }),
+    Replacements = {},
+}
+
+do
+local function NameHiderConnect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(NameHider.Connections, connection)
+    return connection
+end
+
+local function EscapeNamePattern(value)
+    return tostring(value):gsub("([^%w])", "%%%1")
+end
+
+local function RebuildNameReplacements()
+    local replacements = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Name ~= "" then replacements[player.Name] = "Hidden" end
+        if player.DisplayName ~= "" then replacements[player.DisplayName] = "Hidden" end
+    end
+    local ordered = {}
+    for source, replacement in pairs(replacements) do
+        table.insert(ordered, { Source = source, Replacement = replacement })
+    end
+    table.sort(ordered, function(a, b)
+        return #a.Source > #b.Source
+    end)
+    NameHider.Replacements = ordered
+end
+
+local function ScrubPlayerNames(value)
+    local result = tostring(value or "")
+    for _, entry in ipairs(NameHider.Replacements) do
+        result = result:gsub(EscapeNamePattern(entry.Source), entry.Replacement)
+    end
+    return result
+end
+
+local function ApplyHiddenText(object)
+    if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then return end
+    if not NameHider.Enabled or not object.Parent then return end
+    local original = tostring(object.Text or "")
+    local hidden = ScrubPlayerNames(original)
+    if hidden ~= original then
+        NameHider.TextStates[object] = { Original = original, Hidden = hidden }
+        object.Text = hidden
+    end
+end
+
+local function WatchNameTextObject(object)
+    if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then return end
+    if NameHider.TextConnections[object] then return end
+    ApplyHiddenText(object)
+    local busy = false
+    local connection = object:GetPropertyChangedSignal("Text"):Connect(function()
+        if busy or not NameHider.Enabled then return end
+        local original = tostring(object.Text or "")
+        local hidden = ScrubPlayerNames(original)
+        if hidden ~= original then
+            NameHider.TextStates[object] = { Original = original, Hidden = hidden }
+            busy = true
+            object.Text = hidden
+            busy = false
+        end
+    end)
+    NameHider.TextConnections[object] = connection
+    table.insert(NameHider.Connections, connection)
+end
+
+local function WatchNameGuiRoot(root)
+    if not root then return end
+    WatchNameTextObject(root)
+    for _, object in ipairs(root:GetDescendants()) do WatchNameTextObject(object) end
+    NameHiderConnect(root.DescendantAdded, WatchNameTextObject)
+end
+
+local function HideHumanoidName(humanoid)
+    if not NameHider.Enabled then return end
+    if not NameHider.HumanoidStates[humanoid] then
+        NameHider.HumanoidStates[humanoid] = {
+            DisplayDistanceType = humanoid.DisplayDistanceType,
+            NameDisplayDistance = humanoid.NameDisplayDistance,
+            HealthDisplayDistance = humanoid.HealthDisplayDistance,
+        }
+    end
+    if not NameHider.HumanoidConnections[humanoid] then
+        NameHider.HumanoidConnections[humanoid] = true
+        NameHiderConnect(humanoid:GetPropertyChangedSignal("DisplayDistanceType"), function()
+            if NameHider.Enabled and humanoid.DisplayDistanceType ~= Enum.HumanoidDisplayDistanceType.None then
+                humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+            end
+        end)
+        NameHiderConnect(humanoid:GetPropertyChangedSignal("NameDisplayDistance"), function()
+            if NameHider.Enabled and humanoid.NameDisplayDistance ~= 0 then humanoid.NameDisplayDistance = 0 end
+        end)
+        NameHiderConnect(humanoid:GetPropertyChangedSignal("HealthDisplayDistance"), function()
+            if NameHider.Enabled and humanoid.HealthDisplayDistance ~= 0 then humanoid.HealthDisplayDistance = 0 end
+        end)
+    end
+    humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+    humanoid.NameDisplayDistance = 0
+    humanoid.HealthDisplayDistance = 0
+end
+
+local function WatchNameCharacter(character)
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then HideHumanoidName(humanoid) end
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("Humanoid") then HideHumanoidName(object) end
+        WatchNameTextObject(object)
+    end
+    NameHiderConnect(character.DescendantAdded, function(object)
+        if object:IsA("Humanoid") then HideHumanoidName(object) end
+        WatchNameTextObject(object)
+    end)
+end
+
+local function WatchNamePlayer(player)
+    if player.Character then WatchNameCharacter(player.Character) end
+    NameHiderConnect(player.CharacterAdded, WatchNameCharacter)
+end
+
+local function RefreshHiddenNames()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        for _, object in ipairs(playerGui:GetDescendants()) do ApplyHiddenText(object) end
+    end
+    pcall(function()
+        for _, object in ipairs(CoreGui:GetDescendants()) do ApplyHiddenText(object) end
+    end)
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("BillboardGui") or object:IsA("SurfaceGui") then
+            for _, descendant in ipairs(object:GetDescendants()) do ApplyHiddenText(descendant) end
+        end
+    end
+end
+
+local function RestoreHiddenNames()
+    for object, saved in pairs(NameHider.TextStates) do
+        pcall(function()
+            if object.Parent and object.Text == saved.Hidden then object.Text = saved.Original end
+        end)
+    end
+    table.clear(NameHider.TextStates)
+    for humanoid, saved in pairs(NameHider.HumanoidStates) do
+        pcall(function()
+            if humanoid.Parent then
+                humanoid.DisplayDistanceType = saved.DisplayDistanceType
+                humanoid.NameDisplayDistance = saved.NameDisplayDistance
+                humanoid.HealthDisplayDistance = saved.HealthDisplayDistance
+            end
+        end)
+    end
+    table.clear(NameHider.HumanoidStates)
+end
+
+local function InitializeNameHider()
+    if NameHider.Initialized then return end
+    NameHider.Initialized = true
+    RebuildNameReplacements()
+    local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then WatchNameGuiRoot(playerGui) end
+    pcall(function() WatchNameGuiRoot(CoreGui) end)
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("BillboardGui") or object:IsA("SurfaceGui") then WatchNameGuiRoot(object) end
+    end
+    for _, player in ipairs(Players:GetPlayers()) do WatchNamePlayer(player) end
+    NameHiderConnect(Players.PlayerAdded, function(player)
+        RebuildNameReplacements()
+        WatchNamePlayer(player)
+        RefreshHiddenNames()
+    end)
+    NameHiderConnect(Players.PlayerRemoving, function()
+        task.defer(RebuildNameReplacements)
+    end)
+    NameHiderConnect(Workspace.DescendantAdded, function(object)
+        if object:IsA("BillboardGui") or object:IsA("SurfaceGui") then WatchNameGuiRoot(object) end
+    end)
+end
+
+function NameHider.SetEnabled(enabled)
+    enabled = enabled == true
+    if enabled then InitializeNameHider() end
+    NameHider.Enabled = enabled
+    State.HideName = enabled
+    if enabled then
+        RebuildNameReplacements()
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player.Character then
+                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid then HideHumanoidName(humanoid) end
+            end
+        end
+        RefreshHiddenNames()
+    else
+        RestoreHiddenNames()
+    end
+end
+
+function NameHider.Destroy()
+    NameHider.Enabled = false
+    RestoreHiddenNames()
+    DisconnectAll(NameHider.Connections)
+    NameHider.TextConnections = setmetatable({}, { __mode = "k" })
+    NameHider.HumanoidConnections = setmetatable({}, { __mode = "k" })
+    NameHider.Initialized = false
+end
 end
 
 local function WaitUntil(condition, timeout, interval)
@@ -1513,7 +1737,9 @@ State.ProfileName = SanitizeName(Config.SelectedProfile or "")
 State.AutoSkip = Config.AutoSkip == true
 State.AutoSpeed = Config.AutoSpeed == true
 State.AutoJump = Config.AutoJump == true
+State.WalkAround = Config.WalkAround == true
 State.AutoAntiMacro = Config.AutoAntiMacro == true
+State.HideName = Config.HideName == true
 State.AutoExec = Config.AutoExec == true
 State.FpsBoost = Config.FpsBoost == true
 State.BlackScreen = Config.BlackScreen == true
@@ -1602,7 +1828,9 @@ local function SaveConfig()
         AutoSkip = State.AutoSkip,
         AutoSpeed = State.AutoSpeed,
         AutoJump = State.AutoJump,
+        WalkAround = State.WalkAround,
         AutoAntiMacro = State.AutoAntiMacro,
+        HideName = State.HideName,
         AutoExec = State.AutoExec,
         FpsBoost = State.FpsBoost,
         BlackScreen = State.BlackScreen,
@@ -1667,6 +1895,47 @@ local function QueueSave()
         saveQueued = false
         SaveConfig()
     end)
+end
+
+local WalkAround = {}
+do
+function WalkAround.GetCharacter()
+    local character = LocalPlayer and LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not humanoid or not root or humanoid.Health <= 0 then return nil end
+    return character, humanoid, root
+end
+
+function WalkAround.CaptureCenter()
+    local character, _, root = WalkAround.GetCharacter()
+    if not character then return false end
+    State.WalkAroundCharacter = character
+    State.WalkAroundCenter = root.CFrame
+    return true
+end
+
+local function StopWalkAroundMovement()
+    local _, humanoid, root = WalkAround.GetCharacter()
+    if humanoid and root then
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+            humanoid:MoveTo(root.Position)
+        end)
+    end
+end
+
+function WalkAround.SetEnabled(enabled)
+    State.WalkAround = enabled == true
+    State.WalkAroundSerial = State.WalkAroundSerial + 1
+    if State.WalkAround then
+        WalkAround.CaptureCenter()
+    else
+        State.WalkAroundCenter = nil
+        State.WalkAroundCharacter = nil
+        StopWalkAroundMovement()
+    end
+end
 end
 
 local function GetQueueOnTeleport()
@@ -3487,6 +3756,15 @@ blackScreenToggle = MiscTab:Toggle({
     end,
 })
 Gui.BlackScreenToggle = blackScreenToggle
+MiscTab:Toggle({
+    Title = "Hide Name",
+    Desc = "Replaces player names in UI and hides overhead humanoid names",
+    Value = State.HideName,
+    Callback = function(value)
+        NameHider.SetEnabled(value == true)
+        QueueSave()
+    end,
+})
 if State.FpsBoost then task.defer(SetFpsBoost, true) end
 if State.BlackScreen then
     task.defer(function()
@@ -3494,6 +3772,7 @@ if State.BlackScreen then
         if not ok then pcall(function() blackScreenToggle:Set(false) end) end
     end)
 end
+if State.HideName then task.defer(NameHider.SetEnabled, true) end
 
 MiscTab:Section({ Title = "Auto Execute" })
 Gui.AutoExecToggle = MiscTab:Toggle({
@@ -3552,6 +3831,15 @@ MiscTab:Toggle({
     Value = State.AutoJump,
     Callback = function(value)
         State.AutoJump = value == true
+        QueueSave()
+    end,
+})
+MiscTab:Toggle({
+    Title = "Walk Around",
+    Desc = "Walks around the saved start point using circle, zig-zag and square paths",
+    Value = State.WalkAround,
+    Callback = function(value)
+        WalkAround.SetEnabled(value == true)
         QueueSave()
     end,
 })
@@ -3695,6 +3983,80 @@ task.spawn(function()
         task.wait(0.1)
     end
 end)
+
+do
+local WALK_AROUND_PATTERNS = {
+    function()
+        local points = {}
+        for step = 0, 15 do
+            local angle = (step / 16) * math.pi * 2
+            table.insert(points, Vector3.new(math.cos(angle) * 8, 0, math.sin(angle) * 8))
+        end
+        table.insert(points, Vector3.zero)
+        return points
+    end,
+    function()
+        return {
+            Vector3.new(-8, 0, -6), Vector3.new(8, 0, -3),
+            Vector3.new(-8, 0, 0), Vector3.new(8, 0, 3),
+            Vector3.new(-8, 0, 6), Vector3.zero,
+        }
+    end,
+    function()
+        return {
+            Vector3.new(8, 0, 0), Vector3.new(8, 0, 8),
+            Vector3.new(-8, 0, 8), Vector3.new(-8, 0, -8),
+            Vector3.new(8, 0, -8), Vector3.new(8, 0, 0),
+            Vector3.zero,
+        }
+    end,
+}
+
+local function WalkToSavedOffset(offset, serial)
+    local character, humanoid, root = WalkAround.GetCharacter()
+    if not character or character ~= State.WalkAroundCharacter or not State.WalkAroundCenter then return false end
+    local target = State.WalkAroundCenter:PointToWorldSpace(offset)
+    humanoid:MoveTo(target)
+    local deadline = os.clock() + 4
+    repeat
+        if not State.Running or not State.WalkAround or State.WalkAroundSerial ~= serial then return false end
+        if LocalPlayer.Character ~= character or humanoid.Health <= 0 or not root.Parent then return false end
+        if (root.Position - target).Magnitude <= 2.5 then return true end
+        task.wait(0.1)
+    until os.clock() >= deadline
+    return true
+end
+
+task.spawn(function()
+    local lastPattern
+    while State.Running do
+        if not State.WalkAround then
+            task.wait(0.35)
+        else
+            local character = LocalPlayer.Character
+            if not State.WalkAroundCenter or State.WalkAroundCharacter ~= character then
+                if not WalkAround.CaptureCenter() then
+                    task.wait(0.5)
+                end
+            end
+
+            if State.WalkAroundCenter and State.WalkAroundCharacter == LocalPlayer.Character then
+                local patternIndex = math.random(1, #WALK_AROUND_PATTERNS)
+                if #WALK_AROUND_PATTERNS > 1 and patternIndex == lastPattern then
+                    patternIndex = (patternIndex % #WALK_AROUND_PATTERNS) + 1
+                end
+                lastPattern = patternIndex
+                local serial = State.WalkAroundSerial
+                for _, offset in ipairs(WALK_AROUND_PATTERNS[patternIndex]()) do
+                    if not WalkToSavedOffset(offset, serial) then break end
+                    task.wait(0.08)
+                end
+                task.wait(0.25)
+            end
+        end
+    end
+end)
+end
 
 task.spawn(function()
     while State.Running do
@@ -4908,6 +5270,8 @@ end)
 function Hub.Destroy()
     if not State.Running then return end
     SaveConfig()
+    WalkAround.SetEnabled(false)
+    NameHider.Destroy()
     State.Running = false
     State.Recording = false
     State.Playing = false
