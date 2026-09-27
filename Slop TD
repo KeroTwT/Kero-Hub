@@ -2878,7 +2878,7 @@ MatchTab:Dropdown({
 })
 MatchTab:Dropdown({
     Title = "Complication",
-    Values = { "Normal", "Hard", "Nightmare" },
+    Values = { "Normal", "Hard", "Nightmare","Chaos" },
     Value = State.Complication,
     Multi = false,
     Callback = function(value)
