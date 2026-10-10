@@ -72,8 +72,6 @@ if HasFilesystem and not isfolder(MacroFolder) then
     makefolder(MacroFolder)
 end
 
--- One-time compatibility migration so renaming the hub does not discard the
--- user's existing macros or saved settings.
 if HasFilesystem and type(listfiles) == "function" and isfolder(LegacyMacroFolder) then
     for _, oldPath in ipairs(listfiles(LegacyMacroFolder)) do
         local fileName = oldPath:match("([^\\/]+%.json)$")
@@ -428,8 +426,6 @@ local function RunMovingAround(session)
         else
             humanoid.AutoRotate = true
 
-            -- Prefer the outer edge, then move inward until Roblox finds a
-            -- genuinely walkable route. Never force a direct walk into walls.
             local radiusScales = { 0.42, 0.34, 0.26, 0.18, 0.10 }
             local baseRadiusX = math.max(size.X, 25)
             local baseRadiusZ = math.max(size.Z, 25)
@@ -941,8 +937,6 @@ local function GetPlacementCFrame(tower)
             end
         end
 
-        -- The replicated BoostPos is the ground position. The placement remote
-        -- observed for this game uses a pivot 4.7 studs above it.
         return CFrame.new(boostPosition + Vector3.new(0, 4.7, 0)) * rotation
     end
 
@@ -1290,9 +1284,6 @@ local function WaitForActionGate(action, playbackStartedAt)
             return hasMoney
         end
 
-        -- Hybrid normally requires both recorded timing and cash. If the game
-        -- has already passed the recorded wave, timing is released so a late
-        -- start cannot permanently desync the macro.
         if targetWave > 0 and GetWave() > targetWave then
             hasTime = true
         end
@@ -1582,9 +1573,6 @@ local function StartPlayback()
             end
 
             if index == 1 then
-                -- The playback clock and action gate are now live. Speed/skip
-                -- may safely advance income because this action will execute as
-                -- soon as its recorded wave/time/money conditions are met.
                 State.PlaybackFirstActionArmed = true
             end
 
@@ -1656,7 +1644,6 @@ local function ApplySpeed(speed)
     end
 end
 
--- Background automation. These use visible replicated state and rate-limited RemoteEvents.
 task.spawn(function()
     local lastReady = 0
     local lastSkip = 0
@@ -1700,8 +1687,6 @@ task.spawn(function()
             Gui.StartEnabledPlayback()
         end
 
-        -- Keep ready enabled for the full match. Some maps recreate their ready
-        -- state after loading; the user-controlled delay keeps these requests bounded.
         if State.AutoReady
             and not ended
             and Remotes.Ready
@@ -1710,10 +1695,6 @@ task.spawn(function()
             pcall(function() Remotes.Ready:FireServer(true) end)
         end
 
-        -- Config is restored before WindUI finishes loading the selected macro.
-        -- Keep the opening at x1 and suppress skip until action 1's playback
-        -- gate is actively watching wave/time/money. It can then earn missing
-        -- starting cash without letting automation outrun a slow-loading macro.
         if matchReady
             and macroProfilePrepared
             and not macroAutomationReady
@@ -1830,7 +1811,6 @@ task.spawn(function()
     end
 end)
 
--- Kept as an inert fallback reference while the live interface below uses WindUI.
 if false then
 local function MakeButton(parent, text, position, size)
     local button = Instance.new("TextButton")
