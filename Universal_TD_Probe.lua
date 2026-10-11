@@ -44,6 +44,7 @@ local Config = {
     CorrelationWindow = math.max(1, tonumber(userConfig.CorrelationWindow) or 8),
     PreciseMaxDepth = math.max(3, tonumber(userConfig.PreciseMaxDepth) or 8),
     PreciseMaxItems = math.max(50, tonumber(userConfig.PreciseMaxItems) or 500),
+    BufferMaxBytes = math.max(1, math.floor(tonumber(userConfig.BufferMaxBytes) or 262144)),
     CaptureOutgoing = userConfig.CaptureOutgoing ~= false and isPerfect,
     -- Brutal_Perfect is also used to diagnose hub playback. Include calls
     -- made by the executor so failed/missing automation is visible in JSONL.
@@ -136,7 +137,69 @@ local function safePath(instance)
     return table.concat(parts, ".")
 end
 
+-- Snapshot binary payloads synchronously; hex/JSON encoding remains deferred.
+-- Bound work and disclose truncation instead of silently losing payload bytes.
+local FrozenBuffers = setmetatable({}, { __mode = "k" })
+local function freezeBuffer(value)
+    local frozen = {}
+    local info = { type = "buffer", encoding = "hex", snapshot = true }
+    FrozenBuffers[frozen] = info
+    if not buffer or type(buffer.len) ~= "function" or type(buffer.readstring) ~= "function" then
+        info.error = "buffer API unavailable"
+        return frozen
+    end
+    local ok, length = pcall(buffer.len, value)
+    if not ok then info.error = "buffer length unavailable"; return frozen end
+    info.byteLength = length
+    info.capturedBytes = math.min(length, Config.BufferMaxBytes)
+    info.truncated = info.capturedBytes < length
+    local readOK, bytes = pcall(buffer.readstring, value, 0, info.capturedBytes)
+    if readOK then info.bytes = bytes else info.error = "buffer read failed" end
+    return frozen
+end
+local function encodeFrozenBuffer(info)
+    local result = { type = "buffer", encoding = "hex", snapshot = true,
+        byteLength = info.byteLength, capturedBytes = info.capturedBytes,
+        truncated = info.truncated, error = info.error }
+    if info.bytes then
+        result.data = (info.bytes:gsub(".", function(char) return string.format("%02x", string.byte(char)) end))
+    end
+    return result
+end
+local function snapshotArguments(value, depth, state)
+    if FrozenBuffers[value] then return value end
+    local kind = typeof(value)
+    if kind == "buffer" then return freezeBuffer(value) end
+    if kind ~= "table" then return value end
+    depth = depth or 0
+    state = state or { seen = {}, items = 0 }
+    if state.seen[value] then return state.seen[value] end
+    -- The precise serializer does not visit data beyond these same limits.
+    if depth >= Config.PreciseMaxDepth then return value end
+    local copy = {}
+    state.seen[value] = copy
+    for key, nested in pairs(value) do
+        state.items = state.items + 1
+        if state.items > Config.PreciseMaxItems then
+            -- Retain the remainder for the serializer's existing truncation marker.
+            copy[key] = nested
+            break
+        end
+        copy[snapshotArguments(key, depth + 1, state)] = snapshotArguments(nested, depth + 1, state)
+    end
+    return copy
+end
+Environment.__UniversalTDProbeV2Snapshot = snapshotArguments
+local function safeArgumentSnapshot(value)
+    local snapshot = Environment.__UniversalTDProbeV2Snapshot
+    if type(snapshot) ~= "function" then return value end
+    local ok, result = pcall(snapshot, value)
+    return ok and result or value
+end
+
 local function serialize(value, depth)
+    if FrozenBuffers[value] then return encodeFrozenBuffer(FrozenBuffers[value]) end
+    if typeof(value) == "buffer" then return encodeFrozenBuffer(FrozenBuffers[freezeBuffer(value)]) end
     depth = depth or 0
     if depth >= 4 then
         return clampText(value)
@@ -183,6 +246,8 @@ end
 -- Remote arguments use an entry-list representation so numeric/string/table
 -- keys, sparse arrays, explicit table.pack().n and repeated references survive.
 local function serializePrecise(value, depth, state)
+    if FrozenBuffers[value] then return encodeFrozenBuffer(FrozenBuffers[value]) end
+    if typeof(value) == "buffer" then return encodeFrozenBuffer(FrozenBuffers[freezeBuffer(value)]) end
     depth = depth or 0
     state = state or { seen = {}, nextId = 0, items = 0 }
     local valueType = typeof(value)
@@ -537,7 +602,7 @@ local function snapshotRemote(remote, reason)
     if remote:IsA("RemoteEvent") or remote.ClassName == "UnreliableRemoteEvent" then
         connect(remote.OnClientEvent, function(...)
             if not Probe.Running then return end
-            local raw = table.pack(...)
+            local raw = safeArgumentSnapshot(table.pack(...))
             local actionId = activeActionId()
             local remotePath = safePath(remote)
             local sequence = reserveSequence()
@@ -819,6 +884,8 @@ end
 
 local function captureOutgoing(remote, method, rawArguments, rawReturned, context, actionId, remotePath, sequence, observedElapsed, capturePath)
     if not Probe.Running or not Config.CaptureOutgoing or not remoteAllowed(remote) then return end
+    rawArguments = safeArgumentSnapshot(rawArguments)
+    rawReturned = rawReturned and safeArgumentSnapshot(rawReturned) or nil
     task.defer(function()
         if not Probe.Running then return end
         addCandidate(Probe.RemoteCandidates, remote, method, 8)
@@ -893,9 +960,9 @@ local function installNamecallHook()
             return oldNamecall(remote, ...)
         end
 
-        -- Only cheap references/context are captured before the game call. The
-        -- original transport always runs before serialization, JSON or files.
-        local rawArguments = table.pack(...)
+        -- Copy bounded binary arguments before the game can reuse its buffers.
+        -- Hex encoding, JSON and file writes still run after the original call.
+        local rawArguments = safeArgumentSnapshot(table.pack(...))
         local actionId = activeActionId()
         local sequence = reserveSequence()
         local observedElapsed = os.clock() - StartedAt
@@ -947,9 +1014,9 @@ local function installDirectMethodHook(className, methodName, installedKey)
                 return originalMethod(remote, ...)
             end
 
-            -- Retain cheap references, run the original transport, then defer
-            -- precise serialization and file I/O through captureOutgoing.
-            local rawArguments = table.pack(...)
+            -- Snapshot bounded binary arguments, run the original transport, then
+            -- defer hex/JSON encoding and file I/O through captureOutgoing.
+            local rawArguments = safeArgumentSnapshot(table.pack(...))
             local actionId = activeActionId()
             local sequence = reserveSequence()
             local observedElapsed = os.clock() - StartedAt
