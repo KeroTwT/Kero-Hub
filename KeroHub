@@ -8,7 +8,7 @@ local Releases = {
     [4938220315] = {Release = "Skibidi%20Defense", Folder = "SkibidiDefense_Macros", RequiresCache = false},
     [6628327758] = {Release = "Dummy%20Defense", Folder = "DummyDefense_Macros", RequiresCache = false},
     [3913007563] = {Release = "The%20Battle%20Brick", Folder = "BattleBrick_Macros", RequiresCache = false},
-    [6272727021] = {Release = "Undertable%20Adventure%20X", Folder = "UndertableAX_Macros", RequiresCache = true},
+    [6272727021] = {Release = "Undertale%20Adventure%20X", Folder = "UndertableAX_Macros", RequiresCache = true},
 }
 local BaseURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Sources/"
 
