@@ -775,9 +775,20 @@ local function InferAbilityIndex(object)
 end
 
 local function IsOwnTower(tower)
-    return tower
-        and tower.Parent == TowerDataFolder
-        and tower:GetAttribute("Creator") == LocalPlayer.Name
+    if not tower or tower.Parent ~= TowerDataFolder then
+        return false
+    end
+    local creator = tower:GetAttribute("Creator") or tower:GetAttribute("Owner") or tower:GetAttribute("Player")
+    if creator == nil then
+        return false
+    end
+    if creator == LocalPlayer.Name or creator == LocalPlayer.DisplayName or creator == LocalPlayer.UserId then
+        return true
+    end
+    local creatorText = tostring(creator)
+    return creatorText == LocalPlayer.Name
+        or creatorText == LocalPlayer.DisplayName
+        or creatorText == tostring(LocalPlayer.UserId)
 end
 
 local function FindTowerModel(towerId, timeout)
@@ -786,20 +797,65 @@ local function FindTowerModel(towerId, timeout)
     end
     local model
     WaitUntil(function()
-        model = TowersFolder:FindFirstChild(tostring(towerId))
+        if not TowersFolder then RefreshGameObjects() end
+        model = TowersFolder and TowersFolder:FindFirstChild(tostring(towerId))
         return model
     end, timeout or 2, 0.05)
     return model
 end
 
-local function GetPlacementCFrame(tower)
-    local model = FindTowerModel(tower.Name, 2)
+local function GetTowerWorldPosition(tower)
+    if not tower then
+        return nil, nil
+    end
     local boostPosition = tower:GetAttribute("BoostPos")
+    if typeof(boostPosition) == "Vector3" then
+        return boostPosition, true
+    end
+    if typeof(boostPosition) == "CFrame" then
+        return boostPosition.Position, true
+    end
+    for _, attr in ipairs({ "Position", "Pos", "Origin", "CFrame", "Pivot" }) do
+        local val = tower:GetAttribute(attr)
+        if typeof(val) == "Vector3" then
+            return val, true
+        elseif typeof(val) == "CFrame" then
+            return val.Position, false
+        end
+    end
+    if TowersFolder then
+        local model = TowersFolder:FindFirstChild(tostring(tower.Name))
+        if model then
+            if model:IsA("Model") then
+                local ok, pivot = pcall(model.GetPivot, model)
+                if ok and typeof(pivot) == "CFrame" then
+                    return pivot.Position, false
+                end
+            elseif model:IsA("BasePart") then
+                return model.Position, false
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function GetPlacementCFrame(tower)
+    local model = FindTowerModel(tower.Name, 3)
+    local boostPosition
+    WaitUntil(function()
+        boostPosition = tower:GetAttribute("BoostPos")
+        return typeof(boostPosition) == "Vector3" or typeof(boostPosition) == "CFrame"
+    end, 2.5, 0.05)
+
+    if typeof(boostPosition) == "CFrame" then
+        boostPosition = boostPosition.Position
+    end
+
     if typeof(boostPosition) == "Vector3" then
         local rotation = CFrame.identity
         if model and model:IsA("Model") then
             local success, pivot = pcall(model.GetPivot, model)
-            if success then
+            if success and typeof(pivot) == "CFrame" then
                 rotation = pivot.Rotation
             end
         end
@@ -811,9 +867,16 @@ local function GetPlacementCFrame(tower)
 
     if model and model:IsA("Model") then
         local success, pivot = pcall(model.GetPivot, model)
-        if success then
+        if success and typeof(pivot) == "CFrame" then
             return pivot
         end
+    elseif model and model:IsA("BasePart") then
+        return model.CFrame
+    end
+
+    local fallbackPos, isGround = GetTowerWorldPosition(tower)
+    if typeof(fallbackPos) == "Vector3" then
+        return CFrame.new(isGround and (fallbackPos + Vector3.new(0, 4.7, 0)) or fallbackPos)
     end
 
     return nil
@@ -1043,11 +1106,15 @@ local function StartRecording(profileName)
         task.spawn(function()
             local ready = WaitUntil(function()
                 return IsOwnTower(tower) and tower:GetAttribute("ID") ~= nil
-            end, 5, 0.05)
+            end, 8, 0.05)
 
             if not ready or not State.Recording or State.RecordSession ~= recordSession then
                 return
             end
+
+            WaitUntil(function()
+                return tower:GetAttribute("SellPrice") ~= nil or tower:GetAttribute("BoostPos") ~= nil
+            end, 1.5, 0.05)
 
             local handle = "T" .. State.NextHandle
             State.NextHandle = State.NextHandle + 1
@@ -1061,11 +1128,13 @@ local function StartRecording(profileName)
             if not State.Recording or State.RecordSession ~= recordSession then return end
 
             local sellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0
+            local boostPos = tower:GetAttribute("BoostPos")
             AddAction({
                 Type = "Place",
                 Handle = handle,
                 Unit = tostring(tower:GetAttribute("ID")),
                 CFrame = CFrameToArray(placement),
+                BoostPos = typeof(boostPos) == "Vector3" and { boostPos.X, boostPos.Y, boostPos.Z } or nil,
                 EstimatedCost = sellPrice * 2,
             })
             local meta = State.TowerMeta[tower]
@@ -1155,31 +1224,116 @@ local function HorizontalDistance(a, b)
     return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 end
 
+local function NormalizeUnitId(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function SameUnitId(a, b)
+    local na, nb = NormalizeUnitId(a), NormalizeUnitId(b)
+    return na ~= "" and (na == nb or na:lower() == nb:lower())
+end
+
+local function IsMatchPaused()
+    local gui = GetPlayerGui()
+    if not gui then return false end
+    for _, desc in ipairs(gui:GetDescendants()) do
+        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+            local txt = tostring(desc.Text or ""):upper()
+            if txt == "UNPAUSE" or txt == "PAUSED" then
+                local screen = desc:FindFirstAncestorWhichIsA("ScreenGui")
+                if not screen or screen.Enabled ~= false then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function TryUnpauseMatch()
+    local gui = GetPlayerGui()
+    if not gui or not Hub.MatchFlow then return false end
+    for _, desc in ipairs(gui:GetDescendants()) do
+        if desc:IsA("GuiButton") and desc.Visible then
+            local txt = tostring((desc:IsA("TextButton") and desc.Text) or desc.Name or ""):upper()
+            if txt:find("UNPAUSE", 1, true) then
+                if Hub.MatchFlow.Click(desc) then
+                    return true
+                end
+            end
+        end
+        if desc:IsA("TextLabel") and desc.Visible and tostring(desc.Text or ""):upper():find("UNPAUSE", 1, true) then
+            local btn = desc.Parent and (desc.Parent:IsA("GuiButton") and desc.Parent or desc.Parent:FindFirstChildWhichIsA("GuiButton"))
+            if btn and Hub.MatchFlow.Click(btn) then
+                return true
+            end
+        end
+    end
+    if Remotes.Ready then
+        pcall(function() Remotes.Ready:FireServer(true) end)
+    end
+    return false
+end
+
 local function FindMatchingRuntimeTower(action, known)
     if not TowerDataFolder then
-        return nil
+        RefreshGameObjects()
+        if not TowerDataFolder then return nil end
     end
     local placement = ArrayToCFrame(action.CFrame)
     if not placement then
         return nil
     end
 
-    local match
+    local expectedGround = type(action.BoostPos) == "table"
+        and #action.BoostPos >= 3
+        and Vector3.new(action.BoostPos[1], action.BoostPos[2], action.BoostPos[3])
+        or (placement.Position - Vector3.new(0, 4.7, 0))
+
+    local bestMatch
+    local bestDistance = math.huge
+    local freshUnitCandidates = {}
+
     for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower)
             and not State.UsedRuntimeTowers[tower]
             and (not known or not known[tower])
-            and tostring(tower:GetAttribute("ID")) == tostring(action.Unit) then
-            local boostPosition = tower:GetAttribute("BoostPos")
-            if typeof(boostPosition) == "Vector3"
-                and HorizontalDistance(boostPosition, placement.Position) <= 0.35
-                and math.abs(boostPosition.Y + 4.7 - placement.Position.Y) <= 1 then
-                if match then return nil, "Multiple matching towers at the recorded position" end
-                match = tower
+            and SameUnitId(tower:GetAttribute("ID"), action.Unit) then
+            table.insert(freshUnitCandidates, tower)
+            local worldPos, isGround = GetTowerWorldPosition(tower)
+            if typeof(worldPos) == "Vector3" then
+                local horizDist = HorizontalDistance(worldPos, placement.Position)
+                local expectedY = isGround and expectedGround.Y or placement.Position.Y
+                local vertDiff = math.abs(worldPos.Y - expectedY)
+                local altVertDiff = math.abs(worldPos.Y + 4.7 - placement.Position.Y)
+                local minVertDiff = math.min(vertDiff, altVertDiff)
+
+                if horizDist <= 2.5 and minVertDiff <= 6.0 then
+                    if horizDist < bestDistance then
+                        bestDistance = horizDist
+                        bestMatch = tower
+                    end
+                end
             end
         end
     end
-    return match
+
+    if bestMatch then
+        return bestMatch
+    end
+
+    -- Fallback: if exactly one new tower of the requested unit appeared after
+    -- FireServer and its position attributes are still replicating or shifted slightly,
+    -- adopt it safely since sequential macro placement only spawns one unit at a time.
+    if #freshUnitCandidates == 1 then
+        local onlyTower = freshUnitCandidates[1]
+        local worldPos = GetTowerWorldPosition(onlyTower)
+        if worldPos == nil or HorizontalDistance(worldPos, placement.Position) <= 8.0 then
+            return onlyTower
+        end
+    end
+
+    return nil
 end
 
 local function PlaybackAlive(session)
@@ -1199,22 +1353,35 @@ local function WaitForActionGate(action, playbackStartedAt, session)
         local elapsed = os.clock() - playbackStartedAt
         local hasTime = elapsed >= recordedAt
         local hasMoney = cost <= 0 or GetMoney() >= cost
-        local hasWave = targetWave <= 0 or GetWave() >= targetWave
+        local currentWave = GetWave()
+        local hasWave = targetWave <= 0 or currentWave >= targetWave
 
         if State.PlaybackMode == "Time" then
             return hasTime
         elseif State.PlaybackMode == "Money" then
-            return hasMoney
+            -- Still wait for wave 1 to actually begin if the action was recorded in wave >= 1
+            return hasMoney and (targetWave <= 0 or currentWave >= 1)
         end
 
         -- Hybrid normally requires both recorded timing and cash. If the game
         -- has already passed the recorded wave, timing is released so a late
         -- start cannot permanently desync the macro.
-        if targetWave > 0 and GetWave() > targetWave then
+        if targetWave > 0 and currentWave > targetWave then
             hasTime = true
         end
         return hasWave and hasTime and hasMoney
     end, 600, 0.1)
+end
+
+local function FirePlaceRequest(unit, cframe)
+    RefreshGameObjects()
+    if not Remotes.Place then
+        return false, "placeTower remote is missing"
+    end
+    if Remotes.Place:IsA("RemoteFunction") then
+        return pcall(Remotes.Place.InvokeServer, Remotes.Place, unit, cframe, false)
+    end
+    return pcall(Remotes.Place.FireServer, Remotes.Place, unit, cframe, false)
 end
 
 local function PlayPlace(action, session)
@@ -1223,37 +1390,102 @@ local function PlayPlace(action, session)
         return false, "Invalid placement CFrame"
     end
 
-    -- Never adopt a pre-existing same-kind neighbour as this new placement.
+    RefreshGameObjects()
+    -- Snapshot pre-existing towers so we never adopt a neighbour placed earlier.
     local known = {}
-    for _, tower in ipairs(TowerDataFolder:GetChildren()) do known[tower] = true end
+    if TowerDataFolder then
+        for _, tower in ipairs(TowerDataFolder:GetChildren()) do
+            known[tower] = true
+        end
+    end
+
     local deadline = os.clock() + 180
     local estimatedCost = tonumber(action.EstimatedCost) or 0
+    local attempts = 0
+    local maxAttempts = 6
+    local lastReason = nil
 
     while PlaybackAlive(session) and os.clock() < deadline and not IsGameEnded() do
+        if IsMatchPaused() then
+            TryUnpauseMatch()
+        end
+
+        -- Check if a delayed server response from an earlier attempt already spawned our tower
+        local lateTower = FindMatchingRuntimeTower(action, known)
+        if typeof(lateTower) == "Instance" then
+            State.RuntimeHandles[action.Handle] = lateTower
+            State.UsedRuntimeTowers[lateTower] = true
+            return true
+        end
+
         if GetMoney() >= estimatedCost then
-            local sent, why = pcall(Remotes.Place.FireServer, Remotes.Place, action.Unit, placement, false)
-            local ambiguity
+            attempts = attempts + 1
+            local cashBefore = GetMoney()
+            -- Alternate CFrame on retry in case executor/map expects ground BoostPos vs +4.7 pivot
+            local tryCFrame = placement
+            if attempts == 3 or attempts == 5 then
+                if type(action.BoostPos) == "table" and #action.BoostPos >= 3 then
+                    tryCFrame = CFrame.new(action.BoostPos[1], action.BoostPos[2], action.BoostPos[3]) * placement.Rotation
+                else
+                    tryCFrame = CFrame.new(placement.Position - Vector3.new(0, 4.7, 0)) * placement.Rotation
+                end
+            end
+
+            SetStatus(
+                "Playback",
+                string.format("Placing %s (try %d/%d)", tostring(action.Unit), attempts, maxAttempts)
+            )
+
+            local sent, why = FirePlaceRequest(action.Unit, tryCFrame)
+            if not sent then
+                lastReason = "Place transport failed: " .. tostring(why)
+            end
+
+            local waitWindow = attempts == 1 and 4.5 or 5.5
             local success, tower = WaitUntil(function()
                 if not PlaybackAlive(session) or IsGameEnded() then return true end
-                local found, reason = FindMatchingRuntimeTower(action, known)
-                ambiguity = reason
-                return found
-            end, 12, 0.1)
-            if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
+                return FindMatchingRuntimeTower(action, known)
+            end, waitWindow, 0.08)
+
+            if not PlaybackAlive(session) or IsGameEnded() then
+                return false, "Playback cancelled"
+            end
             if success and typeof(tower) == "Instance" then
                 State.RuntimeHandles[action.Handle] = tower
                 State.UsedRuntimeTowers[tower] = true
                 return true
             end
-            -- A FireServer return is not an acceptance receipt. A late reply
-            -- must not result in a second paid placement at the same spot.
-            return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
-        end
 
-        task.wait(1.5)
+            -- If cash clearly dropped after firing, the server accepted the purchase
+            -- and the instance is still replicating; wait an extended grace window
+            -- without firing another purchase.
+            local cashNow = GetMoney()
+            if cashBefore < math.huge and cashNow < cashBefore - 1 then
+                local graceOk, graceTower = WaitUntil(function()
+                    if not PlaybackAlive(session) or IsGameEnded() then return true end
+                    return FindMatchingRuntimeTower(action, known)
+                end, 10, 0.1)
+                if not PlaybackAlive(session) or IsGameEnded() then
+                    return false, "Playback cancelled"
+                end
+                if graceOk and typeof(graceTower) == "Instance" then
+                    State.RuntimeHandles[action.Handle] = graceTower
+                    State.UsedRuntimeTowers[graceTower] = true
+                    return true
+                end
+            end
+
+            if attempts >= maxAttempts then
+                return false, lastReason or string.format("Placement unconfirmed after %d attempts (check unit loadout / match pause)", attempts)
+            end
+
+            task.wait(0.6)
+        else
+            task.wait(0.25)
+        end
     end
 
-    return false, "Place timed out"
+    return false, lastReason or "Place timed out"
 end
 
 local function ResolveHandle(handle)
@@ -1262,6 +1494,21 @@ local function ResolveHandle(handle)
         return tower
     end
     return nil
+end
+
+local function FireUpgradeRequest(towerName)
+    RefreshGameObjects()
+    if not Remotes.Upgrade then
+        return false, "UpgradeTower remote is missing"
+    end
+    if Remotes.Upgrade:IsA("RemoteFunction") then
+        local ok, res = pcall(Remotes.Upgrade.InvokeServer, Remotes.Upgrade, tostring(towerName))
+        if not ok then
+            ok, res = pcall(Remotes.Upgrade.InvokeServer, Remotes.Upgrade, tonumber(towerName) or tostring(towerName))
+        end
+        return ok, res
+    end
+    return pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(towerName))
 end
 
 local function PlayUpgrade(action, session)
@@ -1274,8 +1521,14 @@ local function PlayUpgrade(action, session)
     local estimatedCost = tonumber(action.EstimatedCost) or 0
     local deadline = os.clock() + 180
     local fundsUnlocked = estimatedCost <= 0
+    local stalledAttempts = 0
+    local maxStalledAttempts = 6
 
     while PlaybackAlive(session) and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
+        if IsMatchPaused() then
+            TryUnpauseMatch()
+        end
+
         local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
         if currentLevel >= targetLevel then
             return true
@@ -1291,11 +1544,13 @@ local function PlayUpgrade(action, session)
 
         if fundsUnlocked then
             local levelBeforeRequest = currentLevel
-            local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
+            local cashBefore = GetMoney()
+            local sent, why = FireUpgradeRequest(tower.Name)
+            local waitWindow = stalledAttempts == 0 and 4.0 or 5.0
             local progressed = WaitUntil(function()
                 return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
                     or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
-            end, 12, 0.05)
+            end, waitWindow, 0.05)
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if tower.Parent ~= TowerDataFolder then
                 return false, "Tower disappeared during upgrade"
@@ -1304,10 +1559,32 @@ local function PlayUpgrade(action, session)
                 return true
             end
 
-            if not progressed then
-                return false, sent and "Upgrade unconfirmed after 12s; no duplicate retry" or ("Upgrade transport failed: " .. tostring(why))
+            if progressed then
+                stalledAttempts = 0
+                task.wait(0.05)
+            else
+                -- If money dropped, wait longer for attribute replication before retrying
+                local cashNow = GetMoney()
+                if cashBefore < math.huge and cashNow < cashBefore - 1 then
+                    WaitUntil(function()
+                        return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
+                            or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
+                    end, 8.0, 0.05)
+                    if (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest then
+                        stalledAttempts = 0
+                        if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
+                            return true
+                        end
+                    end
+                end
+
+                stalledAttempts = stalledAttempts + 1
+                if stalledAttempts >= maxStalledAttempts then
+                    return false, sent and string.format("Upgrade unconfirmed after %d attempts", stalledAttempts) or ("Upgrade transport failed: " .. tostring(why))
+                end
+                -- Re-check funds on next loop in case EstimatedCost was slightly underestimated
+                task.wait(0.5)
             end
-            task.wait(0.05)
         else
             task.wait(0.1)
         end
@@ -1638,6 +1915,9 @@ local function StartPlayback()
 
         -- Match the recorder's clock to the first live wave, not loading time.
         while PlaybackAlive(session) and not IsGameEnded() and GetWave() < 1 do
+            if IsMatchPaused() then
+                TryUnpauseMatch()
+            end
             playbackStartedAt = os.clock()
             task.wait(0.1)
         end
@@ -2015,8 +2295,8 @@ function Reports.BuildMatch()
             {name="Clear Time",value="⏱️ "..Reports.FormatTime(elapsed),inline=true},
             {name="Match Rewards",value=Reports.MatchRewards(),inline=false},
             {name="Account Totals",value=Reports.AccountTotals(),inline=false},
-        },image={url="https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
-        footer={text="Made By Kero",icon_url="https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
+        },image={url="https://www.google.com/search?q=https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
+        footer={text="Made By Kero",icon_url="https://www.google.com/search?q=https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
 end
 SendDiscordWebhook=function(title,description,color)
     if not State.WebhookEnabled then return false,"Webhook is disabled" end
@@ -2796,7 +3076,7 @@ function Knock.Ready(door)
 end
 function Knock.Doors()
     local doors={}
-    -- The probe shows Door<number> models as direct Workspace children.
+    -- The probe shows Door&lt;number&gt; models as direct Workspace children.
     for _,door in ipairs(Workspace:GetChildren()) do
         if door:IsA("Model") and door.Name:match("^Door%d+$") then
             local prompt=door:FindFirstChildWhichIsA("ProximityPrompt",true)
@@ -3260,7 +3540,7 @@ function Hub.StopKnock()
     DisconnectAll(Knock.Connections)
 end
 -- WindUI interface -----------------------------------------------------------
-local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local WindUI = loadstring(game:HttpGet("https://www.google.com/search?q=https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
 local Window = KeroBrand.Bind(WindUI:CreateWindow(KeroBrand.Check({
     Title = "Skibidi Defense Hub",
     Author = KeroBrand.Author,
@@ -4897,9 +5177,20 @@ local function InferAbilityIndex(object)
 end
 
 local function IsOwnTower(tower)
-    return tower
-        and tower.Parent == TowerDataFolder
-        and tower:GetAttribute("Creator") == LocalPlayer.Name
+    if not tower or tower.Parent ~= TowerDataFolder then
+        return false
+    end
+    local creator = tower:GetAttribute("Creator") or tower:GetAttribute("Owner") or tower:GetAttribute("Player")
+    if creator == nil then
+        return false
+    end
+    if creator == LocalPlayer.Name or creator == LocalPlayer.DisplayName or creator == LocalPlayer.UserId then
+        return true
+    end
+    local creatorText = tostring(creator)
+    return creatorText == LocalPlayer.Name
+        or creatorText == LocalPlayer.DisplayName
+        or creatorText == tostring(LocalPlayer.UserId)
 end
 
 local function FindTowerModel(towerId, timeout)
@@ -4908,20 +5199,65 @@ local function FindTowerModel(towerId, timeout)
     end
     local model
     WaitUntil(function()
-        model = TowersFolder:FindFirstChild(tostring(towerId))
+        if not TowersFolder then RefreshGameObjects() end
+        model = TowersFolder and TowersFolder:FindFirstChild(tostring(towerId))
         return model
     end, timeout or 2, 0.05)
     return model
 end
 
-local function GetPlacementCFrame(tower)
-    local model = FindTowerModel(tower.Name, 2)
+local function GetTowerWorldPosition(tower)
+    if not tower then
+        return nil, nil
+    end
     local boostPosition = tower:GetAttribute("BoostPos")
+    if typeof(boostPosition) == "Vector3" then
+        return boostPosition, true
+    end
+    if typeof(boostPosition) == "CFrame" then
+        return boostPosition.Position, true
+    end
+    for _, attr in ipairs({ "Position", "Pos", "Origin", "CFrame", "Pivot" }) do
+        local val = tower:GetAttribute(attr)
+        if typeof(val) == "Vector3" then
+            return val, true
+        elseif typeof(val) == "CFrame" then
+            return val.Position, false
+        end
+    end
+    if TowersFolder then
+        local model = TowersFolder:FindFirstChild(tostring(tower.Name))
+        if model then
+            if model:IsA("Model") then
+                local ok, pivot = pcall(model.GetPivot, model)
+                if ok and typeof(pivot) == "CFrame" then
+                    return pivot.Position, false
+                end
+            elseif model:IsA("BasePart") then
+                return model.Position, false
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function GetPlacementCFrame(tower)
+    local model = FindTowerModel(tower.Name, 3)
+    local boostPosition
+    WaitUntil(function()
+        boostPosition = tower:GetAttribute("BoostPos")
+        return typeof(boostPosition) == "Vector3" or typeof(boostPosition) == "CFrame"
+    end, 2.5, 0.05)
+
+    if typeof(boostPosition) == "CFrame" then
+        boostPosition = boostPosition.Position
+    end
+
     if typeof(boostPosition) == "Vector3" then
         local rotation = CFrame.identity
         if model and model:IsA("Model") then
             local success, pivot = pcall(model.GetPivot, model)
-            if success then
+            if success and typeof(pivot) == "CFrame" then
                 rotation = pivot.Rotation
             end
         end
@@ -4933,9 +5269,16 @@ local function GetPlacementCFrame(tower)
 
     if model and model:IsA("Model") then
         local success, pivot = pcall(model.GetPivot, model)
-        if success then
+        if success and typeof(pivot) == "CFrame" then
             return pivot
         end
+    elseif model and model:IsA("BasePart") then
+        return model.CFrame
+    end
+
+    local fallbackPos, isGround = GetTowerWorldPosition(tower)
+    if typeof(fallbackPos) == "Vector3" then
+        return CFrame.new(isGround and (fallbackPos + Vector3.new(0, 4.7, 0)) or fallbackPos)
     end
 
     return nil
@@ -5165,11 +5508,15 @@ local function StartRecording(profileName)
         task.spawn(function()
             local ready = WaitUntil(function()
                 return IsOwnTower(tower) and tower:GetAttribute("ID") ~= nil
-            end, 5, 0.05)
+            end, 8, 0.05)
 
             if not ready or not State.Recording or State.RecordSession ~= recordSession then
                 return
             end
+
+            WaitUntil(function()
+                return tower:GetAttribute("SellPrice") ~= nil or tower:GetAttribute("BoostPos") ~= nil
+            end, 1.5, 0.05)
 
             local handle = "T" .. State.NextHandle
             State.NextHandle = State.NextHandle + 1
@@ -5183,11 +5530,13 @@ local function StartRecording(profileName)
             if not State.Recording or State.RecordSession ~= recordSession then return end
 
             local sellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0
+            local boostPos = tower:GetAttribute("BoostPos")
             AddAction({
                 Type = "Place",
                 Handle = handle,
                 Unit = tostring(tower:GetAttribute("ID")),
                 CFrame = CFrameToArray(placement),
+                BoostPos = typeof(boostPos) == "Vector3" and { boostPos.X, boostPos.Y, boostPos.Z } or nil,
                 EstimatedCost = sellPrice * 2,
             })
             local meta = State.TowerMeta[tower]
@@ -5277,31 +5626,116 @@ local function HorizontalDistance(a, b)
     return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 end
 
+local function NormalizeUnitId(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function SameUnitId(a, b)
+    local na, nb = NormalizeUnitId(a), NormalizeUnitId(b)
+    return na ~= "" and (na == nb or na:lower() == nb:lower())
+end
+
+local function IsMatchPaused()
+    local gui = GetPlayerGui()
+    if not gui then return false end
+    for _, desc in ipairs(gui:GetDescendants()) do
+        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+            local txt = tostring(desc.Text or ""):upper()
+            if txt == "UNPAUSE" or txt == "PAUSED" then
+                local screen = desc:FindFirstAncestorWhichIsA("ScreenGui")
+                if not screen or screen.Enabled ~= false then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function TryUnpauseMatch()
+    local gui = GetPlayerGui()
+    if not gui or not Hub.MatchFlow then return false end
+    for _, desc in ipairs(gui:GetDescendants()) do
+        if desc:IsA("GuiButton") and desc.Visible then
+            local txt = tostring((desc:IsA("TextButton") and desc.Text) or desc.Name or ""):upper()
+            if txt:find("UNPAUSE", 1, true) then
+                if Hub.MatchFlow.Click(desc) then
+                    return true
+                end
+            end
+        end
+        if desc:IsA("TextLabel") and desc.Visible and tostring(desc.Text or ""):upper():find("UNPAUSE", 1, true) then
+            local btn = desc.Parent and (desc.Parent:IsA("GuiButton") and desc.Parent or desc.Parent:FindFirstChildWhichIsA("GuiButton"))
+            if btn and Hub.MatchFlow.Click(btn) then
+                return true
+            end
+        end
+    end
+    if Remotes.Ready then
+        pcall(function() Remotes.Ready:FireServer(true) end)
+    end
+    return false
+end
+
 local function FindMatchingRuntimeTower(action, known)
     if not TowerDataFolder then
-        return nil
+        RefreshGameObjects()
+        if not TowerDataFolder then return nil end
     end
     local placement = ArrayToCFrame(action.CFrame)
     if not placement then
         return nil
     end
 
-    local match
+    local expectedGround = type(action.BoostPos) == "table"
+        and #action.BoostPos >= 3
+        and Vector3.new(action.BoostPos[1], action.BoostPos[2], action.BoostPos[3])
+        or (placement.Position - Vector3.new(0, 4.7, 0))
+
+    local bestMatch
+    local bestDistance = math.huge
+    local freshUnitCandidates = {}
+
     for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower)
             and not State.UsedRuntimeTowers[tower]
             and (not known or not known[tower])
-            and tostring(tower:GetAttribute("ID")) == tostring(action.Unit) then
-            local boostPosition = tower:GetAttribute("BoostPos")
-            if typeof(boostPosition) == "Vector3"
-                and HorizontalDistance(boostPosition, placement.Position) <= 0.35
-                and math.abs(boostPosition.Y + 4.7 - placement.Position.Y) <= 1 then
-                if match then return nil, "Multiple matching towers at the recorded position" end
-                match = tower
+            and SameUnitId(tower:GetAttribute("ID"), action.Unit) then
+            table.insert(freshUnitCandidates, tower)
+            local worldPos, isGround = GetTowerWorldPosition(tower)
+            if typeof(worldPos) == "Vector3" then
+                local horizDist = HorizontalDistance(worldPos, placement.Position)
+                local expectedY = isGround and expectedGround.Y or placement.Position.Y
+                local vertDiff = math.abs(worldPos.Y - expectedY)
+                local altVertDiff = math.abs(worldPos.Y + 4.7 - placement.Position.Y)
+                local minVertDiff = math.min(vertDiff, altVertDiff)
+
+                if horizDist <= 2.5 and minVertDiff <= 6.0 then
+                    if horizDist < bestDistance then
+                        bestDistance = horizDist
+                        bestMatch = tower
+                    end
+                end
             end
         end
     end
-    return match
+
+    if bestMatch then
+        return bestMatch
+    end
+
+    -- Fallback: if exactly one new tower of the requested unit appeared after
+    -- FireServer and its position attributes are still replicating or shifted slightly,
+    -- adopt it safely since sequential macro placement only spawns one unit at a time.
+    if #freshUnitCandidates == 1 then
+        local onlyTower = freshUnitCandidates[1]
+        local worldPos = GetTowerWorldPosition(onlyTower)
+        if worldPos == nil or HorizontalDistance(worldPos, placement.Position) <= 8.0 then
+            return onlyTower
+        end
+    end
+
+    return nil
 end
 
 local function PlaybackAlive(session)
@@ -5321,22 +5755,35 @@ local function WaitForActionGate(action, playbackStartedAt, session)
         local elapsed = os.clock() - playbackStartedAt
         local hasTime = elapsed >= recordedAt
         local hasMoney = cost <= 0 or GetMoney() >= cost
-        local hasWave = targetWave <= 0 or GetWave() >= targetWave
+        local currentWave = GetWave()
+        local hasWave = targetWave <= 0 or currentWave >= targetWave
 
         if State.PlaybackMode == "Time" then
             return hasTime
         elseif State.PlaybackMode == "Money" then
-            return hasMoney
+            -- Still wait for wave 1 to actually begin if the action was recorded in wave >= 1
+            return hasMoney and (targetWave <= 0 or currentWave >= 1)
         end
 
         -- Hybrid normally requires both recorded timing and cash. If the game
         -- has already passed the recorded wave, timing is released so a late
         -- start cannot permanently desync the macro.
-        if targetWave > 0 and GetWave() > targetWave then
+        if targetWave > 0 and currentWave > targetWave then
             hasTime = true
         end
         return hasWave and hasTime and hasMoney
     end, 600, 0.1)
+end
+
+local function FirePlaceRequest(unit, cframe)
+    RefreshGameObjects()
+    if not Remotes.Place then
+        return false, "placeTower remote is missing"
+    end
+    if Remotes.Place:IsA("RemoteFunction") then
+        return pcall(Remotes.Place.InvokeServer, Remotes.Place, unit, cframe, false)
+    end
+    return pcall(Remotes.Place.FireServer, Remotes.Place, unit, cframe, false)
 end
 
 local function PlayPlace(action, session)
@@ -5345,37 +5792,102 @@ local function PlayPlace(action, session)
         return false, "Invalid placement CFrame"
     end
 
-    -- Never adopt a pre-existing same-kind neighbour as this new placement.
+    RefreshGameObjects()
+    -- Snapshot pre-existing towers so we never adopt a neighbour placed earlier.
     local known = {}
-    for _, tower in ipairs(TowerDataFolder:GetChildren()) do known[tower] = true end
+    if TowerDataFolder then
+        for _, tower in ipairs(TowerDataFolder:GetChildren()) do
+            known[tower] = true
+        end
+    end
+
     local deadline = os.clock() + 180
     local estimatedCost = tonumber(action.EstimatedCost) or 0
+    local attempts = 0
+    local maxAttempts = 6
+    local lastReason = nil
 
     while PlaybackAlive(session) and os.clock() < deadline and not IsGameEnded() do
+        if IsMatchPaused() then
+            TryUnpauseMatch()
+        end
+
+        -- Check if a delayed server response from an earlier attempt already spawned our tower
+        local lateTower = FindMatchingRuntimeTower(action, known)
+        if typeof(lateTower) == "Instance" then
+            State.RuntimeHandles[action.Handle] = lateTower
+            State.UsedRuntimeTowers[lateTower] = true
+            return true
+        end
+
         if GetMoney() >= estimatedCost then
-            local sent, why = pcall(Remotes.Place.FireServer, Remotes.Place, action.Unit, placement, false)
-            local ambiguity
+            attempts = attempts + 1
+            local cashBefore = GetMoney()
+            -- Alternate CFrame on retry in case executor/map expects ground BoostPos vs +4.7 pivot
+            local tryCFrame = placement
+            if attempts == 3 or attempts == 5 then
+                if type(action.BoostPos) == "table" and #action.BoostPos >= 3 then
+                    tryCFrame = CFrame.new(action.BoostPos[1], action.BoostPos[2], action.BoostPos[3]) * placement.Rotation
+                else
+                    tryCFrame = CFrame.new(placement.Position - Vector3.new(0, 4.7, 0)) * placement.Rotation
+                end
+            end
+
+            SetStatus(
+                "Playback",
+                string.format("Placing %s (try %d/%d)", tostring(action.Unit), attempts, maxAttempts)
+            )
+
+            local sent, why = FirePlaceRequest(action.Unit, tryCFrame)
+            if not sent then
+                lastReason = "Place transport failed: " .. tostring(why)
+            end
+
+            local waitWindow = attempts == 1 and 4.5 or 5.5
             local success, tower = WaitUntil(function()
                 if not PlaybackAlive(session) or IsGameEnded() then return true end
-                local found, reason = FindMatchingRuntimeTower(action, known)
-                ambiguity = reason
-                return found
-            end, 12, 0.1)
-            if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
+                return FindMatchingRuntimeTower(action, known)
+            end, waitWindow, 0.08)
+
+            if not PlaybackAlive(session) or IsGameEnded() then
+                return false, "Playback cancelled"
+            end
             if success and typeof(tower) == "Instance" then
                 State.RuntimeHandles[action.Handle] = tower
                 State.UsedRuntimeTowers[tower] = true
                 return true
             end
-            -- A FireServer return is not an acceptance receipt. A late reply
-            -- must not result in a second paid placement at the same spot.
-            return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
-        end
 
-        task.wait(1.5)
+            -- If cash clearly dropped after firing, the server accepted the purchase
+            -- and the instance is still replicating; wait an extended grace window
+            -- without firing another purchase.
+            local cashNow = GetMoney()
+            if cashBefore < math.huge and cashNow < cashBefore - 1 then
+                local graceOk, graceTower = WaitUntil(function()
+                    if not PlaybackAlive(session) or IsGameEnded() then return true end
+                    return FindMatchingRuntimeTower(action, known)
+                end, 10, 0.1)
+                if not PlaybackAlive(session) or IsGameEnded() then
+                    return false, "Playback cancelled"
+                end
+                if graceOk and typeof(graceTower) == "Instance" then
+                    State.RuntimeHandles[action.Handle] = graceTower
+                    State.UsedRuntimeTowers[graceTower] = true
+                    return true
+                end
+            end
+
+            if attempts >= maxAttempts then
+                return false, lastReason or string.format("Placement unconfirmed after %d attempts (check unit loadout / match pause)", attempts)
+            end
+
+            task.wait(0.6)
+        else
+            task.wait(0.25)
+        end
     end
 
-    return false, "Place timed out"
+    return false, lastReason or "Place timed out"
 end
 
 local function ResolveHandle(handle)
@@ -5384,6 +5896,21 @@ local function ResolveHandle(handle)
         return tower
     end
     return nil
+end
+
+local function FireUpgradeRequest(towerName)
+    RefreshGameObjects()
+    if not Remotes.Upgrade then
+        return false, "UpgradeTower remote is missing"
+    end
+    if Remotes.Upgrade:IsA("RemoteFunction") then
+        local ok, res = pcall(Remotes.Upgrade.InvokeServer, Remotes.Upgrade, tostring(towerName))
+        if not ok then
+            ok, res = pcall(Remotes.Upgrade.InvokeServer, Remotes.Upgrade, tonumber(towerName) or tostring(towerName))
+        end
+        return ok, res
+    end
+    return pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(towerName))
 end
 
 local function PlayUpgrade(action, session)
@@ -5396,8 +5923,14 @@ local function PlayUpgrade(action, session)
     local estimatedCost = tonumber(action.EstimatedCost) or 0
     local deadline = os.clock() + 180
     local fundsUnlocked = estimatedCost <= 0
+    local stalledAttempts = 0
+    local maxStalledAttempts = 6
 
     while PlaybackAlive(session) and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
+        if IsMatchPaused() then
+            TryUnpauseMatch()
+        end
+
         local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
         if currentLevel >= targetLevel then
             return true
@@ -5413,11 +5946,13 @@ local function PlayUpgrade(action, session)
 
         if fundsUnlocked then
             local levelBeforeRequest = currentLevel
-            local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
+            local cashBefore = GetMoney()
+            local sent, why = FireUpgradeRequest(tower.Name)
+            local waitWindow = stalledAttempts == 0 and 4.0 or 5.0
             local progressed = WaitUntil(function()
                 return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
                     or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
-            end, 12, 0.05)
+            end, waitWindow, 0.05)
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if tower.Parent ~= TowerDataFolder then
                 return false, "Tower disappeared during upgrade"
@@ -5426,10 +5961,32 @@ local function PlayUpgrade(action, session)
                 return true
             end
 
-            if not progressed then
-                return false, sent and "Upgrade unconfirmed after 12s; no duplicate retry" or ("Upgrade transport failed: " .. tostring(why))
+            if progressed then
+                stalledAttempts = 0
+                task.wait(0.05)
+            else
+                -- If money dropped, wait longer for attribute replication before retrying
+                local cashNow = GetMoney()
+                if cashBefore < math.huge and cashNow < cashBefore - 1 then
+                    WaitUntil(function()
+                        return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
+                            or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
+                    end, 8.0, 0.05)
+                    if (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest then
+                        stalledAttempts = 0
+                        if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
+                            return true
+                        end
+                    end
+                end
+
+                stalledAttempts = stalledAttempts + 1
+                if stalledAttempts >= maxStalledAttempts then
+                    return false, sent and string.format("Upgrade unconfirmed after %d attempts", stalledAttempts) or ("Upgrade transport failed: " .. tostring(why))
+                end
+                -- Re-check funds on next loop in case EstimatedCost was slightly underestimated
+                task.wait(0.5)
             end
-            task.wait(0.05)
         else
             task.wait(0.1)
         end
@@ -5760,6 +6317,9 @@ local function StartPlayback()
 
         -- Match the recorder's clock to the first live wave, not loading time.
         while PlaybackAlive(session) and not IsGameEnded() and GetWave() < 1 do
+            if IsMatchPaused() then
+                TryUnpauseMatch()
+            end
             playbackStartedAt = os.clock()
             task.wait(0.1)
         end
@@ -6137,8 +6697,8 @@ function Reports.BuildMatch()
             {name="Clear Time",value="⏱️ "..Reports.FormatTime(elapsed),inline=true},
             {name="Match Rewards",value=Reports.MatchRewards(),inline=false},
             {name="Account Totals",value=Reports.AccountTotals(),inline=false},
-        },image={url="https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
-        footer={text="Made By Kero",icon_url="https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
+        },image={url="https://www.google.com/search?q=https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
+        footer={text="Made By Kero",icon_url="https://www.google.com/search?q=https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
 end
 SendDiscordWebhook=function(title,description,color)
     if not State.WebhookEnabled then return false,"Webhook is disabled" end
@@ -6918,7 +7478,7 @@ function Knock.Ready(door)
 end
 function Knock.Doors()
     local doors={}
-    -- The probe shows Door<number> models as direct Workspace children.
+    -- The probe shows Door&lt;number&gt; models as direct Workspace children.
     for _,door in ipairs(Workspace:GetChildren()) do
         if door:IsA("Model") and door.Name:match("^Door%d+$") then
             local prompt=door:FindFirstChildWhichIsA("ProximityPrompt",true)
@@ -7382,7 +7942,7 @@ function Hub.StopKnock()
     DisconnectAll(Knock.Connections)
 end
 -- WindUI interface -----------------------------------------------------------
-local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local WindUI = loadstring(game:HttpGet("https://www.google.com/search?q=https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
 local Window = KeroBrand.Bind(WindUI:CreateWindow(KeroBrand.Check({
     Title = "Skibidi Defense Hub",
     Author = KeroBrand.Author,
