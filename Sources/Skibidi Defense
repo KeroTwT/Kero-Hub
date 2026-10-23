@@ -2295,8 +2295,8 @@ function Reports.BuildMatch()
             {name="Clear Time",value="⏱️ "..Reports.FormatTime(elapsed),inline=true},
             {name="Match Rewards",value=Reports.MatchRewards(),inline=false},
             {name="Account Totals",value=Reports.AccountTotals(),inline=false},
-        },image={url="https://www.google.com/search?q=https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
-        footer={text="Made By Kero",icon_url="https://www.google.com/search?q=https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
+        },image={url=("https://" .. "i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg")},
+        footer={text="Made By Kero",icon_url=("https://" .. "i.postimg.cc/HWKcyfKJ/download-(2).jpg")},timestamp=DateTime.now():ToIsoDate()}
 end
 SendDiscordWebhook=function(title,description,color)
     if not State.WebhookEnabled then return false,"Webhook is disabled" end
@@ -3076,7 +3076,7 @@ function Knock.Ready(door)
 end
 function Knock.Doors()
     local doors={}
-    -- The probe shows Door&lt;number&gt; models as direct Workspace children.
+    -- The probe shows Door<number> models as direct Workspace children.
     for _,door in ipairs(Workspace:GetChildren()) do
         if door:IsA("Model") and door.Name:match("^Door%d+$") then
             local prompt=door:FindFirstChildWhichIsA("ProximityPrompt",true)
@@ -3540,7 +3540,14 @@ function Hub.StopKnock()
     DisconnectAll(Knock.Connections)
 end
 -- WindUI interface -----------------------------------------------------------
-local WindUI = loadstring(game:HttpGet("https://www.google.com/search?q=https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local WindUI do
+    local windUrl = "https://" .. "raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+    local okGet, windSrc = pcall(game.HttpGet, game, windUrl)
+    assert(okGet and type(windSrc) == "string" and #windSrc > 0, "Failed to download WindUI")
+    local windChunk, windErr = loadstring(windSrc)
+    assert(type(windChunk) == "function", "Failed to compile WindUI: " .. tostring(windErr))
+    WindUI = windChunk()
+end
 local Window = KeroBrand.Bind(WindUI:CreateWindow(KeroBrand.Check({
     Title = "Skibidi Defense Hub",
     Author = KeroBrand.Author,
@@ -6697,8 +6704,8 @@ function Reports.BuildMatch()
             {name="Clear Time",value="⏱️ "..Reports.FormatTime(elapsed),inline=true},
             {name="Match Rewards",value=Reports.MatchRewards(),inline=false},
             {name="Account Totals",value=Reports.AccountTotals(),inline=false},
-        },image={url="https://www.google.com/search?q=https://i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg"},
-        footer={text="Made By Kero",icon_url="https://www.google.com/search?q=https://i.postimg.cc/HWKcyfKJ/download-(2).jpg"},timestamp=DateTime.now():ToIsoDate()}
+        },image={url=("https://" .. "i.postimg.cc/1RYRdwrS/Bo-suu-tap.jpg")},
+        footer={text="Made By Kero",icon_url=("https://" .. "i.postimg.cc/HWKcyfKJ/download-(2).jpg")},timestamp=DateTime.now():ToIsoDate()}
 end
 SendDiscordWebhook=function(title,description,color)
     if not State.WebhookEnabled then return false,"Webhook is disabled" end
@@ -7478,7 +7485,7 @@ function Knock.Ready(door)
 end
 function Knock.Doors()
     local doors={}
-    -- The probe shows Door&lt;number&gt; models as direct Workspace children.
+    -- The probe shows Door<number> models as direct Workspace children.
     for _,door in ipairs(Workspace:GetChildren()) do
         if door:IsA("Model") and door.Name:match("^Door%d+$") then
             local prompt=door:FindFirstChildWhichIsA("ProximityPrompt",true)
@@ -7942,7 +7949,14 @@ function Hub.StopKnock()
     DisconnectAll(Knock.Connections)
 end
 -- WindUI interface -----------------------------------------------------------
-local WindUI = loadstring(game:HttpGet("https://www.google.com/search?q=https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local WindUI do
+    local windUrl = "https://" .. "raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+    local okGet, windSrc = pcall(game.HttpGet, game, windUrl)
+    assert(okGet and type(windSrc) == "string" and #windSrc > 0, "Failed to download WindUI")
+    local windChunk, windErr = loadstring(windSrc)
+    assert(type(windChunk) == "function", "Failed to compile WindUI: " .. tostring(windErr))
+    WindUI = windChunk()
+end
 local Window = KeroBrand.Bind(WindUI:CreateWindow(KeroBrand.Check({
     Title = "Skibidi Defense Hub",
     Author = KeroBrand.Author,
