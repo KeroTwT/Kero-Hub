@@ -1189,6 +1189,9 @@ StopRecording = function(save)
         return false, "Recorder is not running"
     end
 
+    if Hub.MatchFlow and Hub.MatchFlow.RecordLoadout then
+        pcall(Hub.MatchFlow.RecordLoadout)
+    end
     for _,sample in ipairs(State.RecordCooldownSamples or {}) do pcall(UpdateRecordedCooldown,sample) end
     State.Recording = false
     if Gui.SetRecordToggle then
@@ -2389,73 +2392,145 @@ function MatchFlow.ReadCards()
         if list then for slot=1,12 do
             local label=MatchFlow.Path(list,"Row"..slot.."/Name")
             if not label then break end
-            towers[#towers+1]=label.Text
+            local txt=tostring(label.Text or ""):gsub("^%s+",""):gsub("%s+$","")
+            if txt~="" then towers[#towers+1]=txt end
         end end
         if #towers>0 then presets[index]={Name=title and title.Text or "Preset "..index,Towers=towers} end
     end end
     return presets,cards
+end
+function MatchFlow.IsPresetModeActive()
+    local gui=GetPlayerGui()
+    local easy=gui and gui:FindFirstChild("EasyLoadout")
+    if easy then
+        if easy:IsA("ScreenGui") and easy.Enabled==false then return false end
+        local root=easy:FindFirstChild("Root")
+        if root and MatchFlow.Visible(root) then return true end
+        local presets=MatchFlow.ReadCards()
+        if next(presets)~=nil then return true end
+    end
+    return next(MatchFlow.Presets)~=nil or MatchFlow.Applied~=nil
 end
 function MatchFlow.PickerOpen()
     local root=MatchFlow.Path(GetPlayerGui(),"EasyLoadout/Root")
     local title=MatchFlow.Path(root,"Header/Title")
     return MatchFlow.Visible(root) and not (title and tostring(title.Text):upper():find("LOCKED",1,true))
 end
+function MatchFlow.WatchPickerCards()
+    local _,cards=MatchFlow.ReadCards()
+    if not cards or MatchFlow.WatchedCards==cards then return end
+    MatchFlow.WatchedCards=cards
+    for index=1,4 do
+        local card=cards:FindFirstChild("Card"..index)
+        local selectBtn=card and (card:FindFirstChild("Select") or card)
+        if selectBtn and selectBtn:IsA("GuiObject") then
+            AddConnection(State.Connections,selectBtn.InputBegan:Connect(function(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+                    local presets=MatchFlow.Presets
+                    if not next(presets) then presets=MatchFlow.ReadCards() end
+                    local preset=presets[index]
+                    if preset then
+                        MatchFlow.Applied=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+                        MatchFlow.RecordLoadout()
+                    end
+                end
+            end))
+        end
+    end
+end
 function MatchFlow.OnShow(data)
     if type(data)~="table" or type(data.Presets)~="table" then return end
     MatchFlow.Presets=data.Presets;MatchFlow.Chapter=data.Chapter
     MatchFlow.Applied=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
-    MatchFlow.HydrateAfter=os.clock()+0.5
+    MatchFlow.HydrateAfter=os.clock()+0.2
+    MatchFlow.WatchPickerCards()
 end
 function MatchFlow.HydrateApplied()
+    MatchFlow.WatchPickerCards()
     if MatchFlow.Applied or os.clock()<(MatchFlow.HydrateAfter or 0) then return end
-    local title=MatchFlow.Path(GetPlayerGui(),"EasyLoadout/Root/Header/Title")
-    if not title or not tostring(title.Text):upper():find("LOCKED IN",1,true) then return end
-    local presets,cards=MatchFlow.ReadCards();local selected
+    local presets,cards=MatchFlow.ReadCards()
+    if not next(presets) and next(MatchFlow.Presets) then presets=MatchFlow.Presets end
+    if not cards then return end
+    local selected
     for index,preset in pairs(presets) do
-        local picked=MatchFlow.Path(cards,"Card"..index.."/Picked")
+        local card=cards:FindFirstChild("Card"..index)
+        local picked=card and card:FindFirstChild("Picked")
         local label=picked and picked:FindFirstChild("Label")
-        if picked and picked.Visible and label and tostring(label.Text):upper():find("LOCKED IN",1,true) then
-            if selected then return end -- Ambiguous UI is not confirmation.
+        local selectBtn=card and card:FindFirstChild("Select")
+        local selectTxt=selectBtn and (selectBtn:IsA("TextButton") and selectBtn.Text or (selectBtn:FindFirstChildWhichIsA("TextLabel") and selectBtn:FindFirstChildWhichIsA("TextLabel").Text)) or ""
+        if (picked and picked.Visible and (not label or tostring(label.Text):upper():find("LOCKED",1,true) or tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECT",1,true)))
+            or tostring(selectTxt):upper():find("SELECTED",1,true)
+            or tostring(selectTxt):upper():find("LOCKED",1,true) then
+            if selected then return end
             selected={Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers}
         end
     end
-    MatchFlow.Applied=MatchFlow.ValidateLoadout(selected)
+    if selected then
+        MatchFlow.Applied=MatchFlow.ValidateLoadout(selected)
+    end
+end
+function MatchFlow.InferLoadoutFromActions()
+    local presets=MatchFlow.Presets
+    if not next(presets) then presets=MatchFlow.ReadCards() end
+    if not next(presets) then return nil end
+    local usedUnits={}
+    for _,action in ipairs(State.Actions or {}) do
+        if action.Type=="Place" and type(action.Unit)=="string" and action.Unit~="" then
+            usedUnits[action.Unit]=true
+        end
+    end
+    if not next(usedUnits) then return nil end
+    for index,preset in pairs(presets) do
+        if type(preset.Towers)=="table" then
+            local allFound=true
+            for unit in pairs(usedUnits) do
+                local found=false
+                for _,pUnit in ipairs(preset.Towers) do
+                    if SameUnitId(unit,pUnit) then found=true;break end
+                end
+                if not found then allFound=false;break end
+            end
+            if allFound then
+                return MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+            end
+        end
+    end
+    return nil
 end
 function MatchFlow.RecordLoadout()
     MatchFlow.HydrateApplied()
-    if not State.Recording or not MatchFlow.Applied then return end
-    State.MacroLoadout=MatchFlow.ValidateLoadout(MatchFlow.Applied)
-    if State.MacroLoadout then
-        if GetWave()<1 and #State.Actions==0 then
-            State.RecordStartedAt=os.clock();State.RecordAwaitFirstWave=true
+    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.InferLoadoutFromActions()
+    if not candidate then return end
+    if State.Recording then
+        local changed=not State.MacroLoadout or State.MacroLoadout.Name~=candidate.Name
+        State.MacroLoadout=candidate
+        if changed then
+            if GetWave()<1 and #State.Actions==0 then
+                State.RecordStartedAt=os.clock();State.RecordAwaitFirstWave=true
+            end
+            SetStatus("Recording","Loadout auto-saved: "..State.MacroLoadout.Name)
         end
-        SetStatus("Recording","Loadout confirmed: "..State.MacroLoadout.Name)
-        if Gui.LoadoutStatus then Gui.LoadoutStatus:SetDesc(State.MacroLoadout.Name) end
+        MatchFlow.UpdateLoadoutStatus()
     end
 end
 function MatchFlow.UpdateRecorderClock()
-    if State.Recording and State.RecordAwaitFirstWave and GetWave()>0 then
-        State.RecordAwaitFirstWave=false;State.RecordStartedAt=os.clock()
+    if State.Recording then
+        if not State.MacroLoadout then
+            MatchFlow.RecordLoadout()
+        end
+        if State.RecordAwaitFirstWave and GetWave()>0 then
+            State.RecordAwaitFirstWave=false;State.RecordStartedAt=os.clock()
+        end
     end
 end
 function MatchFlow.UpdateLoadoutStatus()
-    local text=State.MacroLoadout and State.MacroLoadout.Name or "Not recorded"
+    if State.Recording and not State.MacroLoadout then
+        MatchFlow.RecordLoadout()
+    end
+    local text=State.MacroLoadout and (State.MacroLoadout.Name.." (Preset Mode)") or "Current Loadout (Normal)"
     if Gui.LoadoutStatus and MatchFlow.LoadoutText~=text then
         MatchFlow.LoadoutText=text;Gui.LoadoutStatus:SetDesc(text)
     end
-end
-function MatchFlow.SaveCurrentLoadout()
-    if State.Playing or State.Recording then return false,"Stop recording/playback first" end
-    if State.ProfileName=="" then return false,"Select a macro first" end
-    MatchFlow.HydrateApplied()
-    local selected=MatchFlow.ValidateLoadout(MatchFlow.Applied)
-    if not selected then return false,"Choose a preset in the game first" end
-    local previous=State.MacroLoadout
-    State.MacroLoadout=selected
-    local ok,saved,why=pcall(SaveProfile,State.ProfileName)
-    if not ok or not saved then State.MacroLoadout=previous;return false,tostring(ok and why or saved) end
-    MatchFlow.UpdateLoadoutStatus()
-    return true,selected.Name
 end
 function MatchFlow.OnApplied(towers)
     local presets=MatchFlow.Presets
@@ -2478,38 +2553,97 @@ function MatchFlow.Bind()
     end
     bind(loadout and loadout:FindFirstChild("Show"),MatchFlow.OnShow)
     bind(loadout and loadout:FindFirstChild("Applied"),MatchFlow.OnApplied)
+    MatchFlow.WatchPickerCards()
+end
+function MatchFlow.SelectPresetCard(matchedIndex, cards)
+    local card=cards and cards:FindFirstChild("Card"..matchedIndex)
+    local selectButton=card and (card:FindFirstChild("Select") or card:FindFirstChildWhichIsA("GuiButton",true) or card)
+    if selectButton then
+        local ok=MatchFlow.Click(selectButton)
+        if ok then return true end
+    end
+    -- Fallback: check if EasyLoadout has a selection RemoteEvent/RemoteFunction
+    local loadoutFolder=ReplicatedStorage:FindFirstChild("EasyLoadout")
+    if loadoutFolder then
+        for _,child in ipairs(loadoutFolder:GetChildren()) do
+            if child.Name~="Show" and child.Name~="Applied" then
+                if child:IsA("RemoteEvent") then
+                    local ok=pcall(child.FireServer,child,matchedIndex)
+                    if ok then return true end
+                elseif child:IsA("RemoteFunction") then
+                    local ok=pcall(child.InvokeServer,child,matchedIndex)
+                    if ok then return true end
+                end
+            end
+        end
+    end
+    return false,"Waiting for loadout button"
 end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
-    if not expected then return true end -- Legacy macros keep their existing behavior.
-    local deadline=os.clock()+70
+    if not expected then return true end -- Normal mode or legacy macro: use current equipped loadout.
+    local startWait=os.clock()
+    local deadline=startWait+70
+    local lastClickAt=0
     while PlaybackAlive(session) and not IsGameEnded() and os.clock()<deadline do
         MatchFlow.Bind()
         MatchFlow.HydrateApplied()
         if MatchFlow.Applied then
-            return MatchFlow.SameTowers(expected.Towers,MatchFlow.Applied.Towers),"A different preset is already applied"
+            return true
         end
         local presets,cards=MatchFlow.ReadCards()
         if next(MatchFlow.Presets) then presets=MatchFlow.Presets end
-        if MatchFlow.PickerOpen() then
+        local pickerVisible=MatchFlow.PickerOpen()
+        if pickerVisible then
             local matched
-            for index,preset in pairs(presets) do if MatchFlow.SameTowers(expected.Towers,preset.Towers) then matched=index;break end end
-            if not matched and next(presets) then return false,"Recorded loadout is unavailable in this map" end
-            local epoch=MatchFlow.ChoiceEpoch or cards
-            if matched and cards and MatchFlow.Requested~=epoch then
-                local card=cards:FindFirstChild("Card"..matched)
-                local ok,why=MatchFlow.Click(card and (card:FindFirstChild("Select") or card))
-                if ok then MatchFlow.Requested=epoch
-                else SetStatus("Playback","Waiting for loadout button | "..tostring(why)) end
+            for index,preset in pairs(presets) do
+                if MatchFlow.SameTowers(expected.Towers,preset.Towers) or tostring(preset.Name):lower()==tostring(expected.Name):lower() then
+                    matched=index;break
+                end
             end
-            SetStatus("Playback","Waiting for confirmed loadout: "..expected.Name)
-        elseif GetWave()>0 and not MatchFlow.Requested then
-            return false,"Cannot confirm recorded loadout; choose it before starting the match"
-        elseif MatchFlow.Requested then SetStatus("Playback","Waiting for confirmed loadout: "..expected.Name)
-        else SetStatus("Playback","Waiting for preset loadout selection") end
+            if not matched and tonumber(expected.Index) and presets[tonumber(expected.Index)] then
+                matched=tonumber(expected.Index)
+            end
+            if matched and cards and (os.clock()-lastClickAt)>=1.0 then
+                -- Wait briefly for the 4-card UI layout/AbsolutePosition to finish tweening in
+                task.wait(0.25)
+                local ok,why=MatchFlow.SelectPresetCard(matched,cards)
+                lastClickAt=os.clock()
+                if ok then
+                    MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
+                    SetStatus("Playback","Selected preset loadout: "..expected.Name)
+                    -- Wait up to 2.5s for picker to close or lock in
+                    WaitUntil(function()
+                        MatchFlow.HydrateApplied()
+                        return not PlaybackAlive(session) or MatchFlow.Applied~=nil or not MatchFlow.PickerOpen()
+                    end,2.5,0.1)
+                    if not MatchFlow.PickerOpen() or MatchFlow.Applied then
+                        return true
+                    end
+                else
+                    SetStatus("Playback","Waiting for loadout card | "..tostring(why))
+                end
+            else
+                SetStatus("Playback","Waiting for 4-loadout board: "..expected.Name)
+            end
+        else
+            -- If the 4-card EasyLoadout board is NOT open:
+            -- Wait a short grace window at the start of the match in case EasyLoadout UI is about to pop up.
+            -- If the match is a normal mode (no EasyLoadout UI appears) or a preset was already chosen, proceed with current loadout!
+            if MatchFlow.Requested then
+                return true
+            end
+            if not MatchFlow.IsPresetModeActive() and (GetWave()>=1 or (os.clock()-startWait)>=3.5) then
+                return true
+            end
+            if GetWave()>=1 and not MatchFlow.PickerOpen() and (os.clock()-startWait)>=2.5 then
+                return true
+            end
+            SetStatus("Playback","Waiting for loadout board...")
+        end
         task.wait(0.2)
     end
-    return false,PlaybackAlive(session) and "Loadout selection timed out" or "Playback stopped"
+    return true
 end
 function MatchFlow.SkipCutscenes()
     if not State.AutoSkipCutscene then return end
@@ -4067,11 +4201,7 @@ MacrosTab:Section({ Title = "Macro State" })
 Gui.Status = WrapParagraph(MacrosTab:Paragraph({ Title = "State: Idle", Desc = "Waiting" }))
 Gui.Runtime = WrapParagraph(MacrosTab:Paragraph({ Title = "Live match", Desc = "Reading game state..." }))
 Gui.ActionSummary = WrapParagraph(MacrosTab:Paragraph({ Title = "Recorded actions: 0", Desc = "No actions loaded" }))
-Gui.LoadoutStatus = WrapParagraph(MacrosTab:Paragraph({Title="Recorded Loadout",Desc="Not recorded"}))
-MacrosTab:Button({Title="Save Current Loadout",Callback=function()
-    local ok,message=Hub.MatchFlow.SaveCurrentLoadout()
-    SetStatus(ok and "Loadout saved" or "Loadout unavailable",message)
-end})
+Gui.LoadoutStatus = WrapParagraph(MacrosTab:Paragraph({Title="Recorded Loadout",Desc="Current Loadout (Normal)"}))
 
 local newProfileName = Config.NewProfileName or ""
 local profileInput = MacrosTab:Input({
@@ -5598,6 +5728,9 @@ StopRecording = function(save)
         return false, "Recorder is not running"
     end
 
+    if Hub.MatchFlow and Hub.MatchFlow.RecordLoadout then
+        pcall(Hub.MatchFlow.RecordLoadout)
+    end
     for _,sample in ipairs(State.RecordCooldownSamples or {}) do pcall(UpdateRecordedCooldown,sample) end
     State.Recording = false
     if Gui.SetRecordToggle then
@@ -6798,73 +6931,145 @@ function MatchFlow.ReadCards()
         if list then for slot=1,12 do
             local label=MatchFlow.Path(list,"Row"..slot.."/Name")
             if not label then break end
-            towers[#towers+1]=label.Text
+            local txt=tostring(label.Text or ""):gsub("^%s+",""):gsub("%s+$","")
+            if txt~="" then towers[#towers+1]=txt end
         end end
         if #towers>0 then presets[index]={Name=title and title.Text or "Preset "..index,Towers=towers} end
     end end
     return presets,cards
+end
+function MatchFlow.IsPresetModeActive()
+    local gui=GetPlayerGui()
+    local easy=gui and gui:FindFirstChild("EasyLoadout")
+    if easy then
+        if easy:IsA("ScreenGui") and easy.Enabled==false then return false end
+        local root=easy:FindFirstChild("Root")
+        if root and MatchFlow.Visible(root) then return true end
+        local presets=MatchFlow.ReadCards()
+        if next(presets)~=nil then return true end
+    end
+    return next(MatchFlow.Presets)~=nil or MatchFlow.Applied~=nil
 end
 function MatchFlow.PickerOpen()
     local root=MatchFlow.Path(GetPlayerGui(),"EasyLoadout/Root")
     local title=MatchFlow.Path(root,"Header/Title")
     return MatchFlow.Visible(root) and not (title and tostring(title.Text):upper():find("LOCKED",1,true))
 end
+function MatchFlow.WatchPickerCards()
+    local _,cards=MatchFlow.ReadCards()
+    if not cards or MatchFlow.WatchedCards==cards then return end
+    MatchFlow.WatchedCards=cards
+    for index=1,4 do
+        local card=cards:FindFirstChild("Card"..index)
+        local selectBtn=card and (card:FindFirstChild("Select") or card)
+        if selectBtn and selectBtn:IsA("GuiObject") then
+            AddConnection(State.Connections,selectBtn.InputBegan:Connect(function(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+                    local presets=MatchFlow.Presets
+                    if not next(presets) then presets=MatchFlow.ReadCards() end
+                    local preset=presets[index]
+                    if preset then
+                        MatchFlow.Applied=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+                        MatchFlow.RecordLoadout()
+                    end
+                end
+            end))
+        end
+    end
+end
 function MatchFlow.OnShow(data)
     if type(data)~="table" or type(data.Presets)~="table" then return end
     MatchFlow.Presets=data.Presets;MatchFlow.Chapter=data.Chapter
     MatchFlow.Applied=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
-    MatchFlow.HydrateAfter=os.clock()+0.5
+    MatchFlow.HydrateAfter=os.clock()+0.2
+    MatchFlow.WatchPickerCards()
 end
 function MatchFlow.HydrateApplied()
+    MatchFlow.WatchPickerCards()
     if MatchFlow.Applied or os.clock()<(MatchFlow.HydrateAfter or 0) then return end
-    local title=MatchFlow.Path(GetPlayerGui(),"EasyLoadout/Root/Header/Title")
-    if not title or not tostring(title.Text):upper():find("LOCKED IN",1,true) then return end
-    local presets,cards=MatchFlow.ReadCards();local selected
+    local presets,cards=MatchFlow.ReadCards()
+    if not next(presets) and next(MatchFlow.Presets) then presets=MatchFlow.Presets end
+    if not cards then return end
+    local selected
     for index,preset in pairs(presets) do
-        local picked=MatchFlow.Path(cards,"Card"..index.."/Picked")
+        local card=cards:FindFirstChild("Card"..index)
+        local picked=card and card:FindFirstChild("Picked")
         local label=picked and picked:FindFirstChild("Label")
-        if picked and picked.Visible and label and tostring(label.Text):upper():find("LOCKED IN",1,true) then
-            if selected then return end -- Ambiguous UI is not confirmation.
+        local selectBtn=card and card:FindFirstChild("Select")
+        local selectTxt=selectBtn and (selectBtn:IsA("TextButton") and selectBtn.Text or (selectBtn:FindFirstChildWhichIsA("TextLabel") and selectBtn:FindFirstChildWhichIsA("TextLabel").Text)) or ""
+        if (picked and picked.Visible and (not label or tostring(label.Text):upper():find("LOCKED",1,true) or tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECT",1,true)))
+            or tostring(selectTxt):upper():find("SELECTED",1,true)
+            or tostring(selectTxt):upper():find("LOCKED",1,true) then
+            if selected then return end
             selected={Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers}
         end
     end
-    MatchFlow.Applied=MatchFlow.ValidateLoadout(selected)
+    if selected then
+        MatchFlow.Applied=MatchFlow.ValidateLoadout(selected)
+    end
+end
+function MatchFlow.InferLoadoutFromActions()
+    local presets=MatchFlow.Presets
+    if not next(presets) then presets=MatchFlow.ReadCards() end
+    if not next(presets) then return nil end
+    local usedUnits={}
+    for _,action in ipairs(State.Actions or {}) do
+        if action.Type=="Place" and type(action.Unit)=="string" and action.Unit~="" then
+            usedUnits[action.Unit]=true
+        end
+    end
+    if not next(usedUnits) then return nil end
+    for index,preset in pairs(presets) do
+        if type(preset.Towers)=="table" then
+            local allFound=true
+            for unit in pairs(usedUnits) do
+                local found=false
+                for _,pUnit in ipairs(preset.Towers) do
+                    if SameUnitId(unit,pUnit) then found=true;break end
+                end
+                if not found then allFound=false;break end
+            end
+            if allFound then
+                return MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+            end
+        end
+    end
+    return nil
 end
 function MatchFlow.RecordLoadout()
     MatchFlow.HydrateApplied()
-    if not State.Recording or not MatchFlow.Applied then return end
-    State.MacroLoadout=MatchFlow.ValidateLoadout(MatchFlow.Applied)
-    if State.MacroLoadout then
-        if GetWave()<1 and #State.Actions==0 then
-            State.RecordStartedAt=os.clock();State.RecordAwaitFirstWave=true
+    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.InferLoadoutFromActions()
+    if not candidate then return end
+    if State.Recording then
+        local changed=not State.MacroLoadout or State.MacroLoadout.Name~=candidate.Name
+        State.MacroLoadout=candidate
+        if changed then
+            if GetWave()<1 and #State.Actions==0 then
+                State.RecordStartedAt=os.clock();State.RecordAwaitFirstWave=true
+            end
+            SetStatus("Recording","Loadout auto-saved: "..State.MacroLoadout.Name)
         end
-        SetStatus("Recording","Loadout confirmed: "..State.MacroLoadout.Name)
-        if Gui.LoadoutStatus then Gui.LoadoutStatus:SetDesc(State.MacroLoadout.Name) end
+        MatchFlow.UpdateLoadoutStatus()
     end
 end
 function MatchFlow.UpdateRecorderClock()
-    if State.Recording and State.RecordAwaitFirstWave and GetWave()>0 then
-        State.RecordAwaitFirstWave=false;State.RecordStartedAt=os.clock()
+    if State.Recording then
+        if not State.MacroLoadout then
+            MatchFlow.RecordLoadout()
+        end
+        if State.RecordAwaitFirstWave and GetWave()>0 then
+            State.RecordAwaitFirstWave=false;State.RecordStartedAt=os.clock()
+        end
     end
 end
 function MatchFlow.UpdateLoadoutStatus()
-    local text=State.MacroLoadout and State.MacroLoadout.Name or "Not recorded"
+    if State.Recording and not State.MacroLoadout then
+        MatchFlow.RecordLoadout()
+    end
+    local text=State.MacroLoadout and (State.MacroLoadout.Name.." (Preset Mode)") or "Current Loadout (Normal)"
     if Gui.LoadoutStatus and MatchFlow.LoadoutText~=text then
         MatchFlow.LoadoutText=text;Gui.LoadoutStatus:SetDesc(text)
     end
-end
-function MatchFlow.SaveCurrentLoadout()
-    if State.Playing or State.Recording then return false,"Stop recording/playback first" end
-    if State.ProfileName=="" then return false,"Select a macro first" end
-    MatchFlow.HydrateApplied()
-    local selected=MatchFlow.ValidateLoadout(MatchFlow.Applied)
-    if not selected then return false,"Choose a preset in the game first" end
-    local previous=State.MacroLoadout
-    State.MacroLoadout=selected
-    local ok,saved,why=pcall(SaveProfile,State.ProfileName)
-    if not ok or not saved then State.MacroLoadout=previous;return false,tostring(ok and why or saved) end
-    MatchFlow.UpdateLoadoutStatus()
-    return true,selected.Name
 end
 function MatchFlow.OnApplied(towers)
     local presets=MatchFlow.Presets
@@ -6887,38 +7092,97 @@ function MatchFlow.Bind()
     end
     bind(loadout and loadout:FindFirstChild("Show"),MatchFlow.OnShow)
     bind(loadout and loadout:FindFirstChild("Applied"),MatchFlow.OnApplied)
+    MatchFlow.WatchPickerCards()
+end
+function MatchFlow.SelectPresetCard(matchedIndex, cards)
+    local card=cards and cards:FindFirstChild("Card"..matchedIndex)
+    local selectButton=card and (card:FindFirstChild("Select") or card:FindFirstChildWhichIsA("GuiButton",true) or card)
+    if selectButton then
+        local ok=MatchFlow.Click(selectButton)
+        if ok then return true end
+    end
+    -- Fallback: check if EasyLoadout has a selection RemoteEvent/RemoteFunction
+    local loadoutFolder=ReplicatedStorage:FindFirstChild("EasyLoadout")
+    if loadoutFolder then
+        for _,child in ipairs(loadoutFolder:GetChildren()) do
+            if child.Name~="Show" and child.Name~="Applied" then
+                if child:IsA("RemoteEvent") then
+                    local ok=pcall(child.FireServer,child,matchedIndex)
+                    if ok then return true end
+                elseif child:IsA("RemoteFunction") then
+                    local ok=pcall(child.InvokeServer,child,matchedIndex)
+                    if ok then return true end
+                end
+            end
+        end
+    end
+    return false,"Waiting for loadout button"
 end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
-    if not expected then return true end -- Legacy macros keep their existing behavior.
-    local deadline=os.clock()+70
+    if not expected then return true end -- Normal mode or legacy macro: use current equipped loadout.
+    local startWait=os.clock()
+    local deadline=startWait+70
+    local lastClickAt=0
     while PlaybackAlive(session) and not IsGameEnded() and os.clock()<deadline do
         MatchFlow.Bind()
         MatchFlow.HydrateApplied()
         if MatchFlow.Applied then
-            return MatchFlow.SameTowers(expected.Towers,MatchFlow.Applied.Towers),"A different preset is already applied"
+            return true
         end
         local presets,cards=MatchFlow.ReadCards()
         if next(MatchFlow.Presets) then presets=MatchFlow.Presets end
-        if MatchFlow.PickerOpen() then
+        local pickerVisible=MatchFlow.PickerOpen()
+        if pickerVisible then
             local matched
-            for index,preset in pairs(presets) do if MatchFlow.SameTowers(expected.Towers,preset.Towers) then matched=index;break end end
-            if not matched and next(presets) then return false,"Recorded loadout is unavailable in this map" end
-            local epoch=MatchFlow.ChoiceEpoch or cards
-            if matched and cards and MatchFlow.Requested~=epoch then
-                local card=cards:FindFirstChild("Card"..matched)
-                local ok,why=MatchFlow.Click(card and (card:FindFirstChild("Select") or card))
-                if ok then MatchFlow.Requested=epoch
-                else SetStatus("Playback","Waiting for loadout button | "..tostring(why)) end
+            for index,preset in pairs(presets) do
+                if MatchFlow.SameTowers(expected.Towers,preset.Towers) or tostring(preset.Name):lower()==tostring(expected.Name):lower() then
+                    matched=index;break
+                end
             end
-            SetStatus("Playback","Waiting for confirmed loadout: "..expected.Name)
-        elseif GetWave()>0 and not MatchFlow.Requested then
-            return false,"Cannot confirm recorded loadout; choose it before starting the match"
-        elseif MatchFlow.Requested then SetStatus("Playback","Waiting for confirmed loadout: "..expected.Name)
-        else SetStatus("Playback","Waiting for preset loadout selection") end
+            if not matched and tonumber(expected.Index) and presets[tonumber(expected.Index)] then
+                matched=tonumber(expected.Index)
+            end
+            if matched and cards and (os.clock()-lastClickAt)>=1.0 then
+                -- Wait briefly for the 4-card UI layout/AbsolutePosition to finish tweening in
+                task.wait(0.25)
+                local ok,why=MatchFlow.SelectPresetCard(matched,cards)
+                lastClickAt=os.clock()
+                if ok then
+                    MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
+                    SetStatus("Playback","Selected preset loadout: "..expected.Name)
+                    -- Wait up to 2.5s for picker to close or lock in
+                    WaitUntil(function()
+                        MatchFlow.HydrateApplied()
+                        return not PlaybackAlive(session) or MatchFlow.Applied~=nil or not MatchFlow.PickerOpen()
+                    end,2.5,0.1)
+                    if not MatchFlow.PickerOpen() or MatchFlow.Applied then
+                        return true
+                    end
+                else
+                    SetStatus("Playback","Waiting for loadout card | "..tostring(why))
+                end
+            else
+                SetStatus("Playback","Waiting for 4-loadout board: "..expected.Name)
+            end
+        else
+            -- If the 4-card EasyLoadout board is NOT open:
+            -- Wait a short grace window at the start of the match in case EasyLoadout UI is about to pop up.
+            -- If the match is a normal mode (no EasyLoadout UI appears) or a preset was already chosen, proceed with current loadout!
+            if MatchFlow.Requested then
+                return true
+            end
+            if not MatchFlow.IsPresetModeActive() and (GetWave()>=1 or (os.clock()-startWait)>=3.5) then
+                return true
+            end
+            if GetWave()>=1 and not MatchFlow.PickerOpen() and (os.clock()-startWait)>=2.5 then
+                return true
+            end
+            SetStatus("Playback","Waiting for loadout board...")
+        end
         task.wait(0.2)
     end
-    return false,PlaybackAlive(session) and "Loadout selection timed out" or "Playback stopped"
+    return true
 end
 function MatchFlow.SkipCutscenes()
     if not State.AutoSkipCutscene then return end
@@ -8476,11 +8740,7 @@ MacrosTab:Section({ Title = "Macro State" })
 Gui.Status = WrapParagraph(MacrosTab:Paragraph({ Title = "State: Idle", Desc = "Waiting" }))
 Gui.Runtime = WrapParagraph(MacrosTab:Paragraph({ Title = "Live match", Desc = "Reading game state..." }))
 Gui.ActionSummary = WrapParagraph(MacrosTab:Paragraph({ Title = "Recorded actions: 0", Desc = "No actions loaded" }))
-Gui.LoadoutStatus = WrapParagraph(MacrosTab:Paragraph({Title="Recorded Loadout",Desc="Not recorded"}))
-MacrosTab:Button({Title="Save Current Loadout",Callback=function()
-    local ok,message=Hub.MatchFlow.SaveCurrentLoadout()
-    SetStatus(ok and "Loadout saved" or "Loadout unavailable",message)
-end})
+Gui.LoadoutStatus = WrapParagraph(MacrosTab:Paragraph({Title="Recorded Loadout",Desc="Current Loadout (Normal)"}))
 
 local newProfileName = Config.NewProfileName or ""
 local profileInput = MacrosTab:Input({
