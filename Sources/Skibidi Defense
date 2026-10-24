@@ -1388,6 +1388,11 @@ local function FirePlaceRequest(unit, cframe)
 end
 
 local function PlayPlace(action, session)
+    -- A delayed picker must gate placement even if it appears after preparation.
+    if Hub.MatchFlow and Hub.MatchFlow.PickerOpen() then
+        local ready,why=Hub.MatchFlow.PreparePlayback(session)
+        if not ready then return false,why end
+    end
     local placement = ArrayToCFrame(action.CFrame)
     if not placement then
         return false, "Invalid placement CFrame"
@@ -2455,7 +2460,9 @@ function MatchFlow.HydrateApplied()
     if MatchFlow.Applied or os.clock()<(MatchFlow.HydrateAfter or 0) then return end
     local presets,cards=MatchFlow.ReadCards()
     if not next(presets) and next(MatchFlow.Presets) then presets=MatchFlow.Presets end
-    if not cards then return end
+    -- Hidden templates can retain PICKED/LOCKED labels during the cutscene.
+    -- They cannot confirm a choice for the new match.
+    if not cards or not MatchFlow.Visible(cards) then return end
     local selected
     for index,preset in pairs(presets) do
         local card=cards:FindFirstChild("Card"..index)
@@ -2463,9 +2470,8 @@ function MatchFlow.HydrateApplied()
         local label=picked and picked:FindFirstChild("Label")
         local selectBtn=card and card:FindFirstChild("Select")
         local selectTxt=selectBtn and (selectBtn:IsA("TextButton") and selectBtn.Text or (selectBtn:FindFirstChildWhichIsA("TextLabel") and selectBtn:FindFirstChildWhichIsA("TextLabel").Text)) or ""
-        if (picked and picked.Visible and (not label or tostring(label.Text):upper():find("LOCKED",1,true) or tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECT",1,true)))
-            or tostring(selectTxt):upper():find("SELECTED",1,true)
-            or tostring(selectTxt):upper():find("LOCKED",1,true) then
+        if (picked and MatchFlow.Visible(picked) and label and (tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECTED",1,true)))
+            or (selectBtn and MatchFlow.Visible(selectBtn) and tostring(selectTxt):upper():find("SELECTED",1,true)) then
             if selected then return end
             selected={Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers}
         end
@@ -2581,6 +2587,8 @@ end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
     if not expected then return true end -- Legacy/normal macro uses equipped units.
+    -- Do not reuse an acknowledgement/GUI label observed before this playback.
+    MatchFlow.Applied=nil
     local startWait=os.clock()
     local deadline=startWait+70
     local lastClickAt=-math.huge
@@ -2633,13 +2641,9 @@ function MatchFlow.PreparePlayback(session)
                 SetStatus("Playback","Waiting for matching preset: "..expected.Name)
             end
         else
-            -- Only allow a normal match through after a grace period. Wave 1
-            -- is already replicated while the preset picker is still loading.
-            if not sawPicker and not MatchFlow.IsPresetModeActive()
-                and (os.clock()-startWait)>=3.5 and GetWave()>=1 then
-                return true
-            end
-            SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
+            -- A saved preset requires positive confirmation. Cutscenes can delay
+            -- the board arbitrarily; elapsed time and Wave 1 prove nothing.
+            SetStatus("Playback",(sawPicker and "Waiting for preset confirmation: " or "Waiting for preset board: ")..expected.Name)
         end
         task.wait(0.2)
     end
@@ -5929,6 +5933,11 @@ local function FirePlaceRequest(unit, cframe)
 end
 
 local function PlayPlace(action, session)
+    -- A delayed picker must gate placement even if it appears after preparation.
+    if Hub.MatchFlow and Hub.MatchFlow.PickerOpen() then
+        local ready,why=Hub.MatchFlow.PreparePlayback(session)
+        if not ready then return false,why end
+    end
     local placement = ArrayToCFrame(action.CFrame)
     if not placement then
         return false, "Invalid placement CFrame"
@@ -6996,7 +7005,9 @@ function MatchFlow.HydrateApplied()
     if MatchFlow.Applied or os.clock()<(MatchFlow.HydrateAfter or 0) then return end
     local presets,cards=MatchFlow.ReadCards()
     if not next(presets) and next(MatchFlow.Presets) then presets=MatchFlow.Presets end
-    if not cards then return end
+    -- Hidden templates can retain PICKED/LOCKED labels during the cutscene.
+    -- They cannot confirm a choice for the new match.
+    if not cards or not MatchFlow.Visible(cards) then return end
     local selected
     for index,preset in pairs(presets) do
         local card=cards:FindFirstChild("Card"..index)
@@ -7004,9 +7015,8 @@ function MatchFlow.HydrateApplied()
         local label=picked and picked:FindFirstChild("Label")
         local selectBtn=card and card:FindFirstChild("Select")
         local selectTxt=selectBtn and (selectBtn:IsA("TextButton") and selectBtn.Text or (selectBtn:FindFirstChildWhichIsA("TextLabel") and selectBtn:FindFirstChildWhichIsA("TextLabel").Text)) or ""
-        if (picked and picked.Visible and (not label or tostring(label.Text):upper():find("LOCKED",1,true) or tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECT",1,true)))
-            or tostring(selectTxt):upper():find("SELECTED",1,true)
-            or tostring(selectTxt):upper():find("LOCKED",1,true) then
+        if (picked and MatchFlow.Visible(picked) and label and (tostring(label.Text):upper():find("PICKED",1,true) or tostring(label.Text):upper():find("SELECTED",1,true)))
+            or (selectBtn and MatchFlow.Visible(selectBtn) and tostring(selectTxt):upper():find("SELECTED",1,true)) then
             if selected then return end
             selected={Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers}
         end
@@ -7122,6 +7132,8 @@ end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
     if not expected then return true end -- Legacy/normal macro uses equipped units.
+    -- Do not reuse an acknowledgement/GUI label observed before this playback.
+    MatchFlow.Applied=nil
     local startWait=os.clock()
     local deadline=startWait+70
     local lastClickAt=-math.huge
@@ -7174,13 +7186,9 @@ function MatchFlow.PreparePlayback(session)
                 SetStatus("Playback","Waiting for matching preset: "..expected.Name)
             end
         else
-            -- Only allow a normal match through after a grace period. Wave 1
-            -- is already replicated while the preset picker is still loading.
-            if not sawPicker and not MatchFlow.IsPresetModeActive()
-                and (os.clock()-startWait)>=3.5 and GetWave()>=1 then
-                return true
-            end
-            SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
+            -- A saved preset requires positive confirmation. Cutscenes can delay
+            -- the board arbitrarily; elapsed time and Wave 1 prove nothing.
+            SetStatus("Playback",(sawPicker and "Waiting for preset confirmation: " or "Waiting for preset board: ")..expected.Name)
         end
         task.wait(0.2)
     end
