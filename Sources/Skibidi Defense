@@ -2311,7 +2311,7 @@ SendMatchEndWebhook=function()
     State.LastWebhookResult=ok and "Sent" or why
 end
 -- Passive preset confirmation and native game buttons. No namecall hooks.
-local MatchFlow={Bound={},Presets={},Cutscene=setmetatable({}, {__mode="k"})}
+local MatchFlow={Bound={},Presets={},ObserverConnections=setmetatable({}, {__mode="k"}),Cutscene=setmetatable({}, {__mode="k"})}
 Hub.MatchFlow=MatchFlow
 function MatchFlow.Path(root,path)
     for name in path:gmatch("[^/]+") do root=root and root:FindFirstChild(name) end
@@ -2326,16 +2326,16 @@ function MatchFlow.Visible(object)
     end
     return true
 end
-function MatchFlow.Click(button)
+function MatchFlow.Click(button,physicalOnly)
     if not button or not button:IsA("GuiButton") or not MatchFlow.Visible(button) or button.Active==false then return false,"Game button unavailable" end
     -- Invoke one event route only. Replaying two routes could toggle a vote off.
-    if type(getconnections)=="function" then
+    if not physicalOnly and type(getconnections)=="function" then
         for _,name in ipairs({"Activated","MouseButton1Click"}) do
             local ok,list=pcall(function() return getconnections(button[name]) end)
             if ok and type(list)=="table" then
                 local fired=false
                 for _,connection in ipairs(list) do
-                    if connection.Enabled~=false and connection.Connected~=false then
+                    if connection.Enabled~=false and connection.Connected~=false and not MatchFlow.ObserverConnections[connection] then
                         local called=pcall(function()
                             if type(connection.Fire)=="function" then connection:Fire()
                             elseif type(connection.Function)=="function" then connection.Function()
@@ -2424,24 +2424,29 @@ function MatchFlow.WatchPickerCards()
         local card=cards:FindFirstChild("Card"..index)
         local selectBtn=card and (card:FindFirstChild("Select") or card)
         if selectBtn and selectBtn:IsA("GuiObject") then
-            AddConnection(State.Connections,selectBtn.InputBegan:Connect(function(input)
+            local observer=selectBtn.InputBegan:Connect(function(input)
                 if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
                     local presets=MatchFlow.Presets
                     if not next(presets) then presets=MatchFlow.ReadCards() end
                     local preset=presets[index]
                     if preset then
-                        MatchFlow.Applied=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
-                        MatchFlow.RecordLoadout()
+                        -- Input is intent, not a server acknowledgement.
+                        if State.Recording then
+                            MatchFlow.RecordChoice=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+                            MatchFlow.RecordLoadout()
+                        end
                     end
                 end
-            end))
+            end)
+            MatchFlow.ObserverConnections[observer]=true
+            AddConnection(State.Connections,observer)
         end
     end
 end
 function MatchFlow.OnShow(data)
     if type(data)~="table" or type(data.Presets)~="table" then return end
     MatchFlow.Presets=data.Presets;MatchFlow.Chapter=data.Chapter
-    MatchFlow.Applied=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
+    MatchFlow.Applied=nil;MatchFlow.RecordChoice=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
     MatchFlow.HydrateAfter=os.clock()+0.2
     MatchFlow.WatchPickerCards()
 end
@@ -2499,7 +2504,7 @@ function MatchFlow.InferLoadoutFromActions()
 end
 function MatchFlow.RecordLoadout()
     MatchFlow.HydrateApplied()
-    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.InferLoadoutFromActions()
+    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.ValidateLoadout(MatchFlow.RecordChoice) or MatchFlow.InferLoadoutFromActions()
     if not candidate then return end
     if State.Recording then
         local changed=not State.MacroLoadout or State.MacroLoadout.Name~=candidate.Name
@@ -2555,95 +2560,92 @@ function MatchFlow.Bind()
     bind(loadout and loadout:FindFirstChild("Applied"),MatchFlow.OnApplied)
     MatchFlow.WatchPickerCards()
 end
+-- Always use the game's button handlers; never guess a remote or its arguments.
 function MatchFlow.SelectPresetCard(matchedIndex, cards)
     local card=cards and cards:FindFirstChild("Card"..matchedIndex)
-    local selectButton=card and (card:FindFirstChild("Select") or card:FindFirstChildWhichIsA("GuiButton",true) or card)
-    if selectButton then
-        local ok=MatchFlow.Click(selectButton)
-        if ok then return true end
+    local selectButton=card and card:FindFirstChild("Select")
+    if selectButton and not selectButton:IsA("GuiButton") then
+        selectButton=selectButton:FindFirstChildWhichIsA("GuiButton",true)
     end
-    -- Fallback: check if EasyLoadout has a selection RemoteEvent/RemoteFunction
-    local loadoutFolder=ReplicatedStorage:FindFirstChild("EasyLoadout")
-    if loadoutFolder then
-        for _,child in ipairs(loadoutFolder:GetChildren()) do
-            if child.Name~="Show" and child.Name~="Applied" then
-                if child:IsA("RemoteEvent") then
-                    local ok=pcall(child.FireServer,child,matchedIndex)
-                    if ok then return true end
-                elseif child:IsA("RemoteFunction") then
-                    local ok=pcall(child.InvokeServer,child,matchedIndex)
-                    if ok then return true end
-                end
-            end
-        end
-    end
-    return false,"Waiting for loadout button"
+    selectButton=selectButton or (card and card:FindFirstChildWhichIsA("GuiButton",true))
+    -- Some executors report dispatch success without running the game callback.
+    -- Alternate with native mouse input when the preceding request was unconfirmed.
+    MatchFlow.SelectAttempts=MatchFlow.SelectAttempts or setmetatable({}, {__mode="k"})
+    local attempts=selectButton and ((MatchFlow.SelectAttempts[selectButton] or 0)+1) or 1
+    if selectButton then MatchFlow.SelectAttempts[selectButton]=attempts end
+    return MatchFlow.Click(selectButton,attempts%2==0)
+end
+function MatchFlow.MatchesExpected(actual,expected)
+    return actual and MatchFlow.SameTowers(actual.Towers,expected.Towers)
 end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
-    if not expected then return true end -- Normal mode or legacy macro: use current equipped loadout.
+    if not expected then return true end -- Legacy/normal macro uses equipped units.
     local startWait=os.clock()
     local deadline=startWait+70
-    local lastClickAt=0
+    local lastClickAt=-math.huge
+    local sawPicker=false
     while PlaybackAlive(session) and not IsGameEnded() and os.clock()<deadline do
         MatchFlow.Bind()
-        MatchFlow.HydrateApplied()
-        if MatchFlow.Applied then
-            return true
-        end
         local presets,cards=MatchFlow.ReadCards()
-        if next(MatchFlow.Presets) then presets=MatchFlow.Presets end
         local pickerVisible=MatchFlow.PickerOpen()
         if pickerVisible then
-            local matched
-            for index,preset in pairs(presets) do
-                if MatchFlow.SameTowers(expected.Towers,preset.Towers) or tostring(preset.Name):lower()==tostring(expected.Name):lower() then
-                    matched=index;break
-                end
+            -- A fresh, unlocked board invalidates a previous match's cached choice.
+            if not sawPicker then MatchFlow.Applied=nil end
+            sawPicker=true
+        end
+        MatchFlow.HydrateApplied()
+        if MatchFlow.Applied then
+            if MatchFlow.MatchesExpected(MatchFlow.Applied,expected) then
+                return true
             end
-            if not matched and tonumber(expected.Index) and presets[tonumber(expected.Index)] then
-                matched=tonumber(expected.Index)
+            return false,"A different preset is selected; expected "..expected.Name
+        end
+        if pickerVisible then
+            if not next(presets) then presets=MatchFlow.Presets end
+            local matched
+            -- Compare actual unit lists first; names and saved slot numbers alone
+            -- must not select a different loadout after the board changes.
+            for index,preset in pairs(presets) do
+                if MatchFlow.MatchesExpected(preset,expected) then matched=index;break end
             end
             if matched and cards and (os.clock()-lastClickAt)>=1.0 then
-                -- Wait briefly for the 4-card UI layout/AbsolutePosition to finish tweening in
                 task.wait(0.25)
-                local ok,why=MatchFlow.SelectPresetCard(matched,cards)
-                lastClickAt=os.clock()
-                if ok then
-                    MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
-                    SetStatus("Playback","Selected preset loadout: "..expected.Name)
-                    -- Wait up to 2.5s for picker to close or lock in
-                    WaitUntil(function()
-                        MatchFlow.HydrateApplied()
-                        return not PlaybackAlive(session) or MatchFlow.Applied~=nil or not MatchFlow.PickerOpen()
-                    end,2.5,0.1)
-                    if not MatchFlow.PickerOpen() or MatchFlow.Applied then
-                        return true
+                if not PlaybackAlive(session) or IsGameEnded() then break end
+                if MatchFlow.PickerOpen() then
+                    local ok,why=MatchFlow.SelectPresetCard(matched,cards)
+                    lastClickAt=os.clock()
+                    if ok then
+                        MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
+                        SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
+                        WaitUntil(function()
+                            MatchFlow.HydrateApplied()
+                            return not PlaybackAlive(session) or IsGameEnded() or MatchFlow.Applied~=nil
+                        end,2.5,0.1)
+                        if not PlaybackAlive(session) or IsGameEnded() then break end
+                        if MatchFlow.MatchesExpected(MatchFlow.Applied,expected) then return true end
+                        if MatchFlow.Applied then return false,"Game applied a different preset" end
+                    else
+                        SetStatus("Playback","Waiting for loadout button | "..tostring(why))
                     end
-                else
-                    SetStatus("Playback","Waiting for loadout card | "..tostring(why))
                 end
             else
-                SetStatus("Playback","Waiting for 4-loadout board: "..expected.Name)
+                SetStatus("Playback","Waiting for matching preset: "..expected.Name)
             end
         else
-            -- If the 4-card EasyLoadout board is NOT open:
-            -- Wait a short grace window at the start of the match in case EasyLoadout UI is about to pop up.
-            -- If the match is a normal mode (no EasyLoadout UI appears) or a preset was already chosen, proceed with current loadout!
-            if MatchFlow.Requested then
+            -- Only allow a normal match through after a grace period. Wave 1
+            -- is already replicated while the preset picker is still loading.
+            if not sawPicker and not MatchFlow.IsPresetModeActive()
+                and (os.clock()-startWait)>=3.5 and GetWave()>=1 then
                 return true
             end
-            if not MatchFlow.IsPresetModeActive() and (GetWave()>=1 or (os.clock()-startWait)>=3.5) then
-                return true
-            end
-            if GetWave()>=1 and not MatchFlow.PickerOpen() and (os.clock()-startWait)>=2.5 then
-                return true
-            end
-            SetStatus("Playback","Waiting for loadout board...")
+            SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
         end
         task.wait(0.2)
     end
-    return true
+    if not PlaybackAlive(session) then return false,"Playback cancelled while selecting preset" end
+    if IsGameEnded() then return false,"Match ended before preset was confirmed" end
+    return false,"Preset selection timed out: "..expected.Name.."; no units were placed"
 end
 function MatchFlow.SkipCutscenes()
     if not State.AutoSkipCutscene then return end
@@ -6850,7 +6852,7 @@ SendMatchEndWebhook=function()
     State.LastWebhookResult=ok and "Sent" or why
 end
 -- Passive preset confirmation and native game buttons. No namecall hooks.
-local MatchFlow={Bound={},Presets={},Cutscene=setmetatable({}, {__mode="k"})}
+local MatchFlow={Bound={},Presets={},ObserverConnections=setmetatable({}, {__mode="k"}),Cutscene=setmetatable({}, {__mode="k"})}
 Hub.MatchFlow=MatchFlow
 function MatchFlow.Path(root,path)
     for name in path:gmatch("[^/]+") do root=root and root:FindFirstChild(name) end
@@ -6865,16 +6867,16 @@ function MatchFlow.Visible(object)
     end
     return true
 end
-function MatchFlow.Click(button)
+function MatchFlow.Click(button,physicalOnly)
     if not button or not button:IsA("GuiButton") or not MatchFlow.Visible(button) or button.Active==false then return false,"Game button unavailable" end
     -- Invoke one event route only. Replaying two routes could toggle a vote off.
-    if type(getconnections)=="function" then
+    if not physicalOnly and type(getconnections)=="function" then
         for _,name in ipairs({"Activated","MouseButton1Click"}) do
             local ok,list=pcall(function() return getconnections(button[name]) end)
             if ok and type(list)=="table" then
                 local fired=false
                 for _,connection in ipairs(list) do
-                    if connection.Enabled~=false and connection.Connected~=false then
+                    if connection.Enabled~=false and connection.Connected~=false and not MatchFlow.ObserverConnections[connection] then
                         local called=pcall(function()
                             if type(connection.Fire)=="function" then connection:Fire()
                             elseif type(connection.Function)=="function" then connection.Function()
@@ -6963,24 +6965,29 @@ function MatchFlow.WatchPickerCards()
         local card=cards:FindFirstChild("Card"..index)
         local selectBtn=card and (card:FindFirstChild("Select") or card)
         if selectBtn and selectBtn:IsA("GuiObject") then
-            AddConnection(State.Connections,selectBtn.InputBegan:Connect(function(input)
+            local observer=selectBtn.InputBegan:Connect(function(input)
                 if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
                     local presets=MatchFlow.Presets
                     if not next(presets) then presets=MatchFlow.ReadCards() end
                     local preset=presets[index]
                     if preset then
-                        MatchFlow.Applied=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
-                        MatchFlow.RecordLoadout()
+                        -- Input is intent, not a server acknowledgement.
+                        if State.Recording then
+                            MatchFlow.RecordChoice=MatchFlow.ValidateLoadout({Index=index,Name=preset.Name,Chapter=MatchFlow.Chapter,Towers=preset.Towers})
+                            MatchFlow.RecordLoadout()
+                        end
                     end
                 end
-            end))
+            end)
+            MatchFlow.ObserverConnections[observer]=true
+            AddConnection(State.Connections,observer)
         end
     end
 end
 function MatchFlow.OnShow(data)
     if type(data)~="table" or type(data.Presets)~="table" then return end
     MatchFlow.Presets=data.Presets;MatchFlow.Chapter=data.Chapter
-    MatchFlow.Applied=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
+    MatchFlow.Applied=nil;MatchFlow.RecordChoice=nil;MatchFlow.Requested=nil;MatchFlow.ChoiceEpoch={}
     MatchFlow.HydrateAfter=os.clock()+0.2
     MatchFlow.WatchPickerCards()
 end
@@ -7038,7 +7045,7 @@ function MatchFlow.InferLoadoutFromActions()
 end
 function MatchFlow.RecordLoadout()
     MatchFlow.HydrateApplied()
-    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.InferLoadoutFromActions()
+    local candidate=MatchFlow.ValidateLoadout(MatchFlow.Applied) or MatchFlow.ValidateLoadout(MatchFlow.RecordChoice) or MatchFlow.InferLoadoutFromActions()
     if not candidate then return end
     if State.Recording then
         local changed=not State.MacroLoadout or State.MacroLoadout.Name~=candidate.Name
@@ -7094,95 +7101,92 @@ function MatchFlow.Bind()
     bind(loadout and loadout:FindFirstChild("Applied"),MatchFlow.OnApplied)
     MatchFlow.WatchPickerCards()
 end
+-- Always use the game's button handlers; never guess a remote or its arguments.
 function MatchFlow.SelectPresetCard(matchedIndex, cards)
     local card=cards and cards:FindFirstChild("Card"..matchedIndex)
-    local selectButton=card and (card:FindFirstChild("Select") or card:FindFirstChildWhichIsA("GuiButton",true) or card)
-    if selectButton then
-        local ok=MatchFlow.Click(selectButton)
-        if ok then return true end
+    local selectButton=card and card:FindFirstChild("Select")
+    if selectButton and not selectButton:IsA("GuiButton") then
+        selectButton=selectButton:FindFirstChildWhichIsA("GuiButton",true)
     end
-    -- Fallback: check if EasyLoadout has a selection RemoteEvent/RemoteFunction
-    local loadoutFolder=ReplicatedStorage:FindFirstChild("EasyLoadout")
-    if loadoutFolder then
-        for _,child in ipairs(loadoutFolder:GetChildren()) do
-            if child.Name~="Show" and child.Name~="Applied" then
-                if child:IsA("RemoteEvent") then
-                    local ok=pcall(child.FireServer,child,matchedIndex)
-                    if ok then return true end
-                elseif child:IsA("RemoteFunction") then
-                    local ok=pcall(child.InvokeServer,child,matchedIndex)
-                    if ok then return true end
-                end
-            end
-        end
-    end
-    return false,"Waiting for loadout button"
+    selectButton=selectButton or (card and card:FindFirstChildWhichIsA("GuiButton",true))
+    -- Some executors report dispatch success without running the game callback.
+    -- Alternate with native mouse input when the preceding request was unconfirmed.
+    MatchFlow.SelectAttempts=MatchFlow.SelectAttempts or setmetatable({}, {__mode="k"})
+    local attempts=selectButton and ((MatchFlow.SelectAttempts[selectButton] or 0)+1) or 1
+    if selectButton then MatchFlow.SelectAttempts[selectButton]=attempts end
+    return MatchFlow.Click(selectButton,attempts%2==0)
+end
+function MatchFlow.MatchesExpected(actual,expected)
+    return actual and MatchFlow.SameTowers(actual.Towers,expected.Towers)
 end
 function MatchFlow.PreparePlayback(session)
     local expected=MatchFlow.ValidateLoadout(State.MacroLoadout)
-    if not expected then return true end -- Normal mode or legacy macro: use current equipped loadout.
+    if not expected then return true end -- Legacy/normal macro uses equipped units.
     local startWait=os.clock()
     local deadline=startWait+70
-    local lastClickAt=0
+    local lastClickAt=-math.huge
+    local sawPicker=false
     while PlaybackAlive(session) and not IsGameEnded() and os.clock()<deadline do
         MatchFlow.Bind()
-        MatchFlow.HydrateApplied()
-        if MatchFlow.Applied then
-            return true
-        end
         local presets,cards=MatchFlow.ReadCards()
-        if next(MatchFlow.Presets) then presets=MatchFlow.Presets end
         local pickerVisible=MatchFlow.PickerOpen()
         if pickerVisible then
-            local matched
-            for index,preset in pairs(presets) do
-                if MatchFlow.SameTowers(expected.Towers,preset.Towers) or tostring(preset.Name):lower()==tostring(expected.Name):lower() then
-                    matched=index;break
-                end
+            -- A fresh, unlocked board invalidates a previous match's cached choice.
+            if not sawPicker then MatchFlow.Applied=nil end
+            sawPicker=true
+        end
+        MatchFlow.HydrateApplied()
+        if MatchFlow.Applied then
+            if MatchFlow.MatchesExpected(MatchFlow.Applied,expected) then
+                return true
             end
-            if not matched and tonumber(expected.Index) and presets[tonumber(expected.Index)] then
-                matched=tonumber(expected.Index)
+            return false,"A different preset is selected; expected "..expected.Name
+        end
+        if pickerVisible then
+            if not next(presets) then presets=MatchFlow.Presets end
+            local matched
+            -- Compare actual unit lists first; names and saved slot numbers alone
+            -- must not select a different loadout after the board changes.
+            for index,preset in pairs(presets) do
+                if MatchFlow.MatchesExpected(preset,expected) then matched=index;break end
             end
             if matched and cards and (os.clock()-lastClickAt)>=1.0 then
-                -- Wait briefly for the 4-card UI layout/AbsolutePosition to finish tweening in
                 task.wait(0.25)
-                local ok,why=MatchFlow.SelectPresetCard(matched,cards)
-                lastClickAt=os.clock()
-                if ok then
-                    MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
-                    SetStatus("Playback","Selected preset loadout: "..expected.Name)
-                    -- Wait up to 2.5s for picker to close or lock in
-                    WaitUntil(function()
-                        MatchFlow.HydrateApplied()
-                        return not PlaybackAlive(session) or MatchFlow.Applied~=nil or not MatchFlow.PickerOpen()
-                    end,2.5,0.1)
-                    if not MatchFlow.PickerOpen() or MatchFlow.Applied then
-                        return true
+                if not PlaybackAlive(session) or IsGameEnded() then break end
+                if MatchFlow.PickerOpen() then
+                    local ok,why=MatchFlow.SelectPresetCard(matched,cards)
+                    lastClickAt=os.clock()
+                    if ok then
+                        MatchFlow.Requested=MatchFlow.ChoiceEpoch or cards
+                        SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
+                        WaitUntil(function()
+                            MatchFlow.HydrateApplied()
+                            return not PlaybackAlive(session) or IsGameEnded() or MatchFlow.Applied~=nil
+                        end,2.5,0.1)
+                        if not PlaybackAlive(session) or IsGameEnded() then break end
+                        if MatchFlow.MatchesExpected(MatchFlow.Applied,expected) then return true end
+                        if MatchFlow.Applied then return false,"Game applied a different preset" end
+                    else
+                        SetStatus("Playback","Waiting for loadout button | "..tostring(why))
                     end
-                else
-                    SetStatus("Playback","Waiting for loadout card | "..tostring(why))
                 end
             else
-                SetStatus("Playback","Waiting for 4-loadout board: "..expected.Name)
+                SetStatus("Playback","Waiting for matching preset: "..expected.Name)
             end
         else
-            -- If the 4-card EasyLoadout board is NOT open:
-            -- Wait a short grace window at the start of the match in case EasyLoadout UI is about to pop up.
-            -- If the match is a normal mode (no EasyLoadout UI appears) or a preset was already chosen, proceed with current loadout!
-            if MatchFlow.Requested then
+            -- Only allow a normal match through after a grace period. Wave 1
+            -- is already replicated while the preset picker is still loading.
+            if not sawPicker and not MatchFlow.IsPresetModeActive()
+                and (os.clock()-startWait)>=3.5 and GetWave()>=1 then
                 return true
             end
-            if not MatchFlow.IsPresetModeActive() and (GetWave()>=1 or (os.clock()-startWait)>=3.5) then
-                return true
-            end
-            if GetWave()>=1 and not MatchFlow.PickerOpen() and (os.clock()-startWait)>=2.5 then
-                return true
-            end
-            SetStatus("Playback","Waiting for loadout board...")
+            SetStatus("Playback","Waiting for preset confirmation: "..expected.Name)
         end
         task.wait(0.2)
     end
-    return true
+    if not PlaybackAlive(session) then return false,"Playback cancelled while selecting preset" end
+    if IsGameEnded() then return false,"Match ended before preset was confirmed" end
+    return false,"Preset selection timed out: "..expected.Name.."; no units were placed"
 end
 function MatchFlow.SkipCutscenes()
     if not State.AutoSkipCutscene then return end
