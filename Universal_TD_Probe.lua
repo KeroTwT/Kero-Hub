@@ -1,6 +1,7 @@
--- Universal TD Probe v2
+-- Universal TD Probe v2.1 (extended observation; schema v2 compatible)
 -- Passive discovery in Normal/Brutal modes and loss-minimising transport/state
 -- correlation in Perfect mode. The probe never calls a game remote itself.
+-- Direct execution defaults to Brutal_Perfect; explicit Mode still overrides it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,6 +10,7 @@ local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local LogService = game:GetService("LogService")
 local CollectionService = game:GetService("CollectionService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 
 local Environment = getgenv()
 local previous = Environment.UniversalTDProbe
@@ -20,7 +22,7 @@ local userConfig = type(Environment.UniversalTDProbeConfig) == "table"
     and Environment.UniversalTDProbeConfig
     or {}
 
-local requestedMode = string.lower(tostring(userConfig.Mode or "Normal"))
+local requestedMode = string.lower(tostring(userConfig.Mode or "Brutal_Perfect"))
 local isBrutalPerfectRequest = requestedMode == "brutal_perfect"
     or requestedMode == "brutal-perfect"
     or requestedMode == "brutalperfect"
@@ -51,6 +53,11 @@ local Config = {
     CaptureExecutorCalls = userConfig.CaptureExecutorCalls ~= false and isBrutalPerfectRequest,
     CaptureCallingScript = userConfig.CaptureCallingScript ~= false,
     CaptureKeyboard = userConfig.CaptureKeyboard ~= false and isPerfect,
+    CaptureInteractions = userConfig.CaptureInteractions ~= false and isPerfect,
+    CaptureWorldGui = userConfig.CaptureWorldGui ~= false,
+    CaptureLocalCalls = userConfig.CaptureLocalCalls == true and isPerfect,
+    CaptureExecutorHelpers = userConfig.CaptureExecutorHelpers ~= false and isPerfect,
+    CaptureModuleInventory = userConfig.CaptureModuleInventory ~= false and isPerfect,
     Introspect = userConfig.Introspect == true,
 }
 
@@ -91,6 +98,8 @@ local Probe = {
     LogicalObjects = setmetatable({}, { __mode = "k" }),
     LogicalSequence = 0,
     HookGeneration = tostring(os.clock()) .. ":" .. tostring(math.random()),
+    Diagnostics = { attempts = 0, completed = 0, failed = 0, incoming = 0,
+        captureErrors = 0, byPath = {}, revision = "2.1" },
 }
 Environment.UniversalTDProbe = Probe
 
@@ -112,6 +121,8 @@ local Keywords = {
     health = { "health", "hp", "lives", "base" },
     cost = { "cost", "price" },
     map = { "map", "chapter", "stage", "mode", "difficulty" },
+    merge = { "merge", "fusion", "fuse", "roll", "reveal" },
+    rarity = { "rarity", "common", "rare", "epic", "legendary", "mythic", "secret" },
 }
 
 local function clampText(value)
@@ -493,10 +504,12 @@ local function emit(eventType, data, force, options)
         transaction.firstSequence = math.min(transaction.firstSequence or event.sequence, event.sequence)
         transaction.lastSequence = math.max(transaction.lastSequence or event.sequence, event.sequence)
         transaction.eventTypes[eventType] = (transaction.eventTypes[eventType] or 0) + 1
-        if eventType == "remote_out" and options and options.remotePath then
+        if (eventType == "remote_out" or eventType == "remote_attempt" or eventType == "remote_error")
+            and options and options.remotePath then
             transaction.remotePaths[options.remotePath] = true
         elseif eventType == "state_changed" or eventType == "attribute_changed"
-            or eventType == "world_added" or eventType == "world_removing" then
+            or eventType == "world_added" or eventType == "world_removing"
+            or eventType == "prompt_changed" or eventType == "gui_changed" then
             transaction.evidence[eventType] = (transaction.evidence[eventType] or 0) + 1
         end
     end
@@ -602,6 +615,7 @@ local function snapshotRemote(remote, reason)
     if remote:IsA("RemoteEvent") or remote.ClassName == "UnreliableRemoteEvent" then
         connect(remote.OnClientEvent, function(...)
             if not Probe.Running then return end
+            Probe.Diagnostics.incoming = Probe.Diagnostics.incoming + 1
             local raw = safeArgumentSnapshot(table.pack(...))
             local actionId = activeActionId()
             local remotePath = safePath(remote)
@@ -761,7 +775,68 @@ local function logicalObject(instance)
     return identity
 end
 
+local WorldText = setmetatable({}, { __mode = "k" })
+local PromptWatched = setmetatable({}, { __mode = "k" })
+local ButtonWatched = setmetatable({}, { __mode = "k" })
+local ModuleWatched = setmetatable({}, { __mode = "k" })
+local function playerPosition()
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    return root and root.Position or nil
+end
+local function promptDetails(prompt)
+    local parent, point = prompt.Parent, nil
+    if parent then
+        if parent:IsA("Attachment") then point = parent.WorldPosition
+        elseif parent:IsA("BasePart") then point = parent.Position
+        elseif parent:IsA("Model") then point = parent:GetPivot().Position end
+    end
+    local position = playerPosition()
+    local distance = point and position and (point - position).Magnitude or nil
+    return { object = prompt, objectId = logicalObject(prompt).id,
+        enabled = prompt.Enabled, actionText = prompt.ActionText, objectText = prompt.ObjectText,
+        holdDuration = prompt.HoldDuration, maxDistance = prompt.MaxActivationDistance,
+        requiresLineOfSight = prompt.RequiresLineOfSight,
+        keyboardKeyCode = tostring(prompt.KeyboardKeyCode), position = point,
+        playerPosition = position, distance = distance,
+        withinDistance = distance ~= nil and distance <= prompt.MaxActivationDistance }
+end
+local function watchInteraction(instance)
+    if Config.CaptureWorldGui and (instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox"))
+        and instance:IsDescendantOf(Workspace) then WorldText[instance] = true end
+    if Config.CaptureInteractions and instance:IsA("ProximityPrompt") and not PromptWatched[instance] then
+        PromptWatched[instance] = true
+        emit("prompt_snapshot", promptDetails(instance))
+        for _, property in ipairs({ "Enabled", "ActionText", "ObjectText", "HoldDuration",
+            "MaxActivationDistance", "RequiresLineOfSight", "KeyboardKeyCode" }) do
+            connect(instance:GetPropertyChangedSignal(property), function()
+                if not Probe.Running then return end
+                local details = promptDetails(instance)
+                details.property = property
+                emit("prompt_changed", details)
+            end)
+        end
+    end
+end
+local function watchButton(instance)
+    if not Config.CaptureInteractions or not instance:IsA("GuiButton") or ButtonWatched[instance] then return end
+    ButtonWatched[instance] = true
+    connect(instance.Activated, function(input, clickCount)
+        if not Probe.Running then return end
+        emit("gui_activated", { object = instance, objectId = logicalObject(instance).id,
+            text = readGuiText(instance), visible = isActuallyVisible(instance),
+            inputType = input and tostring(input.UserInputType), clickCount = clickCount })
+    end)
+end
+local function inventoryModule(instance)
+    if not Config.CaptureModuleInventory or not instance:IsA("ModuleScript") or ModuleWatched[instance] then return end
+    ModuleWatched[instance] = true
+    emit("module_inventory", { object = instance, objectId = logicalObject(instance).id,
+        attributes = getAttributes(instance), note = "Inventory only; module was not required or executed." })
+end
 local function snapshotWorld(instance, reason)
+    watchInteraction(instance)
+    inventoryModule(instance)
     if Config.Brutal and reason == "added" and not (instance:IsA("Model") or instance:IsA("Folder")) then
         watchAttributes(instance)
         emit("world_instance_added", {
@@ -791,7 +866,8 @@ end
 
 local GuiLast = setmetatable({}, { __mode = "k" })
 local function scanGui()
-    for _, object in ipairs(PlayerGui:GetDescendants()) do
+    local function scanObject(object)
+        watchButton(object)
         if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
             local text = readGuiText(object)
             local blob = lowerBlob(object, text)
@@ -808,6 +884,8 @@ local function scanGui()
                     GuiLast[object] = currentState
                     emit(previousState and "gui_changed" or "gui_snapshot", {
                         object = object,
+                        objectId = logicalObject(object).id,
+                        scope = object:IsDescendantOf(Workspace) and "workspace" or "playergui",
                         previous = previousState,
                         text = text,
                         visible = visible,
@@ -818,6 +896,10 @@ local function scanGui()
                 end
             end
         end
+    end
+    for _, object in ipairs(PlayerGui:GetDescendants()) do scanObject(object) end
+    for object in pairs(WorldText) do
+        if object.Parent then scanObject(object) else WorldText[object] = nil end
     end
 end
 
@@ -882,192 +964,191 @@ local function callingContext()
     return context
 end
 
-local function captureOutgoing(remote, method, rawArguments, rawReturned, context, actionId, remotePath, sequence, observedElapsed, capturePath)
-    if not Probe.Running or not Config.CaptureOutgoing or not remoteAllowed(remote) then return end
-    rawArguments = safeArgumentSnapshot(rawArguments)
-    rawReturned = rawReturned and safeArgumentSnapshot(rawReturned) or nil
+-- Installed hooks dispatch through the current run; no stale Config/callbacks.
+-- Legacy v2 hooks may remain resident, but their capture switch stays disabled.
+Environment.__UniversalTDProbeV2Enabled = false
+local HookBypass = Environment.__UniversalTDProbeV21Bypass or setmetatable({}, { __mode = "k" })
+Environment.__UniversalTDProbeV21Bypass = HookBypass
+local MainThreadKey = Environment.__UniversalTDProbeV21MainThread or {}
+Environment.__UniversalTDProbeV21MainThread = MainThreadKey
+local function observedKind(object, method)
+    if typeof(object) ~= "Instance" then return nil end
+    if (method == "FireServer" or method == "InvokeServer") and isRemote(object) and remoteAllowed(object) then
+        return "remote"
+    end
+    if Config.CaptureInteractions and object:IsA("ProximityPrompt")
+        and (method == "InputHoldBegin" or method == "InputHoldEnd" or method == "fireproximityprompt") then
+        return "interaction"
+    end
+    if Config.CaptureInteractions and object:IsA("ClickDetector") and method == "fireclickdetector" then
+        return "interaction"
+    end
+    if Config.CaptureLocalCalls and ((object:IsA("BindableEvent") and method == "Fire")
+        or (object:IsA("BindableFunction") and method == "Invoke")) then
+        return "local"
+    end
+end
+local function prepareCall(object, method, capturePath, executor, ...)
+    if not Probe.Running or (executor and not Config.CaptureExecutorCalls) then return end
+    local kind = observedKind(object, method)
+    if not kind or (kind == "remote" and not Config.CaptureOutgoing) then return end
+    local ticket = { object = object, method = method, kind = kind,
+        capturePath = capturePath, executor = executor == true,
+        arguments = safeArgumentSnapshot(table.pack(...)), caller = callingContext(),
+        actionId = activeActionId(), path = safePath(object), clock = os.clock(),
+        sequence = reserveSequence() }
+    if kind == "interaction" and object:IsA("ProximityPrompt") then ticket.interaction = promptDetails(object) end
+    Probe.Diagnostics.attempts = Probe.Diagnostics.attempts + 1
+    Probe.Diagnostics.byPath[capturePath] = (Probe.Diagnostics.byPath[capturePath] or 0) + 1
+    Probe.Diagnostics.lastAttemptAt = ticket.clock - StartedAt
     task.defer(function()
         if not Probe.Running then return end
-        addCandidate(Probe.RemoteCandidates, remote, method, 8)
-        Probe.LastRemote = {
-            method = method,
-            path = remotePath,
-            clock = os.clock(),
-            actionId = actionId,
-        }
-        emit("remote_out", {
-            method = method,
-            capturePath = capturePath or "unknown",
-            remote = serializePrecise(remote),
-            arguments = serializePrecise(rawArguments),
-            returned = rawReturned and serializePrecise(rawReturned) or nil,
-            caller = serializePrecise(context),
-        }, false, {
-            precise = true,
-            actionId = actionId,
-            remotePath = remotePath,
-            sequence = sequence,
-            observedElapsed = observedElapsed,
-        })
+        local ok, err = pcall(function()
+            emit(kind .. "_attempt", { object = serializePrecise(object), method = method,
+                capturePath = capturePath, executor = ticket.executor,
+                interaction = ticket.interaction and serializePrecise(ticket.interaction),
+                arguments = serializePrecise(ticket.arguments), caller = serializePrecise(ticket.caller) }, false,
+                { precise = true, actionId = ticket.actionId, sequence = ticket.sequence,
+                    observedElapsed = ticket.clock - StartedAt, remotePath = ticket.path })
+        end)
+        if not ok then
+            Probe.Diagnostics.captureErrors = Probe.Diagnostics.captureErrors + 1
+            Probe.Diagnostics.lastCaptureError = clampText(err)
+        end
+    end)
+    return ticket
+end
+local function completeCall(ticket, result)
+    local succeeded = result[1]
+    local returned = succeeded and safeArgumentSnapshot(table.pack(table.unpack(result, 2, result.n))) or nil
+    local finished, sequence = os.clock(), reserveSequence()
+    if succeeded then Probe.Diagnostics.completed = Probe.Diagnostics.completed + 1
+    else Probe.Diagnostics.failed = Probe.Diagnostics.failed + 1 end
+    task.defer(function()
+        if not Probe.Running then return end
+        local ok, err = pcall(function()
+            if ticket.kind == "remote" then
+                addCandidate(Probe.RemoteCandidates, ticket.object, ticket.method, 8)
+                Probe.LastRemote = { method = ticket.method, path = ticket.path,
+                    clock = finished, actionId = ticket.actionId }
+            end
+            local eventType = succeeded and (ticket.kind == "remote" and "remote_out" or ticket.kind .. "_call")
+                or ticket.kind .. "_error"
+            emit(eventType, { method = ticket.method, capturePath = ticket.capturePath,
+                remote = serializePrecise(ticket.object), object = serializePrecise(ticket.object),
+                arguments = serializePrecise(ticket.arguments), returned = returned and serializePrecise(returned),
+                caller = serializePrecise(ticket.caller), executor = ticket.executor,
+                interaction = ticket.interaction and serializePrecise(ticket.interaction),
+                attemptSequence = ticket.sequence, duration = finished - ticket.clock,
+                success = succeeded, error = not succeeded and clampText(result[2]) or nil }, false,
+                { precise = true, actionId = ticket.actionId, remotePath = ticket.path,
+                    sequence = sequence, observedElapsed = finished - StartedAt })
+        end)
+        if not ok then
+            Probe.Diagnostics.captureErrors = Probe.Diagnostics.captureErrors + 1
+            Probe.Diagnostics.lastCaptureError = clampText(err)
+        end
     end)
 end
-
-local DirectHookBypass = setmetatable({}, { __mode = "k" })
-local MainThreadKey = {}
-
-local function currentThreadKey()
-    return coroutine.running() or MainThreadKey
+Environment.__UniversalTDProbeV21Observe = function(original, object, method, capturePath, executor, ...)
+    local thread = coroutine.running() or MainThreadKey
+    local bypass = HookBypass[thread]
+    if not Probe.Running or (bypass and bypass.object == object and bypass.method == method) then
+        return original(object, ...)
+    end
+    local prepared, ticket = pcall(prepareCall, object, method, capturePath, executor, ...)
+    if not prepared then
+        Probe.Diagnostics.captureErrors = Probe.Diagnostics.captureErrors + 1
+        Probe.Diagnostics.lastCaptureError = clampText(ticket)
+    end
+    if not prepared or not ticket then return original(object, ...) end
+    HookBypass[thread] = { object = object, method = method }
+    local result = table.pack(pcall(original, object, ...))
+    HookBypass[thread] = bypass
+    local ok, err = pcall(completeCall, ticket, result)
+    if not ok then
+        Probe.Diagnostics.captureErrors = Probe.Diagnostics.captureErrors + 1
+        Probe.Diagnostics.lastCaptureError = clampText(err)
+    end
+    if not result[1] then error(result[2], 0) end
+    return table.unpack(result, 2, result.n)
 end
-
-local function directHookIsBypassed()
-    return (DirectHookBypass[currentThreadKey()] or 0) > 0
-end
-
-local function pushDirectHookBypass()
-    local key = currentThreadKey()
-    DirectHookBypass[key] = (DirectHookBypass[key] or 0) + 1
-    return key
-end
-
-local function popDirectHookBypass(key)
-    local depth = (DirectHookBypass[key] or 1) - 1
-    DirectHookBypass[key] = depth > 0 and depth or nil
-end
-
 local function installNamecallHook()
-    Environment.__UniversalTDProbeV2Capture = captureOutgoing
-    Environment.__UniversalTDProbeV2Enabled = true
-    if Environment.__UniversalTDProbeV2HookInstalled then
-        return true, "reused"
-    end
-    if type(hookmetamethod) ~= "function"
-        or type(getnamecallmethod) ~= "function"
-        or type(newcclosure) ~= "function" then
-        return false, "executor_missing_hookmetamethod"
-    end
-
-    local oldNamecall
-    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(remote, ...)
-        local method = getnamecallmethod()
-        local callerIsExecutor = type(checkcaller) == "function" and checkcaller()
-        local capture = Environment.__UniversalTDProbeV2Capture
-        local eligible = Environment.__UniversalTDProbeV2Enabled == true
-            and type(capture) == "function"
-            and (Config.CaptureExecutorCalls or not callerIsExecutor)
-            and typeof(remote) == "Instance"
-            and (method == "FireServer" or method == "InvokeServer")
-        if not eligible then
-            return oldNamecall(remote, ...)
-        end
-
-        -- Copy bounded binary arguments before the game can reuse its buffers.
-        -- Hex encoding, JSON and file writes still run after the original call.
-        local rawArguments = safeArgumentSnapshot(table.pack(...))
-        local actionId = activeActionId()
-        local sequence = reserveSequence()
-        local observedElapsed = os.clock() - StartedAt
-        local bypassKey = pushDirectHookBypass()
-        local callResult = table.pack(pcall(oldNamecall, remote, ...))
-        popDirectHookBypass(bypassKey)
-        if not callResult[1] then
-            error(callResult[2], 0)
-        end
-        local returned = table.pack(table.unpack(callResult, 2, callResult.n))
-        local context = callingContext()
-        local remotePath = safePath(remote)
-        pcall(capture, remote, method, rawArguments, returned, context, actionId, remotePath, sequence, observedElapsed, "__namecall")
-        return table.unpack(returned, 1, returned.n)
-    end))
-    Environment.__UniversalTDProbeV2HookInstalled = true
+    if Environment.__UniversalTDProbeV21NamecallInstalled then return true, "reused" end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function"
+        or type(newcclosure) ~= "function" then return false, "executor_missing_namecall_API" end
+    local original
+    local ok, err = pcall(function()
+        original = hookmetamethod(game, "__namecall", newcclosure(function(object, ...)
+            local method = getnamecallmethod()
+            local observer = Environment.__UniversalTDProbeV21Observe
+            if type(observer) == "function" and (method == "FireServer" or method == "InvokeServer"
+                or method == "InputHoldBegin" or method == "InputHoldEnd" or method == "Fire" or method == "Invoke") then
+                local executor = type(checkcaller) == "function" and checkcaller()
+                return observer(original, object, method, "__namecall", executor, ...)
+            end
+            return original(object, ...)
+        end))
+    end)
+    if not ok or type(original) ~= "function" then return false, "hook_failed:" .. clampText(err) end
+    Environment.__UniversalTDProbeV21NamecallInstalled = true
     return true, "installed"
 end
-
-local function installDirectMethodHook(className, methodName, installedKey)
-    if Environment[installedKey] then
-        return true, "reused"
-    end
+local function installFunctionHook(target, method, key)
+    local registry = Environment.__UniversalTDProbeV21DirectInstalled or {}
+    Environment.__UniversalTDProbeV21DirectInstalled = registry
+    if registry[key] then return true, "reused" end
+    if type(target) ~= "function" then return false, "function_unavailable" end
     if type(hookfunction) ~= "function" or type(newcclosure) ~= "function" then
         return false, "executor_missing_hookfunction"
     end
-
-    local sample = Instance.new(className)
-    local readOk, targetMethod = pcall(function()
-        return sample[methodName]
-    end)
-    sample:Destroy()
-    if not readOk or type(targetMethod) ~= "function" then
-        return false, "method_unavailable"
-    end
-
-    local originalMethod
-    local hookOk, hookError = pcall(function()
-        originalMethod = hookfunction(targetMethod, newcclosure(function(remote, ...)
-            local callerIsExecutor = type(checkcaller) == "function" and checkcaller()
-            local capture = Environment.__UniversalTDProbeV2Capture
-            local eligible = Environment.__UniversalTDProbeV2Enabled == true
-                and type(capture) == "function"
-                and (Config.CaptureExecutorCalls or not callerIsExecutor)
-                and not directHookIsBypassed()
-                and typeof(remote) == "Instance"
-
-            if not eligible then
-                return originalMethod(remote, ...)
+    local original
+    local ok, err = pcall(function()
+        original = hookfunction(target, newcclosure(function(object, ...)
+            local observer = Environment.__UniversalTDProbeV21Observe
+            if type(observer) == "function" then
+                local executor = type(checkcaller) == "function" and checkcaller()
+                return observer(original, object, method, key, executor, ...)
             end
-
-            -- Snapshot bounded binary arguments, run the original transport, then
-            -- defer hex/JSON encoding and file I/O through captureOutgoing.
-            local rawArguments = safeArgumentSnapshot(table.pack(...))
-            local actionId = activeActionId()
-            local sequence = reserveSequence()
-            local observedElapsed = os.clock() - StartedAt
-            local returned = table.pack(originalMethod(remote, ...))
-            local context = callingContext()
-            local remotePath = safePath(remote)
-            pcall(capture, remote, methodName, rawArguments, returned, context, actionId, remotePath, sequence, observedElapsed, "direct_" .. methodName)
-            return table.unpack(returned, 1, returned.n)
+            return original(object, ...)
         end))
     end)
-
-    if not hookOk or type(originalMethod) ~= "function" then
-        return false, "hookfunction_failed:" .. clampText(hookError)
-    end
-    Environment[installedKey] = true
+    if not ok or type(original) ~= "function" then return false, "hook_failed:" .. clampText(err) end
+    registry[key] = true
     return true, "installed"
 end
-
-local function installOutgoingHooks()
-    Environment.__UniversalTDProbeV2Capture = captureOutgoing
-    Environment.__UniversalTDProbeV2Enabled = true
-
-    local namecallOk, namecallState = installNamecallHook()
-    local invokeOk, invokeState = installDirectMethodHook(
-        "RemoteFunction",
-        "InvokeServer",
-        "__UniversalTDProbeV2DirectInvokeInstalled"
-    )
-    local fireOk, fireState = installDirectMethodHook(
-        "RemoteEvent",
-        "FireServer",
-        "__UniversalTDProbeV2DirectFireInstalled"
-    )
-    local unreliableOk, unreliableState = installDirectMethodHook(
-        "UnreliableRemoteEvent",
-        "FireServer",
-        "__UniversalTDProbeV2DirectUnreliableFireInstalled"
-    )
-
-    local available = namecallOk or invokeOk or fireOk or unreliableOk
-    local coreAvailable = namecallOk and invokeOk and fireOk
-    local state = coreAvailable and "installed_all"
-        or available and "installed_partial"
-        or "unavailable"
-    return available, state, {
-        namecall = { available = namecallOk, state = namecallState },
-        invokeServer = { available = invokeOk, state = invokeState },
-        fireServer = { available = fireOk, state = fireState },
-        unreliableFireServer = { available = unreliableOk, state = unreliableState },
-    }
+local function installDirectMethodHook(className, method)
+    local created, sample = pcall(Instance.new, className)
+    if not created then return false, "class_unavailable" end
+    local ok, target = pcall(function() return sample[method] end)
+    sample:Destroy()
+    if not ok then return false, "method_unavailable" end
+    return installFunctionHook(target, method, className .. "." .. method)
 end
+local function installOutgoingHooks()
+    local paths = {}
+    local function note(key, ok, state) paths[key] = { available = ok, state = state } end
+    note("namecall", installNamecallHook())
+    note("fireServer", installDirectMethodHook("RemoteEvent", "FireServer"))
+    note("invokeServer", installDirectMethodHook("RemoteFunction", "InvokeServer"))
+    note("unreliableFireServer", installDirectMethodHook("UnreliableRemoteEvent", "FireServer"))
+    if Config.CaptureInteractions then
+        note("promptHoldBegin", installDirectMethodHook("ProximityPrompt", "InputHoldBegin"))
+        note("promptHoldEnd", installDirectMethodHook("ProximityPrompt", "InputHoldEnd"))
+    end
+    if Config.CaptureLocalCalls then
+        note("bindableFire", installDirectMethodHook("BindableEvent", "Fire"))
+        note("bindableInvoke", installDirectMethodHook("BindableFunction", "Invoke"))
+    end
+    if Config.CaptureExecutorHelpers then
+        note("fireproximityprompt", installFunctionHook(fireproximityprompt, "fireproximityprompt", "helper.fireproximityprompt"))
+        note("fireclickdetector", installFunctionHook(fireclickdetector, "fireclickdetector", "helper.fireclickdetector"))
+    end
+    local any, core = false, paths.namecall.available and paths.fireServer.available and paths.invokeServer.available
+    for _, path in pairs(paths) do any = any or path.available end
+    return any, core and "installed_all" or any and "installed_partial" or "unavailable", paths
+end
+
 
 local function inspectClientClosures()
     if not Config.Introspect then
@@ -1152,6 +1233,8 @@ local function transactionList()
         for path in pairs(transaction.remotePaths) do table.insert(remotes, path) end
         table.sort(remotes)
         local remoteOut = transaction.eventTypes.remote_out or 0
+        local remoteAttempts = transaction.eventTypes.remote_attempt or 0
+        local remoteErrors = transaction.eventTypes.remote_error or 0
         local evidenceCount = 0
         for _, count in pairs(transaction.evidence) do evidenceCount = evidenceCount + count end
         table.insert(list, {
@@ -1164,7 +1247,9 @@ local function transactionList()
             eventTypes = serialize(transaction.eventTypes),
             remotes = remotes,
             evidence = serialize(transaction.evidence),
-            classification = remoteOut == 0 and "no_remote_observed"
+            classification = remoteAttempts > remoteOut + remoteErrors and "remote_pending_or_unfinished"
+                or remoteErrors > 0 and remoteOut == 0 and "remote_failed_locally"
+                or remoteOut == 0 and "no_remote_observed"
                 or evidenceCount == 0 and "remote_without_state_evidence"
                 or "remote_with_correlated_evidence",
         })
@@ -1183,6 +1268,9 @@ local function buildSummary(reason)
         droppedEvents = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
         writeErrors = Probe.WriteErrors,
+        coreRevision = "2.1",
+        hook = Probe.Hook,
+        diagnostics = Probe.Diagnostics,
         eventTypes = serialize(Probe.EventTypes),
         files = { jsonl = JsonlFile, summary = SummaryFile },
         candidates = {
@@ -1195,7 +1283,10 @@ local function buildSummary(reason)
         limitations = {
             "Correlation is evidence, not a guaranteed server acknowledgement.",
             "Server-only state and non-replicated objects are invisible to any client probe.",
-            "Stopped outgoing hooks remain installed but inert and are reused on the next V2 run.",
+            "Stopped outgoing hooks remain installed but inert and are reused on the next v2.1 run.",
+            "Installed hooks are not proof of coverage; compare attempt/completion counters after manual actions.",
+            "Actor/parallel/native executor paths may bypass these hooks; this probe does not inject into other VMs.",
+            "A successful local call or withinDistance=true does not prove server acceptance or line of sight.",
         },
     }
 end
@@ -1205,6 +1296,7 @@ function Probe.Mark(label, details)
     local payload = {
         manual = true,
         label = tostring(label or "MARK"),
+        playerPosition = playerPosition(),
         details = serialize(details),
     }
     local action = beginAction("manual_mark", payload)
@@ -1230,6 +1322,8 @@ function Probe.Status()
         running = Probe.Running,
         mode = Config.Mode,
         hook = serialize(Probe.Hook),
+        diagnostics = serialize(Probe.Diagnostics),
+        coreRevision = "2.1",
         events = Probe.EventCount,
         dropped = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
@@ -1284,18 +1378,27 @@ Probe.Hook = {
     paths = hookDetails,
 }
 
+local executorInfo = { name = "unavailable" }
+local identify = identifyexecutor or getexecutorname
+if type(identify) == "function" then
+    local ok, name, version = pcall(identify)
+    if ok then executorInfo.name, executorInfo.version = tostring(name), version and tostring(version) end
+end
 emit("session_started", {
+    coreRevision = "2.1",
+    executor = executorInfo,
     placeId = game.PlaceId,
     jobId = game.JobId,
     config = Config,
     hook = Probe.Hook,
     note = Config.CaptureOutgoing
-        and "Original remote call runs before deferred serialization/logging."
+        and "Arguments are frozen before forwarding; attempt/result serialization is deferred. Success is not server acknowledgement."
         or "Passive mode; outgoing remote calls are not hooked.",
 })
 
 local remoteRoot = Config.Perfect and game or ReplicatedStorage
 for _, descendant in ipairs(remoteRoot:GetDescendants()) do
+    inventoryModule(descendant)
     if isRemote(descendant) then
         snapshotRemote(descendant, "inventory")
     elseif descendant:IsDescendantOf(ReplicatedStorage) and isStateValue(descendant) then
@@ -1319,6 +1422,7 @@ end
 connect(remoteRoot.DescendantAdded, function(instance)
     task.defer(function()
         if not Probe.Running or not instance.Parent then return end
+        inventoryModule(instance)
         if isRemote(instance) then
             snapshotRemote(instance, "added")
         elseif isStateValue(instance) then
@@ -1361,6 +1465,30 @@ end)
 -- InputBegan precedes most Activated/MouseButton callbacks, so the action id is
 -- already available when the game's LocalScript sends its remote.
 connect(UserInputService.InputBegan, recordInput)
+if Config.CaptureInteractions then
+    for _, eventName in ipairs({ "PromptShown", "PromptHidden", "PromptButtonHoldBegan",
+        "PromptButtonHoldEnded", "PromptTriggered", "PromptTriggerEnded" }) do
+        local ok, signal = pcall(function() return ProximityPromptService[eventName] end)
+        if ok and signal then
+            connect(signal, function(prompt, actorOrInput)
+                if not Probe.Running or typeof(prompt) ~= "Instance" then return end
+                watchInteraction(prompt)
+                local details = promptDetails(prompt)
+                details.event = eventName
+                details.actorOrInput = actorOrInput
+                if eventName == "PromptButtonHoldBegan" then
+                    Probe.LastInputAt = os.clock()
+                    local action = beginAction("prompt_input", details)
+                    details.actionId = action.id
+                    Probe.LastInput = details
+                end
+                emit("prompt_event", details)
+            end)
+        else
+            emit("capability_unavailable", { capability = eventName, reason = "Prompt service signal unavailable" })
+        end
+    end
+end
 connect(LogService.MessageOut, function(message, messageType)
     local lowered = string.lower(tostring(message))
     if lowered:find("error", 1, true)
@@ -1377,6 +1505,28 @@ task.spawn(function()
     while Probe.Running do
         scanGui()
         task.wait(Config.ScanInterval)
+    end
+end)
+
+task.spawn(function()
+    local warned = false
+    while Probe.Running do
+        task.wait(10)
+        if not Probe.Running then break end
+        emit("capture_health", { diagnostics = Probe.Diagnostics,
+            remoteAttempts = Probe.EventTypes.remote_attempt or 0,
+            remoteCompleted = Probe.EventTypes.remote_out or 0,
+            remoteErrors = Probe.EventTypes.remote_error or 0,
+            hookInstalled = Probe.Hook.available,
+            note = "Counters measure observed calls, not guaranteed transport coverage." })
+        if not warned and Config.CaptureOutgoing and Probe.ActionSequence > 0
+            and (Probe.EventTypes.remote_attempt or 0) == 0 then
+            warned = true
+            emit("capture_warning", { reason = "actions_without_outgoing_observation",
+                incoming = Probe.Diagnostics.incoming,
+                hints = { "Action may not send a remote", "Check executor hook support",
+                    "Try a clean rejoin with this core", "Parallel/native paths can bypass client hooks" } })
+        end
     end
 end)
 
@@ -1400,7 +1550,7 @@ task.delay(Config.Duration, function()
 end)
 
 flush()
-print("[Universal TD Probe] Running in", Config.Mode, "mode.")
+print("[Universal TD Probe 2.1] Running in", Config.Mode, "mode.")
 if Config.CaptureOutgoing then
     local paths = Probe.Hook.paths or {}
     print(
