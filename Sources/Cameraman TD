@@ -990,7 +990,7 @@ function H.SellFarmStep()
     local now = os.clock()
     local state = H.FarmSell
     if not state then
-        state = { Queue = {}, Index = 1, Pending = {}, Attempted = {}, NextAt = now, Sold = 0 }
+        state = { Queue = {}, Index = 1, Pending = {}, Attempted = {}, Retries = {}, NextAt = now, Sold = 0 }
         H.FarmSell = state
     end
     local function appendNewFarms()
@@ -1017,17 +1017,27 @@ function H.SellFarmStep()
             state.Sold = state.Sold + 1
         elseif now >= deadline then
             state.Pending[id] = nil
-            state.Unconfirmed = (state.Unconfirmed or 0) + 1
+            state.Retries = state.Retries or {}
+            local retries = (state.Retries[id] or 0) + 1
+            state.Retries[id] = retries
+            if retries <= 3 and H.IsFarm(H.Towers[id]) then
+                state.Done = nil
+                table.insert(state.Queue, id)
+            else
+                state.Unconfirmed = (state.Unconfirmed or 0) + 1
+            end
         else waiting = true end
     end
-    if now < state.NextAt then return end
+    if now < state.NextAt or (H.NextMacroUpgradeAt and now < H.NextMacroUpgradeAt) then return end
     local id = state.Queue[state.Index]
     if id then
         state.Index = state.Index + 1
         local tower = H.Towers[id]
         if H.IsFarm(tower) then
-            state.NextAt = now + S.SellFarmDelay
-            state.Pending[id] = now + 5
+            local gap = math.max(tonumber(S.SellFarmDelay) or 0.1, 0.35)
+            state.NextAt = now + gap
+            H.NextMacroUpgradeAt = now + 0.35
+            state.Pending[id] = now + 2.5
             H.FarmSellThreads = H.FarmSellThreads or setmetatable({}, { __mode = "k" })
             local thread = coroutine.running()
             local previous = H.FarmSellThreads[thread]
