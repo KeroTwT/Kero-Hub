@@ -1219,8 +1219,14 @@ function H.Hydrate(batched)
             then
                 local id = rawget(object, "Id")
                 if H.Path(WS, "Game/Towers/" .. id) then
-                    H.Towers[id] = object
-                    H.Learn(object)
+                    -- Never bind H.Towers[id] directly to the game's mutable GC table;
+                    -- its client handler mutates Level/TargetMode before our listener runs.
+                    local copy = H.Towers[id] or {}
+                    for k, v in pairs(object) do
+                        copy[k] = v
+                    end
+                    H.Towers[id] = copy
+                    H.Learn(copy)
                 end
             end
         end
@@ -2262,10 +2268,13 @@ function H.StartPlayback()
                             if t.TargetMode == a.Target then
                                 break
                             end
+                            ready, why = H.WaitUpgradeCadence(serial, actionLabel)
+                            assert(ready, why)
                             phase = "waiting for TowerTarget confirmation"
                             local before = t.TargetMode
                             local sent, problem = H.Fire("TowerTarget", { Id = id })
                             assert(sent, problem)
+                            H.NextMacroUpgradeAt = os.clock() + .35
                             ready, why = H.WaitUntil(function()
                                 t = H.Towers[id]
                                 return t and t.TargetMode ~= before
