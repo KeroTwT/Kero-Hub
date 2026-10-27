@@ -3479,6 +3479,142 @@ do
     end})
 end
 -- END KERO INFO
+-- BEGIN KERO BLACK SCREEN
+do
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.__KeroBlackScreen
+    if previous and type(previous.Destroy) == "function" and previous.Destroy() == false then return end
+    local control = { Alive = true, Enabled = false, Connections = {} }
+    env.__KeroBlackScreen = control
+    Hub.BlackScreenController = control
+    local toggle, syncing
+    local runService
+    local function notify(message)
+        pcall(function() WindUI:Notify({Title="Black Screen",Content=message,Duration=5}) end)
+    end
+    local function syncToggle(value)
+        if not toggle or syncing then return end
+        syncing = true
+        pcall(function() toggle:Set(value) end)
+        syncing = false
+    end
+    local function clearOverlay()
+        for _, connection in ipairs(control.Connections) do pcall(connection.Disconnect, connection) end
+        control.Connections = {}
+        local gui = control.Gui
+        control.Gui = nil
+        if gui then pcall(gui.Destroy, gui) end
+    end
+    function control.Set(enabled)
+        enabled = enabled == true
+        if enabled and not control.Alive then return false end
+        if not enabled then
+            if control.RenderDisabled then
+                local ok = pcall(runService.Set3dRenderingEnabled, runService, true)
+                if not ok then
+                    notify("Could not restore 3D rendering. Press Disable Black Screen to retry.")
+                    return false
+                end
+                control.RenderDisabled = nil
+            end
+            control.Enabled = false
+            clearOverlay()
+            syncToggle(false)
+            return true
+        end
+        if control.Enabled and control.Gui and control.Gui.Parent then return true end
+        local screen
+        local ok, problem = pcall(function()
+            screen = Instance.new("ScreenGui")
+            screen.Name = "KeroBlackScreen_skibidi"
+            screen.Enabled = false
+            screen.IgnoreGuiInset = true
+            screen.ResetOnSpawn = false
+            screen.DisplayOrder = 2147483647
+            screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+            local background = Instance.new("Frame")
+            background.Name = "Background"
+            background.Size = UDim2.fromScale(1, 1)
+            background.BackgroundColor3 = Color3.new(0, 0, 0)
+            background.BorderSizePixel = 0
+            background.Active = true
+            background.ZIndex = 1
+            background.Parent = screen
+            local button = Instance.new("TextButton")
+            button.Name = "DisableBlackScreen"
+            button.AnchorPoint = Vector2.new(.5, .5)
+            button.Position = UDim2.fromScale(.5, .5)
+            button.Size = UDim2.fromOffset(230, 52)
+            button.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+            button.BorderSizePixel = 0
+            button.Text = "Disable Black Screen"
+            button.TextColor3 = Color3.fromRGB(245, 245, 245)
+            button.TextSize = 17
+            button.Font = Enum.Font.GothamSemibold
+            button.ZIndex = 2
+            button.Parent = background
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 10)
+            corner.Parent = button
+            local parents = {}
+            if type(gethui) == "function" then
+                local hiddenOK, hidden = pcall(gethui)
+                if hiddenOK and hidden then parents[#parents+1] = hidden end
+            end
+            local coreOK, core = pcall(game.GetService, game, "CoreGui")
+            if coreOK and core then parents[#parents+1] = core end
+            local player = game:GetService("Players").LocalPlayer
+            local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+            if playerGui then parents[#parents+1] = playerGui end
+            local parented = false
+            for _, parent in ipairs(parents) do
+                if pcall(function() screen.Parent = parent end) and screen.Parent == parent then
+                    parented = true
+                    break
+                end
+            end
+            assert(parented, "Overlay unavailable on this executor")
+            control.Gui = screen
+            control.Connections[#control.Connections+1] = button.Activated:Connect(function() control.Set(false) end)
+            if screen.Destroying then
+                control.Connections[#control.Connections+1] = screen.Destroying:Connect(function()
+                    control.Gui = nil
+                    control.Set(false)
+                end)
+            end
+            -- The exit control is connected before covering the game or disabling 3D.
+            screen.Enabled = true
+        end)
+        if not ok then
+            if screen then pcall(screen.Destroy, screen) end
+            clearOverlay()
+            control.Enabled = false
+            syncToggle(false)
+            notify(tostring(problem))
+            return false
+        end
+        local renderOK = pcall(function()
+            runService = game:GetService("RunService")
+            runService:Set3dRenderingEnabled(false)
+        end)
+        control.RenderDisabled = renderOK or nil
+        control.Enabled = true
+        if not renderOK then notify("Black overlay enabled; this executor cannot disable 3D rendering.") end
+        return true
+    end
+    function control.Destroy()
+        if not control.Set(false) then return false end
+        control.Alive = false
+        if env.__KeroBlackScreen == control then env.__KeroBlackScreen = nil end
+        return true
+    end
+    MiscTab:Section({Title="Display"})
+    toggle = MiscTab:Toggle({Title="Black Screen",Desc="Black overlay with a visible Disable button. Turns off 3D rendering when supported.",
+        Value=false,Callback=function(value)
+            if not syncing then control.Set(value) end
+        end})
+end
+-- END KERO BLACK SCREEN
 
 
 LobbyTab:Section({ Title = "Play" })
@@ -4121,6 +4257,7 @@ task.spawn(function()
 end)
 
 function Hub.Destroy()
+    if Hub.BlackScreenController then Hub.BlackScreenController.Destroy() end
     if not State.Running then return end
     if State.Recording then pcall(StopRecording,true) end
     StopPlayback()
@@ -7633,6 +7770,142 @@ do
     end})
 end
 -- END KERO INFO
+-- BEGIN KERO BLACK SCREEN
+do
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.__KeroBlackScreen
+    if previous and type(previous.Destroy) == "function" and previous.Destroy() == false then return end
+    local control = { Alive = true, Enabled = false, Connections = {} }
+    env.__KeroBlackScreen = control
+    Hub.BlackScreenController = control
+    local toggle, syncing
+    local runService
+    local function notify(message)
+        pcall(function() WindUI:Notify({Title="Black Screen",Content=message,Duration=5}) end)
+    end
+    local function syncToggle(value)
+        if not toggle or syncing then return end
+        syncing = true
+        pcall(function() toggle:Set(value) end)
+        syncing = false
+    end
+    local function clearOverlay()
+        for _, connection in ipairs(control.Connections) do pcall(connection.Disconnect, connection) end
+        control.Connections = {}
+        local gui = control.Gui
+        control.Gui = nil
+        if gui then pcall(gui.Destroy, gui) end
+    end
+    function control.Set(enabled)
+        enabled = enabled == true
+        if enabled and not control.Alive then return false end
+        if not enabled then
+            if control.RenderDisabled then
+                local ok = pcall(runService.Set3dRenderingEnabled, runService, true)
+                if not ok then
+                    notify("Could not restore 3D rendering. Press Disable Black Screen to retry.")
+                    return false
+                end
+                control.RenderDisabled = nil
+            end
+            control.Enabled = false
+            clearOverlay()
+            syncToggle(false)
+            return true
+        end
+        if control.Enabled and control.Gui and control.Gui.Parent then return true end
+        local screen
+        local ok, problem = pcall(function()
+            screen = Instance.new("ScreenGui")
+            screen.Name = "KeroBlackScreen_skibidi"
+            screen.Enabled = false
+            screen.IgnoreGuiInset = true
+            screen.ResetOnSpawn = false
+            screen.DisplayOrder = 2147483647
+            screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+            local background = Instance.new("Frame")
+            background.Name = "Background"
+            background.Size = UDim2.fromScale(1, 1)
+            background.BackgroundColor3 = Color3.new(0, 0, 0)
+            background.BorderSizePixel = 0
+            background.Active = true
+            background.ZIndex = 1
+            background.Parent = screen
+            local button = Instance.new("TextButton")
+            button.Name = "DisableBlackScreen"
+            button.AnchorPoint = Vector2.new(.5, .5)
+            button.Position = UDim2.fromScale(.5, .5)
+            button.Size = UDim2.fromOffset(230, 52)
+            button.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+            button.BorderSizePixel = 0
+            button.Text = "Disable Black Screen"
+            button.TextColor3 = Color3.fromRGB(245, 245, 245)
+            button.TextSize = 17
+            button.Font = Enum.Font.GothamSemibold
+            button.ZIndex = 2
+            button.Parent = background
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 10)
+            corner.Parent = button
+            local parents = {}
+            if type(gethui) == "function" then
+                local hiddenOK, hidden = pcall(gethui)
+                if hiddenOK and hidden then parents[#parents+1] = hidden end
+            end
+            local coreOK, core = pcall(game.GetService, game, "CoreGui")
+            if coreOK and core then parents[#parents+1] = core end
+            local player = game:GetService("Players").LocalPlayer
+            local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+            if playerGui then parents[#parents+1] = playerGui end
+            local parented = false
+            for _, parent in ipairs(parents) do
+                if pcall(function() screen.Parent = parent end) and screen.Parent == parent then
+                    parented = true
+                    break
+                end
+            end
+            assert(parented, "Overlay unavailable on this executor")
+            control.Gui = screen
+            control.Connections[#control.Connections+1] = button.Activated:Connect(function() control.Set(false) end)
+            if screen.Destroying then
+                control.Connections[#control.Connections+1] = screen.Destroying:Connect(function()
+                    control.Gui = nil
+                    control.Set(false)
+                end)
+            end
+            -- The exit control is connected before covering the game or disabling 3D.
+            screen.Enabled = true
+        end)
+        if not ok then
+            if screen then pcall(screen.Destroy, screen) end
+            clearOverlay()
+            control.Enabled = false
+            syncToggle(false)
+            notify(tostring(problem))
+            return false
+        end
+        local renderOK = pcall(function()
+            runService = game:GetService("RunService")
+            runService:Set3dRenderingEnabled(false)
+        end)
+        control.RenderDisabled = renderOK or nil
+        control.Enabled = true
+        if not renderOK then notify("Black overlay enabled; this executor cannot disable 3D rendering.") end
+        return true
+    end
+    function control.Destroy()
+        if not control.Set(false) then return false end
+        control.Alive = false
+        if env.__KeroBlackScreen == control then env.__KeroBlackScreen = nil end
+        return true
+    end
+    MiscTab:Section({Title="Display"})
+    toggle = MiscTab:Toggle({Title="Black Screen",Desc="Black overlay with a visible Disable button. Turns off 3D rendering when supported.",
+        Value=false,Callback=function(value)
+            if not syncing then control.Set(value) end
+        end})
+end
+-- END KERO BLACK SCREEN
 
 
 LobbyTab:Section({ Title = "Play" })
@@ -8275,6 +8548,7 @@ task.spawn(function()
 end)
 
 function Hub.Destroy()
+    if Hub.BlackScreenController then Hub.BlackScreenController.Destroy() end
     if not State.Running then return end
     if State.Recording then pcall(StopRecording,true) end
     StopPlayback()
