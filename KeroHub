@@ -1,5 +1,6 @@
 -- Kero Hub | Universal Loader
 local Releases = {
+    [7738524573] = {Release = "Retro%20TD", Folder = "RetroTD_Macros", RequiresCache = true},
     [10762636904] = {Release = "Cameraman%20TD", Folder = "CameraTD_Macros", RequiresCache = true},
     [10393438342] = {Release = "Alliance%20TD", Folder = "AllianceTD_Macros", RequiresCache = true},
     [10340119210] = {Release = "Periastron%20TD", Folder = "PeriastronTD_Macros", RequiresCache = true},
