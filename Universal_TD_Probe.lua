@@ -1,4 +1,4 @@
--- Universal TD Probe v2.2 (direct remote hooks + passive interactions)
+-- Universal TD Probe v2.3 (forward-first namecall + direct remote hooks)
 -- Passive discovery in Normal/Brutal modes and loss-minimising transport/state
 -- correlation in Perfect mode. The probe never calls a game remote itself.
 -- Direct execution defaults to Brutal_Perfect; explicit Mode still overrides it.
@@ -52,6 +52,7 @@ local Config = {
     PreciseMaxItems = math.max(50, tonumber(userConfig.PreciseMaxItems) or 500),
     BufferMaxBytes = math.max(1, math.floor(tonumber(userConfig.BufferMaxBytes) or 262144)),
     CaptureOutgoing = userConfig.CaptureOutgoing ~= false and isPerfect,
+    CaptureNamecall = userConfig.CaptureNamecall ~= false and isPerfect,
     -- Brutal_Perfect is also used to diagnose hub playback. Include calls
     -- made by the executor so failed/missing automation is visible in JSONL.
     CaptureExecutorCalls = userConfig.CaptureExecutorCalls ~= false and isBrutalPerfectRequest,
@@ -104,7 +105,7 @@ local Probe = {
     LogicalSequence = 0,
     HookGeneration = tostring(os.clock()) .. ":" .. tostring(math.random()),
     Diagnostics = { attempts = 0, completed = 0, failed = 0, incoming = 0,
-        captureErrors = 0, byPath = {}, revision = "2.2" },
+        captureErrors = 0, byPath = {}, revision = "2.3" },
 }
 Environment.UniversalTDProbe = Probe
 
@@ -998,6 +999,7 @@ local function prepareCall(object, method, capturePath, executor, ...)
         local ok, err = pcall(function()
             emit(kind .. "_attempt", { object = serializePrecise(object), method = method,
                 capturePath = capturePath, executor = ticket.executor,
+                argumentCapture = ticket.argumentCapture or "before_forward",
                 arguments = serializePrecise(ticket.arguments), caller = serializePrecise(ticket.caller) }, false,
                 { precise = true, actionId = ticket.actionId, sequence = ticket.sequence,
                     observedElapsed = ticket.clock - StartedAt, remotePath = ticket.path })
@@ -1030,6 +1032,7 @@ local function completeCall(ticket, result)
                 arguments = serializePrecise(ticket.arguments), returned = returned and serializePrecise(returned),
                 caller = serializePrecise(ticket.caller), executor = ticket.executor,
                 attemptSequence = ticket.sequence, duration = finished - ticket.clock,
+                argumentCapture = ticket.argumentCapture or "before_forward",
                 success = succeeded, error = not succeeded and clampText(result[2]) or nil }, false,
                 { precise = true, actionId = ticket.actionId, remotePath = ticket.path,
                     sequence = sequence, observedElapsed = finished - StartedAt })
@@ -1094,15 +1097,73 @@ local function installDirectMethodHook(className, method)
     if not ok then return false, "method_unavailable" end
     return installFunctionHook(target, method, className .. "." .. method)
 end
+-- Unlike direct function hooks, __namecall must not inspect Instances, callers,
+-- or buffers before forwarding: executor reflection can replace its current
+-- engine method. Capture only after the original call returns. Arguments may
+-- already have been mutated; expose that limitation explicitly in every event.
+Environment.__UniversalTDProbeV23NamecallObserve = Config.CaptureOutgoing and Config.CaptureNamecall and function(object, method, arguments, result, entered, executor)
+    local ticket = prepareCall(object, method, "__namecall", executor, table.unpack(arguments, 1, arguments.n))
+    if not ticket then return end
+    ticket.clock, ticket.argumentCapture = entered, "after_forward"
+    completeCall(ticket, result)
+end or nil
+local function installForwardFirstNamecall()
+    if not Config.CaptureNamecall then return false, "disabled_by_config" end
+    if Environment.__UniversalTDProbeV23NamecallInstalled then return true, "reused_forward_first" end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function"
+        or type(newcclosure) ~= "function" then return false, "executor_missing_namecall_api" end
+    local original
+    local ok, err = pcall(function()
+        original = hookmetamethod(game, "__namecall", newcclosure(function(object, ...)
+            local method = getnamecallmethod()
+            local observer = Environment.__UniversalTDProbeV23NamecallObserve
+            if type(observer) ~= "function" or (method ~= "FireServer" and method ~= "InvokeServer") then
+                return original(object, ...)
+            end
+            local thread = coroutine.running() or MainThreadKey
+            local bypass = HookBypass[thread]
+            if bypass and bypass.object == object and bypass.method == method then
+                return original(object, ...)
+            end
+            -- No Instance access, serialization or calling-context inspection
+            -- is allowed above the pcall(original, ...) boundary below.
+            local arguments, entered = table.pack(...), os.clock()
+            HookBypass[thread] = { object = object, method = method }
+            local result = table.pack(pcall(original, object, ...))
+            local executor = false
+            if type(checkcaller) == "function" then
+                local checked, value = pcall(checkcaller)
+                executor = checked and value == true
+            end
+            local captured, captureError = pcall(observer, object, method, arguments, result, entered, executor)
+            HookBypass[thread] = bypass
+            if not captured then
+                -- Capture failure must not replace the original return/error.
+                local diagnostics = Environment.UniversalTDProbe and Environment.UniversalTDProbe.Diagnostics
+                if diagnostics then
+                    diagnostics.captureErrors = diagnostics.captureErrors + 1
+                    diagnostics.lastCaptureError = tostring(captureError)
+                end
+            end
+            if not result[1] then error(result[2], 0) end
+            return table.unpack(result, 2, result.n)
+        end))
+    end)
+    if not ok or type(original) ~= "function" then return false, "namecall_hook_failed:" .. clampText(err) end
+    Environment.__UniversalTDProbeV23NamecallInstalled = true
+    return true, "installed_forward_first"
+end
 local function installOutgoingHooks()
-    local paths = { namecall = { available = false, state = "disabled_for_compatibility" } }
+    local paths = {}
     local function note(key, ok, state) paths[key] = { available = ok, state = state } end
+    note("namecall", installForwardFirstNamecall())
     note("fireServer", installDirectMethodHook("RemoteEvent", "FireServer"))
     note("invokeServer", installDirectMethodHook("RemoteFunction", "InvokeServer"))
     note("unreliableFireServer", installDirectMethodHook("UnreliableRemoteEvent", "FireServer"))
     local any, core = false, paths.fireServer.available and paths.invokeServer.available
     for _, path in pairs(paths) do any = any or path.available end
-    return any, core and "direct_remote_hooks_installed" or any and "installed_partial" or "unavailable", paths
+    return any, core and paths.namecall.available and "namecall_and_direct_hooks_installed"
+        or core and "direct_remote_hooks_installed" or any and "installed_partial" or "unavailable", paths
 end
 
 local function inspectClientClosures()
@@ -1223,7 +1284,7 @@ local function buildSummary(reason)
         droppedEvents = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
         writeErrors = Probe.WriteErrors,
-        coreRevision = "2.2",
+        coreRevision = "2.3",
         hook = Probe.Hook,
         diagnostics = Probe.Diagnostics,
         eventTypes = serialize(Probe.EventTypes),
@@ -1238,7 +1299,7 @@ local function buildSummary(reason)
         limitations = {
             "Correlation is evidence, not a guaranteed server acknowledgement.",
             "Server-only state and non-replicated objects are invisible to any client probe.",
-            "Stopped outgoing hooks remain installed but inert and are reused on the next v2.2 run.",
+            "Stopped outgoing hooks remain installed but inert and are reused on the next run.",
             "Direct remote hooks are not proof of coverage; compare attempt/completion counters after manual actions.",
             "Actor/parallel/native executor paths may bypass these hooks; this probe does not inject into other VMs.",
             "A successful local call or withinDistance=true does not prove server acceptance or line of sight.",
@@ -1278,7 +1339,7 @@ function Probe.Status()
         mode = Config.Mode,
         hook = serialize(Probe.Hook),
         diagnostics = serialize(Probe.Diagnostics),
-        coreRevision = "2.2",
+        coreRevision = "2.3",
         events = Probe.EventCount,
         dropped = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
@@ -1300,6 +1361,7 @@ function Probe.Stop(reason)
     Probe.Running = false
     if Environment.UniversalTDProbe == Probe then
         Environment.__UniversalTDProbeV2Enabled = false
+        Environment.__UniversalTDProbeV23NamecallObserve = nil
     end
     for _, connection in ipairs(Probe.Connections) do
         pcall(function() connection:Disconnect() end)
@@ -1340,14 +1402,14 @@ if type(identify) == "function" then
     if ok then executorInfo.name, executorInfo.version = tostring(name), version and tostring(version) end
 end
 emit("session_started", {
-    coreRevision = "2.2",
+    coreRevision = "2.3",
     executor = executorInfo,
     placeId = game.PlaceId,
     jobId = game.JobId,
     config = Config,
     hook = Probe.Hook,
     note = Config.CaptureOutgoing
-        and "Arguments are frozen before forwarding; attempt/result serialization is deferred. Success is not server acknowledgement."
+        and "Direct hooks freeze arguments before forwarding; namecall captures after forwarding to preserve native method context. See argumentCapture. Serialization is deferred; success is not server acknowledgement."
         or "Passive mode; outgoing remote calls are not hooked.",
 })
 
@@ -1505,7 +1567,7 @@ task.delay(Config.Duration, function()
 end)
 
 flush()
-print("[Universal TD Probe 2.2] Running in", Config.Mode, "mode.")
+print("[Universal TD Probe 2.3] Running in", Config.Mode, "mode.")
 if Config.CaptureOutgoing then
     local paths = Probe.Hook.paths or {}
     print(
