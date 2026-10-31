@@ -1,4 +1,4 @@
--- Universal TD Probe v2.3 (forward-first namecall + direct remote hooks)
+-- Universal TD Probe v2.5 (independent OTH/direct transport observation)
 -- Passive discovery in Normal/Brutal modes and loss-minimising transport/state
 -- correlation in Perfect mode. The probe never calls a game remote itself.
 -- Direct execution defaults to Brutal_Perfect; explicit Mode still overrides it.
@@ -55,7 +55,7 @@ local Config = {
     CaptureNamecall = userConfig.CaptureNamecall ~= false and isPerfect,
     -- Brutal_Perfect is also used to diagnose hub playback. Include calls
     -- made by the executor so failed/missing automation is visible in JSONL.
-    CaptureExecutorCalls = userConfig.CaptureExecutorCalls ~= false and isBrutalPerfectRequest,
+    CaptureExecutorCalls = userConfig.CaptureExecutorCalls ~= false and isPerfect,
     CaptureCallingScript = userConfig.CaptureCallingScript ~= false,
     CaptureKeyboard = userConfig.CaptureKeyboard ~= false and isPerfect,
     CaptureInteractions = userConfig.CaptureInteractions ~= false and isPerfect,
@@ -64,9 +64,11 @@ local Config = {
     CaptureExecutorHelpers = false,
     CaptureWorldInstances = userConfig.CaptureWorldInstances == true,
     CaptureModuleInventory = userConfig.CaptureModuleInventory ~= false and isPerfect,
+    CaptureInternalModules = userConfig.CaptureInternalModules == true,
+    HookBackend = userConfig.HookBackend == "Standard" and "Standard" or userConfig.HookBackend == "OTH" and "OTH" or "Auto",
+    AllowStandardNamecall = userConfig.AllowStandardNamecall == true,
     Introspect = userConfig.Introspect == true,
 }
-
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local StartedAt = os.clock()
@@ -105,7 +107,7 @@ local Probe = {
     LogicalSequence = 0,
     HookGeneration = tostring(os.clock()) .. ":" .. tostring(math.random()),
     Diagnostics = { attempts = 0, completed = 0, failed = 0, incoming = 0,
-        captureErrors = 0, byPath = {}, revision = "2.3" },
+        captureErrors = 0, byPath = {}, revision = "2.5" },
 }
 Environment.UniversalTDProbe = Probe
 
@@ -837,6 +839,10 @@ end
 local function inventoryModule(instance)
     if not Config.CaptureModuleInventory or not instance:IsA("ModuleScript") or ModuleWatched[instance] then return end
     ModuleWatched[instance] = true
+    if not Config.CaptureInternalModules then
+        local path = safePath(instance)
+        if path:match("^CorePackages%.") or path:match("^CoreGui%.RobloxGui%.") then return end
+    end
     emit("module_inventory", { object = instance, objectId = logicalObject(instance).id,
         attributes = getAttributes(instance), note = "Inventory only; module was not required or executed." })
 end
@@ -978,6 +984,17 @@ local HookBypass = Environment.__UniversalTDProbeV22Bypass or setmetatable({}, {
 Environment.__UniversalTDProbeV22Bypass = HookBypass
 local MainThreadKey = Environment.__UniversalTDProbeV22MainThread or {}
 Environment.__UniversalTDProbeV22MainThread = MainThreadKey
+local function observationThread()
+    if type(oth)=="table" and type(oth.is_hook_thread)=="function"
+        and type(oth.get_original_thread)=="function" then
+        local ok,isHook=pcall(oth.is_hook_thread)
+        if ok and isHook then
+            local found,thread=pcall(oth.get_original_thread)
+            if found and thread~=nil then return thread end
+        end
+    end
+    return coroutine.running() or MainThreadKey
+end
 local function observedKind(object, method)
     if typeof(object) == "Instance" and (method == "FireServer" or method == "InvokeServer")
         and isRemote(object) and remoteAllowed(object) then return "remote" end
@@ -1044,7 +1061,7 @@ local function completeCall(ticket, result)
     end)
 end
 Environment.__UniversalTDProbeV22Observe = function(original, object, method, capturePath, executor, ...)
-    local thread = coroutine.running() or MainThreadKey
+    local thread = observationThread()
     local bypass = HookBypass[thread]
     if not Probe.Running or (bypass and bypass.object == object and bypass.method == method) then
         return original(object, ...)
@@ -1066,28 +1083,44 @@ Environment.__UniversalTDProbeV22Observe = function(original, object, method, ca
     if not result[1] then error(result[2], 0) end
     return table.unpack(result, 2, result.n)
 end
+-- Adapt the backend selection used by Cobalt, without importing/running Cobalt.
+-- OTH receives a plain callback; standard hooks require newcclosure.
+local function chooseHookBackend(target)
+    if Config.HookBackend ~= "Standard" and type(oth)=="table" and type(oth.hook)=="function"
+        and type(iscclosure)=="function" and type(target)=="function" then
+        local ok,native=pcall(iscclosure,target)
+        if ok and native then return "oth",oth.hook end
+    end
+    if Config.HookBackend=="OTH" then return nil,nil,"oth_unavailable" end
+    if type(hookfunction)=="function" and type(newcclosure)=="function" then return "standard",hookfunction end
+    return nil,nil,"executor_missing_hookfunction"
+end
 local function installFunctionHook(target, method, key)
     local registry = Environment.__UniversalTDProbeV22DirectInstalled or {}
     Environment.__UniversalTDProbeV22DirectInstalled = registry
-    if registry[key] then return true, "reused" end
     if type(target) ~= "function" then return false, "function_unavailable" end
-    if type(hookfunction) ~= "function" or type(newcclosure) ~= "function" then
-        return false, "executor_missing_hookfunction"
+    local backend,hook,problem=chooseHookBackend(target)
+    if not backend then return false,problem end
+    if registry[key] then
+        local previous=type(registry[key])=="table" and registry[key].backend or "standard"
+        if previous~=backend then return false,"backend_change_requires_fresh_session" end
+        return true,"reused_"..backend
     end
     local original
     local ok, err = pcall(function()
-        original = hookfunction(target, newcclosure(function(object, ...)
+        local callback=function(object, ...)
             local observer = Environment.__UniversalTDProbeV22Observe
             if type(observer) == "function" then
                 local executor = type(checkcaller) == "function" and checkcaller()
                 return observer(original, object, method, key, executor, ...)
             end
             return original(object, ...)
-        end))
+        end
+        original=hook(target,backend=="oth" and callback or newcclosure(callback))
     end)
     if not ok or type(original) ~= "function" then return false, "hook_failed:" .. clampText(err) end
-    registry[key] = true
-    return true, "installed"
+    registry[key] = {backend=backend}
+    return true, "installed_"..backend
 end
 local function installDirectMethodHook(className, method)
     local created, sample = pcall(Instance.new, className)
@@ -1109,18 +1142,36 @@ Environment.__UniversalTDProbeV23NamecallObserve = Config.CaptureOutgoing and Co
 end or nil
 local function installForwardFirstNamecall()
     if not Config.CaptureNamecall then return false, "disabled_by_config" end
-    if Environment.__UniversalTDProbeV23NamecallInstalled then return true, "reused_forward_first" end
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function"
-        or type(newcclosure) ~= "function" then return false, "executor_missing_namecall_api" end
+    if type(getnamecallmethod)~="function" then return false,"executor_missing_namecall_api" end
+    local getMeta=getrawmetatable or (debug and debug.getmetatable)
+    local target
+    if type(getMeta)=="function" then
+        local ok,meta=pcall(getMeta,game)
+        if ok and type(meta)=="table" then target=rawget(meta,"__namecall") end
+    end
+    local backend,hook=chooseHookBackend(target)
+    backend=backend=="oth" and "oth" or "standard"
+    if backend=="standard" then
+        if Config.HookBackend=="OTH" then return false,"oth_unavailable" end
+        if not Config.AllowStandardNamecall then return false,"standard_namecall_requires_opt_in" end
+        if type(hookmetamethod)~="function" or type(newcclosure)~="function" then
+            return false,"executor_missing_namecall_api"
+        end
+    end
+    if Environment.__UniversalTDProbeV23NamecallInstalled then
+        local previous=Environment.__UniversalTDProbeV25NamecallBackend or "standard"
+        if previous~=backend then return false,"backend_change_requires_fresh_session" end
+        return true,"reused_forward_first_"..backend
+    end
     local original
     local ok, err = pcall(function()
-        original = hookmetamethod(game, "__namecall", newcclosure(function(object, ...)
+        local callback=function(object, ...)
             local method = getnamecallmethod()
             local observer = Environment.__UniversalTDProbeV23NamecallObserve
             if type(observer) ~= "function" or (method ~= "FireServer" and method ~= "InvokeServer") then
                 return original(object, ...)
             end
-            local thread = coroutine.running() or MainThreadKey
+            local thread = observationThread()
             local bypass = HookBypass[thread]
             if bypass and bypass.object == object and bypass.method == method then
                 return original(object, ...)
@@ -1147,16 +1198,20 @@ local function installForwardFirstNamecall()
             end
             if not result[1] then error(result[2], 0) end
             return table.unpack(result, 2, result.n)
-        end))
+        end
+        if backend=="oth" then original=hook(target,callback)
+        else original=hookmetamethod(game,"__namecall",newcclosure(callback)) end
     end)
     if not ok or type(original) ~= "function" then return false, "namecall_hook_failed:" .. clampText(err) end
     Environment.__UniversalTDProbeV23NamecallInstalled = true
-    return true, "installed_forward_first"
+    Environment.__UniversalTDProbeV25NamecallBackend = backend
+    return true, "installed_forward_first_"..backend
 end
 local function installOutgoingHooks()
     local paths = {}
     local function note(key, ok, state) paths[key] = { available = ok, state = state } end
     note("namecall", installForwardFirstNamecall())
+    if not paths.namecall.available then Environment.__UniversalTDProbeV23NamecallObserve=nil end
     note("fireServer", installDirectMethodHook("RemoteEvent", "FireServer"))
     note("invokeServer", installDirectMethodHook("RemoteFunction", "InvokeServer"))
     note("unreliableFireServer", installDirectMethodHook("UnreliableRemoteEvent", "FireServer"))
@@ -1284,7 +1339,7 @@ local function buildSummary(reason)
         droppedEvents = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
         writeErrors = Probe.WriteErrors,
-        coreRevision = "2.3",
+        coreRevision = "2.5",
         hook = Probe.Hook,
         diagnostics = Probe.Diagnostics,
         eventTypes = serialize(Probe.EventTypes),
@@ -1339,7 +1394,7 @@ function Probe.Status()
         mode = Config.Mode,
         hook = serialize(Probe.Hook),
         diagnostics = serialize(Probe.Diagnostics),
-        coreRevision = "2.3",
+        coreRevision = "2.5",
         events = Probe.EventCount,
         dropped = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
@@ -1355,9 +1410,10 @@ function Probe.InspectClient()
 end
 
 function Probe.Stop(reason)
-    if not Probe.Running then
+    if not Probe.Running or Probe.Stopping then
         return Probe.Status()
     end
+    Probe.Stopping = true
     Probe.Running = false
     if Environment.UniversalTDProbe == Probe then
         Environment.__UniversalTDProbeV2Enabled = false
@@ -1402,7 +1458,7 @@ if type(identify) == "function" then
     if ok then executorInfo.name, executorInfo.version = tostring(name), version and tostring(version) end
 end
 emit("session_started", {
-    coreRevision = "2.3",
+    coreRevision = "2.5",
     executor = executorInfo,
     placeId = game.PlaceId,
     jobId = game.JobId,
@@ -1412,6 +1468,8 @@ emit("session_started", {
         and "Direct hooks freeze arguments before forwarding; namecall captures after forwarding to preserve native method context. See argumentCapture. Serialization is deferred; success is not server acknowledgement."
         or "Passive mode; outgoing remote calls are not hooked.",
 })
+
+
 
 local remoteRoot = Config.Perfect and game or ReplicatedStorage
 for _, descendant in ipairs(remoteRoot:GetDescendants()) do
@@ -1567,7 +1625,7 @@ task.delay(Config.Duration, function()
 end)
 
 flush()
-print("[Universal TD Probe 2.3] Running in", Config.Mode, "mode.")
+print("[Universal TD Probe 2.5] Running in", Config.Mode, "mode.")
 if Config.CaptureOutgoing then
     local paths = Probe.Hook.paths or {}
     print(
