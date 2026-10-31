@@ -794,8 +794,11 @@ local function FindTowerModel(towerId, timeout)
 end
 
 local function GetPlacementCFrame(tower)
-    local model = FindTowerModel(tower.Name, 2)
+    local receipt = State.RecordPlacementReceipts and State.RecordPlacementReceipts[tostring(tower.Name)]
+    if receipt and receipt.Unit == tostring(tower:GetAttribute("ID")) then return receipt.CFrame end
     local boostPosition = tower:GetAttribute("BoostPos")
+    local model = TowersFolder and TowersFolder:FindFirstChild(tostring(tower.Name))
+    if typeof(boostPosition) ~= "Vector3" and not model then model = FindTowerModel(tower.Name, 2) end
     if typeof(boostPosition) == "Vector3" then
         local rotation = CFrame.identity
         if model and model:IsA("Model") then
@@ -805,16 +808,8 @@ local function GetPlacementCFrame(tower)
             end
         end
 
-        -- The replicated BoostPos is the ground position. The placement remote
-        -- observed for this game uses a pivot 4.7 studs above it.
-        return CFrame.new(boostPosition + Vector3.new(0, 4.7, 0)) * rotation
-    end
-
-    if model and model:IsA("Model") then
-        local success, pivot = pcall(model.GetPivot, model)
-        if success then
-            return pivot
-        end
+        -- Native outgoing/receipt pairs in probe 1793450657 use ground Y.
+        return CFrame.new(boostPosition) * rotation
     end
 
     return nil
@@ -828,6 +823,21 @@ local function IsUnavailableTargetMode(mode)
     return normalized == "" or normalized == "N/A" or normalized == "NA" or normalized == "NONE"
 end
 
+local function ReconcileRecordedUpgradeCosts(meta)
+    local actions, costs = meta.UpgradeActionQueue, meta.UpgradeCostQueue
+    while #actions > 0 and #costs > 0 do
+        local action, cost = actions[1], costs[1]
+        if math.abs(action.At-cost.At) <= 1 then
+            action.Action.EstimatedCost = cost.Value
+            table.remove(actions,1);table.remove(costs,1)
+        elseif action.At < cost.At then table.remove(actions,1)
+        else table.remove(costs,1) end
+    end
+    -- Never let an unmatched/free level consume a much later upgrade's price.
+    while #actions>0 and os.clock()-actions[1].At>1 do table.remove(actions,1) end
+    while #costs>0 and os.clock()-costs[1].At>1 do table.remove(costs,1) end
+end
+
 local function AttachTowerRecorder(tower, handle)
     if State.TowerMeta[tower] then
         return
@@ -839,6 +849,7 @@ local function AttachTowerRecorder(tower, handle)
         Level = tonumber(tower:GetAttribute("Upgrade")) or 0,
         SellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0,
         PendingUpgradeCost = nil,
+        UpgradeActionQueue = {}, UpgradeCostQueue = {},
         TargetMode = tower:GetAttribute("TargetMode"),
         LastUpgradeAt = -math.huge,
         AbilityMarkers = {},
@@ -865,6 +876,10 @@ local function AttachTowerRecorder(tower, handle)
         if newPrice > meta.SellPrice then
             meta.PendingUpgradeCost = math.max(0, (newPrice - meta.SellPrice) * 2)
             meta.LastUpgradeAt = os.clock()
+            if State.Recording and meta.Session == State.RecordSession then
+                table.insert(meta.UpgradeCostQueue,{At=os.clock(),Value=meta.PendingUpgradeCost})
+                ReconcileRecordedUpgradeCosts(meta)
+            end
         end
         meta.SellPrice = newPrice
     end))
@@ -873,13 +888,16 @@ local function AttachTowerRecorder(tower, handle)
         local newLevel = tonumber(tower:GetAttribute("Upgrade")) or meta.Level
         if State.Recording and meta.Session == State.RecordSession and newLevel > meta.Level then
             meta.LastUpgradeAt = os.clock()
-            AddTowerAction(meta, {
+            local action = {
                 Type = "Upgrade",
                 Handle = meta.Handle,
                 FromLevel = meta.Level,
                 ToLevel = newLevel,
                 EstimatedCost = meta.PendingUpgradeCost or 0,
-            })
+            }
+            AddTowerAction(meta, action)
+            table.insert(meta.UpgradeActionQueue,{At=os.clock(),Action=action})
+            ReconcileRecordedUpgradeCosts(meta)
         end
         meta.Level = newLevel
         meta.PendingUpgradeCost = nil
@@ -990,6 +1008,23 @@ local function StartRecording(profileName)
     State.RecordCooldownSamples = {}
     State.Recording = true
     if Hub.MatchFlow then Hub.MatchFlow.RecordLoadout() end
+    State.RecordPlacementReceipts, State.RecordPlacementActions = {}, {}
+    local receiptOK, receiptConnection = pcall(function()
+        return Remotes.Place.OnClientEvent:Connect(function(owner, unit, frame, id)
+            if not State.Recording or State.RecordSession ~= recordSession or owner ~= LocalPlayer
+                or typeof(frame) ~= "CFrame" or (type(id) ~= "number" and type(id) ~= "string") then return end
+            if Hub.MatchFlow then Hub.MatchFlow.UpdateRecorderClock() end
+            local key = tostring(id)
+            local receipt = {Unit=tostring(unit),CFrame=frame,RecordedAt=os.clock()-State.RecordStartedAt}
+            State.RecordPlacementReceipts[key] = receipt
+            local action = State.RecordPlacementActions[key]
+            if action and action.Unit == receipt.Unit then
+                action.CFrame, action.PlacementSpace = CFrameToArray(frame), "Ground"
+                action.RecordedAt = receipt.RecordedAt
+            end
+        end)
+    end)
+    if receiptOK and receiptConnection then AddConnection(State.RecorderConnections,receiptConnection) end
 
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local watchedAbilityButtons = setmetatable({}, { __mode = "k" })
@@ -1041,6 +1076,8 @@ local function StartRecording(profileName)
     end
 
     AddConnection(State.RecorderConnections, TowerDataFolder.ChildAdded:Connect(function(tower)
+        if Hub.MatchFlow then Hub.MatchFlow.UpdateRecorderClock() end
+        local observedAt = os.clock()-State.RecordStartedAt
         task.spawn(function()
             local ready = WaitUntil(function()
                 return IsOwnTower(tower) and tower:GetAttribute("ID") ~= nil
@@ -1062,13 +1099,18 @@ local function StartRecording(profileName)
             if not State.Recording or State.RecordSession ~= recordSession then return end
 
             local sellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0
-            AddAction({
+            local receipt = State.RecordPlacementReceipts[tostring(tower.Name)]
+            local action = {
                 Type = "Place",
                 Handle = handle,
                 Unit = tostring(tower:GetAttribute("ID")),
                 CFrame = CFrameToArray(placement),
+                PlacementSpace = "Ground",
+                RecordedAt = receipt and receipt.RecordedAt or observedAt,
                 EstimatedCost = sellPrice * 2,
-            })
+            }
+            State.RecordPlacementActions[tostring(tower.Name)] = action
+            AddAction(action)
             local meta = State.TowerMeta[tower]
             if meta then
                 meta.PlaceRecorded = true
@@ -1156,11 +1198,21 @@ local function HorizontalDistance(a, b)
     return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 end
 
+local function ActionPlacementCFrame(action)
+    local placement = ArrayToCFrame(action.CFrame)
+    if not placement or action.PlacementSpace == "Ground" then return placement end
+    -- Old recorder stored model-pivot Y (+4.7). Convert only in memory;
+    -- imported/shared JSON and the native rotation stay unchanged.
+    local values = table.clone(action.CFrame)
+    values[2] = tonumber(values[2]) - 4.7
+    return ArrayToCFrame(values)
+end
+
 local function FindMatchingRuntimeTower(action, known)
     if not TowerDataFolder then
         return nil
     end
-    local placement = ArrayToCFrame(action.CFrame)
+    local placement = ActionPlacementCFrame(action)
     if not placement then
         return nil
     end
@@ -1174,7 +1226,7 @@ local function FindMatchingRuntimeTower(action, known)
             local boostPosition = tower:GetAttribute("BoostPos")
             if typeof(boostPosition) == "Vector3"
                 and HorizontalDistance(boostPosition, placement.Position) <= 0.35
-                and math.abs(boostPosition.Y + 4.7 - placement.Position.Y) <= 1 then
+                and math.abs(boostPosition.Y - placement.Position.Y) <= 1 then
                 if match then return nil, "Multiple matching towers at the recorded position" end
                 match = tower
             end
@@ -1200,26 +1252,24 @@ local function WaitForActionGate(action, playbackStartedAt, session)
         local elapsed = os.clock() - playbackStartedAt
         local hasTime = elapsed >= recordedAt
         local hasMoney = cost <= 0 or GetMoney() >= cost
-        local hasWave = targetWave <= 0 or GetWave() >= targetWave
-
+        local tower = action.Type == "Upgrade" and State.RuntimeHandles[action.Handle]
+        if tower and tower.Parent == TowerDataFolder
+            and (tonumber(tower:GetAttribute("Upgrade")) or 0) >= (tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0)+1)) then
+            hasMoney = true
+        end
         if State.PlaybackMode == "Time" then
             return hasTime
         elseif State.PlaybackMode == "Money" then
             return hasMoney
         end
-
-        -- Hybrid normally requires both recorded timing and cash. If the game
-        -- has already passed the recorded wave, timing is released so a late
-        -- start cannot permanently desync the macro.
-        if targetWave > 0 and GetWave() > targetWave then
-            hasTime = true
-        end
-        return hasWave and hasTime and hasMoney
-    end, 600, 0.1)
+        -- Hybrid is an absolute time + funds gate. A later wave must not
+        -- release timing early, nor should a slow wave postpone a due action.
+        return hasTime and hasMoney
+    end, 600, 0.03)
 end
 
 local function PlayPlace(action, session)
-    local placement = ArrayToCFrame(action.CFrame)
+    local placement = ActionPlacementCFrame(action)
     if not placement then
         return false, "Invalid placement CFrame"
     end
@@ -1247,7 +1297,7 @@ local function PlayPlace(action, session)
                     local key = tostring(id)
                     if knownIds[key] or key == "" then return end
                     if HorizontalDistance(frame.Position, placement.Position) > 0.35
-                        or math.abs(frame.Position.Y + 4.7 - placement.Position.Y) > 1 then return end
+                        or math.abs(frame.Position.Y - placement.Position.Y) > 1 then return end
                     if receiptId and receiptId ~= key then receiptConflict = true end
                     receiptId = key
                 end)
@@ -1275,7 +1325,7 @@ local function PlayPlace(action, session)
                 local found, reason = FindMatchingRuntimeTower(action, known)
                 ambiguity = reason
                 return found
-            end, 12, 0.1)
+            end, 12, 0.03)
             if receiptConnection then receiptConnection:Disconnect() end
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if success and typeof(tower) == "Instance" then
@@ -1288,7 +1338,7 @@ local function PlayPlace(action, session)
             return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
         end
 
-        task.wait(1.5)
+        task.wait(0.03)
     end
 
     return false, "Place timed out"
@@ -1304,54 +1354,48 @@ end
 
 local function PlayUpgrade(action, session)
     local tower = ResolveHandle(action.Handle)
-    if not tower then
-        return false, "Tower handle is missing: " .. tostring(action.Handle)
-    end
-
+    if not tower then return false, "Tower handle is missing: " .. tostring(action.Handle) end
     local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
-    local estimatedCost = tonumber(action.EstimatedCost) or 0
+    local requiredCost = math.max(0, tonumber(action.EstimatedCost) or 0)
     local deadline = os.clock() + 180
-    local fundsUnlocked = estimatedCost <= 0
-
-    while PlaybackAlive(session) and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
-        local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
-        if currentLevel >= targetLevel then
-            return true
+    local pending, nextStatus = nil, 0
+    while PlaybackAlive(session) and not IsGameEnded() and os.clock() < deadline do
+        if tower.Parent ~= TowerDataFolder then return false, "Tower disappeared during upgrade" end
+        local level = tonumber(tower:GetAttribute("Upgrade")) or 0
+        if level >= targetLevel then State.UpgradeWait=nil;return true end
+        local cash = GetMoney()
+        local price = tonumber(tower:GetAttribute("SellPrice")) or 0
+        if pending and level > pending.level then
+            -- Each native call advances one level. Multi-level Upgrade All
+            -- records still wait for confirmation of every intermediate level.
+            pending, requiredCost = nil, 0
         end
-
-        -- Upgrade All can replicate a multi-level jump (for example 0 -> 4)
-        -- as one recorded action. The server remote still upgrades one level
-        -- per call, so confirm each intermediate level and immediately send the
-        -- next request instead of waiting for the final level for three seconds.
-        if not fundsUnlocked and GetMoney() >= estimatedCost then
-            fundsUnlocked = true
+        if pending then
+            pending.spent = pending.spent or cash < pending.cash or price > pending.price
+            -- UpgradeTower has no rejection return. A request sent before the
+            -- server sees the latest cash can be silently ignored. Retry at a
+            -- bounded rate only with unchanged level and no observed spending.
+            -- Once spending is seen, wait for replication instead of resending.
+            if not pending.spent and pending.cash ~= math.huge and os.clock()-pending.at >= 2 and cash >= requiredCost then
+                pending = nil
+            end
         end
-
-        if fundsUnlocked then
-            local levelBeforeRequest = currentLevel
+        if not pending and cash >= requiredCost then
+            pending={level=level,cash=cash,price=price,at=os.clock(),spent=false}
             local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
-            local progressed = WaitUntil(function()
-                return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
-                    or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
-            end, 12, 0.05)
-            if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
-            if tower.Parent ~= TowerDataFolder then
-                return false, "Tower disappeared during upgrade"
-            end
-            if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
-                return true
-            end
-
-            if not progressed then
-                return false, sent and "Upgrade unconfirmed after 12s; no duplicate retry" or ("Upgrade transport failed: " .. tostring(why))
-            end
-            task.wait(0.05)
-        else
-            task.wait(0.1)
+            if not sent then return false, "Upgrade transport failed: " .. tostring(why) end
         end
+        State.UpgradeWait={Handle=action.Handle,Level=level,TargetLevel=targetLevel,
+            Cash=cash,RequiredCost=requiredCost,Pending=pending~=nil,Spent=pending and pending.spent or false}
+        if os.clock() >= nextStatus then
+            nextStatus=os.clock()+0.5
+            SetStatus("Playback", pending and ("Upgrade "..tostring(action.Handle).." | waiting for level confirmation")
+                or string.format("Upgrade %s | waiting for money: %s / %s",tostring(action.Handle),GetMoneyText(),tostring(requiredCost)))
+        end
+        task.wait(0.03)
     end
-
-    return false, "Upgrade timed out"
+    if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
+    return false, "Upgrade timed out after 180s without confirmed target level"
 end
 
 local function IsAutomaticRecordedTarget(index, action)
@@ -1607,7 +1651,7 @@ function Hub.ExportDebug(reason)
     local snapshot = {Version=1,PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
         Mode=State.PlaybackMode,Wave=GetWave(),Money=GetMoneyText(),ActionIndex=State.PlaybackIndex,
         Action=State.Actions[State.PlaybackIndex or 0],Reason=reason or State.LastPlaybackFailure,Towers={},
-        RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
+        UpgradeWait=State.UpgradeWait,RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
         Knock=Hub.Knock and {Message=Hub.Knock.Message,LastAttempt=Hub.Knock.LastAttempt,LastRound=Hub.Knock.LastRound,WebhookResult=Hub.Knock.LastWebhookResult} or nil}
     if TowerDataFolder then for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower) and #snapshot.Towers < 100 then
@@ -1657,6 +1701,7 @@ local function StartPlayback()
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.PlaybackIndex = 0
+    State.UpgradeWait = nil
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.AbilityLastUsed = {}
     State.AbilityAttempts = {}
@@ -1677,8 +1722,9 @@ local function StartPlayback()
         -- Match the recorder's clock to the first live wave, not loading time.
         while PlaybackAlive(session) and not IsGameEnded() and GetWave() < 1 do
             playbackStartedAt = os.clock()
-            task.wait(0.1)
+            task.wait(0.03)
         end
+        playbackStartedAt = os.clock()
 
         for index, action in ipairs(State.Actions) do
             if not PlaybackAlive(session) or IsGameEnded() then
@@ -5122,8 +5168,11 @@ local function FindTowerModel(towerId, timeout)
 end
 
 local function GetPlacementCFrame(tower)
-    local model = FindTowerModel(tower.Name, 2)
+    local receipt = State.RecordPlacementReceipts and State.RecordPlacementReceipts[tostring(tower.Name)]
+    if receipt and receipt.Unit == tostring(tower:GetAttribute("ID")) then return receipt.CFrame end
     local boostPosition = tower:GetAttribute("BoostPos")
+    local model = TowersFolder and TowersFolder:FindFirstChild(tostring(tower.Name))
+    if typeof(boostPosition) ~= "Vector3" and not model then model = FindTowerModel(tower.Name, 2) end
     if typeof(boostPosition) == "Vector3" then
         local rotation = CFrame.identity
         if model and model:IsA("Model") then
@@ -5133,16 +5182,8 @@ local function GetPlacementCFrame(tower)
             end
         end
 
-        -- The replicated BoostPos is the ground position. The placement remote
-        -- observed for this game uses a pivot 4.7 studs above it.
-        return CFrame.new(boostPosition + Vector3.new(0, 4.7, 0)) * rotation
-    end
-
-    if model and model:IsA("Model") then
-        local success, pivot = pcall(model.GetPivot, model)
-        if success then
-            return pivot
-        end
+        -- Native outgoing/receipt pairs in probe 1793450657 use ground Y.
+        return CFrame.new(boostPosition) * rotation
     end
 
     return nil
@@ -5156,6 +5197,21 @@ local function IsUnavailableTargetMode(mode)
     return normalized == "" or normalized == "N/A" or normalized == "NA" or normalized == "NONE"
 end
 
+local function ReconcileRecordedUpgradeCosts(meta)
+    local actions, costs = meta.UpgradeActionQueue, meta.UpgradeCostQueue
+    while #actions > 0 and #costs > 0 do
+        local action, cost = actions[1], costs[1]
+        if math.abs(action.At-cost.At) <= 1 then
+            action.Action.EstimatedCost = cost.Value
+            table.remove(actions,1);table.remove(costs,1)
+        elseif action.At < cost.At then table.remove(actions,1)
+        else table.remove(costs,1) end
+    end
+    -- Never let an unmatched/free level consume a much later upgrade's price.
+    while #actions>0 and os.clock()-actions[1].At>1 do table.remove(actions,1) end
+    while #costs>0 and os.clock()-costs[1].At>1 do table.remove(costs,1) end
+end
+
 local function AttachTowerRecorder(tower, handle)
     if State.TowerMeta[tower] then
         return
@@ -5167,6 +5223,7 @@ local function AttachTowerRecorder(tower, handle)
         Level = tonumber(tower:GetAttribute("Upgrade")) or 0,
         SellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0,
         PendingUpgradeCost = nil,
+        UpgradeActionQueue = {}, UpgradeCostQueue = {},
         TargetMode = tower:GetAttribute("TargetMode"),
         LastUpgradeAt = -math.huge,
         AbilityMarkers = {},
@@ -5193,6 +5250,10 @@ local function AttachTowerRecorder(tower, handle)
         if newPrice > meta.SellPrice then
             meta.PendingUpgradeCost = math.max(0, (newPrice - meta.SellPrice) * 2)
             meta.LastUpgradeAt = os.clock()
+            if State.Recording and meta.Session == State.RecordSession then
+                table.insert(meta.UpgradeCostQueue,{At=os.clock(),Value=meta.PendingUpgradeCost})
+                ReconcileRecordedUpgradeCosts(meta)
+            end
         end
         meta.SellPrice = newPrice
     end))
@@ -5201,13 +5262,16 @@ local function AttachTowerRecorder(tower, handle)
         local newLevel = tonumber(tower:GetAttribute("Upgrade")) or meta.Level
         if State.Recording and meta.Session == State.RecordSession and newLevel > meta.Level then
             meta.LastUpgradeAt = os.clock()
-            AddTowerAction(meta, {
+            local action = {
                 Type = "Upgrade",
                 Handle = meta.Handle,
                 FromLevel = meta.Level,
                 ToLevel = newLevel,
                 EstimatedCost = meta.PendingUpgradeCost or 0,
-            })
+            }
+            AddTowerAction(meta, action)
+            table.insert(meta.UpgradeActionQueue,{At=os.clock(),Action=action})
+            ReconcileRecordedUpgradeCosts(meta)
         end
         meta.Level = newLevel
         meta.PendingUpgradeCost = nil
@@ -5318,6 +5382,23 @@ local function StartRecording(profileName)
     State.RecordCooldownSamples = {}
     State.Recording = true
     if Hub.MatchFlow then Hub.MatchFlow.RecordLoadout() end
+    State.RecordPlacementReceipts, State.RecordPlacementActions = {}, {}
+    local receiptOK, receiptConnection = pcall(function()
+        return Remotes.Place.OnClientEvent:Connect(function(owner, unit, frame, id)
+            if not State.Recording or State.RecordSession ~= recordSession or owner ~= LocalPlayer
+                or typeof(frame) ~= "CFrame" or (type(id) ~= "number" and type(id) ~= "string") then return end
+            if Hub.MatchFlow then Hub.MatchFlow.UpdateRecorderClock() end
+            local key = tostring(id)
+            local receipt = {Unit=tostring(unit),CFrame=frame,RecordedAt=os.clock()-State.RecordStartedAt}
+            State.RecordPlacementReceipts[key] = receipt
+            local action = State.RecordPlacementActions[key]
+            if action and action.Unit == receipt.Unit then
+                action.CFrame, action.PlacementSpace = CFrameToArray(frame), "Ground"
+                action.RecordedAt = receipt.RecordedAt
+            end
+        end)
+    end)
+    if receiptOK and receiptConnection then AddConnection(State.RecorderConnections,receiptConnection) end
 
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local watchedAbilityButtons = setmetatable({}, { __mode = "k" })
@@ -5369,6 +5450,8 @@ local function StartRecording(profileName)
     end
 
     AddConnection(State.RecorderConnections, TowerDataFolder.ChildAdded:Connect(function(tower)
+        if Hub.MatchFlow then Hub.MatchFlow.UpdateRecorderClock() end
+        local observedAt = os.clock()-State.RecordStartedAt
         task.spawn(function()
             local ready = WaitUntil(function()
                 return IsOwnTower(tower) and tower:GetAttribute("ID") ~= nil
@@ -5390,13 +5473,18 @@ local function StartRecording(profileName)
             if not State.Recording or State.RecordSession ~= recordSession then return end
 
             local sellPrice = tonumber(tower:GetAttribute("SellPrice")) or 0
-            AddAction({
+            local receipt = State.RecordPlacementReceipts[tostring(tower.Name)]
+            local action = {
                 Type = "Place",
                 Handle = handle,
                 Unit = tostring(tower:GetAttribute("ID")),
                 CFrame = CFrameToArray(placement),
+                PlacementSpace = "Ground",
+                RecordedAt = receipt and receipt.RecordedAt or observedAt,
                 EstimatedCost = sellPrice * 2,
-            })
+            }
+            State.RecordPlacementActions[tostring(tower.Name)] = action
+            AddAction(action)
             local meta = State.TowerMeta[tower]
             if meta then
                 meta.PlaceRecorded = true
@@ -5484,11 +5572,21 @@ local function HorizontalDistance(a, b)
     return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 end
 
+local function ActionPlacementCFrame(action)
+    local placement = ArrayToCFrame(action.CFrame)
+    if not placement or action.PlacementSpace == "Ground" then return placement end
+    -- Old recorder stored model-pivot Y (+4.7). Convert only in memory;
+    -- imported/shared JSON and the native rotation stay unchanged.
+    local values = table.clone(action.CFrame)
+    values[2] = tonumber(values[2]) - 4.7
+    return ArrayToCFrame(values)
+end
+
 local function FindMatchingRuntimeTower(action, known)
     if not TowerDataFolder then
         return nil
     end
-    local placement = ArrayToCFrame(action.CFrame)
+    local placement = ActionPlacementCFrame(action)
     if not placement then
         return nil
     end
@@ -5502,7 +5600,7 @@ local function FindMatchingRuntimeTower(action, known)
             local boostPosition = tower:GetAttribute("BoostPos")
             if typeof(boostPosition) == "Vector3"
                 and HorizontalDistance(boostPosition, placement.Position) <= 0.35
-                and math.abs(boostPosition.Y + 4.7 - placement.Position.Y) <= 1 then
+                and math.abs(boostPosition.Y - placement.Position.Y) <= 1 then
                 if match then return nil, "Multiple matching towers at the recorded position" end
                 match = tower
             end
@@ -5528,26 +5626,24 @@ local function WaitForActionGate(action, playbackStartedAt, session)
         local elapsed = os.clock() - playbackStartedAt
         local hasTime = elapsed >= recordedAt
         local hasMoney = cost <= 0 or GetMoney() >= cost
-        local hasWave = targetWave <= 0 or GetWave() >= targetWave
-
+        local tower = action.Type == "Upgrade" and State.RuntimeHandles[action.Handle]
+        if tower and tower.Parent == TowerDataFolder
+            and (tonumber(tower:GetAttribute("Upgrade")) or 0) >= (tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0)+1)) then
+            hasMoney = true
+        end
         if State.PlaybackMode == "Time" then
             return hasTime
         elseif State.PlaybackMode == "Money" then
             return hasMoney
         end
-
-        -- Hybrid normally requires both recorded timing and cash. If the game
-        -- has already passed the recorded wave, timing is released so a late
-        -- start cannot permanently desync the macro.
-        if targetWave > 0 and GetWave() > targetWave then
-            hasTime = true
-        end
-        return hasWave and hasTime and hasMoney
-    end, 600, 0.1)
+        -- Hybrid is an absolute time + funds gate. A later wave must not
+        -- release timing early, nor should a slow wave postpone a due action.
+        return hasTime and hasMoney
+    end, 600, 0.03)
 end
 
 local function PlayPlace(action, session)
-    local placement = ArrayToCFrame(action.CFrame)
+    local placement = ActionPlacementCFrame(action)
     if not placement then
         return false, "Invalid placement CFrame"
     end
@@ -5575,7 +5671,7 @@ local function PlayPlace(action, session)
                     local key = tostring(id)
                     if knownIds[key] or key == "" then return end
                     if HorizontalDistance(frame.Position, placement.Position) > 0.35
-                        or math.abs(frame.Position.Y + 4.7 - placement.Position.Y) > 1 then return end
+                        or math.abs(frame.Position.Y - placement.Position.Y) > 1 then return end
                     if receiptId and receiptId ~= key then receiptConflict = true end
                     receiptId = key
                 end)
@@ -5603,7 +5699,7 @@ local function PlayPlace(action, session)
                 local found, reason = FindMatchingRuntimeTower(action, known)
                 ambiguity = reason
                 return found
-            end, 12, 0.1)
+            end, 12, 0.03)
             if receiptConnection then receiptConnection:Disconnect() end
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if success and typeof(tower) == "Instance" then
@@ -5616,7 +5712,7 @@ local function PlayPlace(action, session)
             return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
         end
 
-        task.wait(1.5)
+        task.wait(0.03)
     end
 
     return false, "Place timed out"
@@ -5632,54 +5728,48 @@ end
 
 local function PlayUpgrade(action, session)
     local tower = ResolveHandle(action.Handle)
-    if not tower then
-        return false, "Tower handle is missing: " .. tostring(action.Handle)
-    end
-
+    if not tower then return false, "Tower handle is missing: " .. tostring(action.Handle) end
     local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
-    local estimatedCost = tonumber(action.EstimatedCost) or 0
+    local requiredCost = math.max(0, tonumber(action.EstimatedCost) or 0)
     local deadline = os.clock() + 180
-    local fundsUnlocked = estimatedCost <= 0
-
-    while PlaybackAlive(session) and tower.Parent == TowerDataFolder and os.clock() < deadline and not IsGameEnded() do
-        local currentLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
-        if currentLevel >= targetLevel then
-            return true
+    local pending, nextStatus = nil, 0
+    while PlaybackAlive(session) and not IsGameEnded() and os.clock() < deadline do
+        if tower.Parent ~= TowerDataFolder then return false, "Tower disappeared during upgrade" end
+        local level = tonumber(tower:GetAttribute("Upgrade")) or 0
+        if level >= targetLevel then State.UpgradeWait=nil;return true end
+        local cash = GetMoney()
+        local price = tonumber(tower:GetAttribute("SellPrice")) or 0
+        if pending and level > pending.level then
+            -- Each native call advances one level. Multi-level Upgrade All
+            -- records still wait for confirmation of every intermediate level.
+            pending, requiredCost = nil, 0
         end
-
-        -- Upgrade All can replicate a multi-level jump (for example 0 -> 4)
-        -- as one recorded action. The server remote still upgrades one level
-        -- per call, so confirm each intermediate level and immediately send the
-        -- next request instead of waiting for the final level for three seconds.
-        if not fundsUnlocked and GetMoney() >= estimatedCost then
-            fundsUnlocked = true
+        if pending then
+            pending.spent = pending.spent or cash < pending.cash or price > pending.price
+            -- UpgradeTower has no rejection return. A request sent before the
+            -- server sees the latest cash can be silently ignored. Retry at a
+            -- bounded rate only with unchanged level and no observed spending.
+            -- Once spending is seen, wait for replication instead of resending.
+            if not pending.spent and pending.cash ~= math.huge and os.clock()-pending.at >= 2 and cash >= requiredCost then
+                pending = nil
+            end
         end
-
-        if fundsUnlocked then
-            local levelBeforeRequest = currentLevel
+        if not pending and cash >= requiredCost then
+            pending={level=level,cash=cash,price=price,at=os.clock(),spent=false}
             local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
-            local progressed = WaitUntil(function()
-                return not PlaybackAlive(session) or IsGameEnded() or tower.Parent ~= TowerDataFolder
-                    or (tonumber(tower:GetAttribute("Upgrade")) or 0) > levelBeforeRequest
-            end, 12, 0.05)
-            if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
-            if tower.Parent ~= TowerDataFolder then
-                return false, "Tower disappeared during upgrade"
-            end
-            if (tonumber(tower:GetAttribute("Upgrade")) or 0) >= targetLevel then
-                return true
-            end
-
-            if not progressed then
-                return false, sent and "Upgrade unconfirmed after 12s; no duplicate retry" or ("Upgrade transport failed: " .. tostring(why))
-            end
-            task.wait(0.05)
-        else
-            task.wait(0.1)
+            if not sent then return false, "Upgrade transport failed: " .. tostring(why) end
         end
+        State.UpgradeWait={Handle=action.Handle,Level=level,TargetLevel=targetLevel,
+            Cash=cash,RequiredCost=requiredCost,Pending=pending~=nil,Spent=pending and pending.spent or false}
+        if os.clock() >= nextStatus then
+            nextStatus=os.clock()+0.5
+            SetStatus("Playback", pending and ("Upgrade "..tostring(action.Handle).." | waiting for level confirmation")
+                or string.format("Upgrade %s | waiting for money: %s / %s",tostring(action.Handle),GetMoneyText(),tostring(requiredCost)))
+        end
+        task.wait(0.03)
     end
-
-    return false, "Upgrade timed out"
+    if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
+    return false, "Upgrade timed out after 180s without confirmed target level"
 end
 
 local function IsAutomaticRecordedTarget(index, action)
@@ -5935,7 +6025,7 @@ function Hub.ExportDebug(reason)
     local snapshot = {Version=1,PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
         Mode=State.PlaybackMode,Wave=GetWave(),Money=GetMoneyText(),ActionIndex=State.PlaybackIndex,
         Action=State.Actions[State.PlaybackIndex or 0],Reason=reason or State.LastPlaybackFailure,Towers={},
-        RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
+        UpgradeWait=State.UpgradeWait,RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
         Knock=Hub.Knock and {Message=Hub.Knock.Message,LastAttempt=Hub.Knock.LastAttempt,LastRound=Hub.Knock.LastRound,WebhookResult=Hub.Knock.LastWebhookResult} or nil}
     if TowerDataFolder then for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower) and #snapshot.Towers < 100 then
@@ -5985,6 +6075,7 @@ local function StartPlayback()
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.PlaybackIndex = 0
+    State.UpgradeWait = nil
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.AbilityLastUsed = {}
     State.AbilityAttempts = {}
@@ -6005,8 +6096,9 @@ local function StartPlayback()
         -- Match the recorder's clock to the first live wave, not loading time.
         while PlaybackAlive(session) and not IsGameEnded() and GetWave() < 1 do
             playbackStartedAt = os.clock()
-            task.wait(0.1)
+            task.wait(0.03)
         end
+        playbackStartedAt = os.clock()
 
         for index, action in ipairs(State.Actions) do
             if not PlaybackAlive(session) or IsGameEnded() then
