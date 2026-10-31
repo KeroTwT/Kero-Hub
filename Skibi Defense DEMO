@@ -137,6 +137,27 @@ local Scripted
 local TowerDataFolder
 local TowersFolder
 
+local function BindServerMoney(remote)
+    if State.MoneySyncRemote == remote and State.MoneySyncConnection then return end
+    if State.MoneySyncConnection then State.MoneySyncConnection:Disconnect() end
+    State.MoneySyncRemote, State.MoneySyncConnection = remote, nil
+    State.ServerMoney, State.ServerMoneyAt = nil, nil
+    if not remote then return end
+    local ok, connection = pcall(function()
+        return remote.OnClientEvent:Connect(function(key,value)
+            if State.Running and State.MoneySyncRemote == remote and key == "Money" and tonumber(value) then
+                State.ServerMoney = tonumber(value)
+                State.ServerMoneyAt = os.clock()
+                State.ServerMoneyVersion = (State.ServerMoneyVersion or 0)+1
+            end
+        end)
+    end)
+    if ok and connection then
+        State.MoneySyncConnection = connection
+        table.insert(State.Connections,connection)
+    end
+end
+
 local function RefreshGameObjects()
     local eventFolder = ReplicatedStorage:FindFirstChild("Event")
     local gameFolder = ReplicatedStorage:FindFirstChild("Game")
@@ -148,6 +169,9 @@ local function RefreshGameObjects()
     Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
     Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
     Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    local notificationFolder = ReplicatedStorage:FindFirstChild("Notification")
+    Remotes.Notice = notificationFolder and notificationFolder:FindFirstChild("server")
+    BindServerMoney(eventFolder and eventFolder:FindFirstChild("statUpdate"))
     Remotes.BoostSelect = ReplicatedStorage:FindFirstChild("BoostSelect")
     local towerScript = ReplicatedStorage:FindFirstChild("TowerScript")
     Remotes.Ability = towerScript and towerScript:FindFirstChild("spawnTowerAbility")
@@ -268,7 +292,10 @@ end
 local function GetMoney()
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
     local money = leaderstats and leaderstats:FindFirstChild("Money")
-    local value = money and tonumber(money.Value) or 0
+    -- leaderstats lags and rounds (probe: 562 vs server 61.5). Use the
+    -- game's direct Money statUpdate as soon as its first value arrives.
+    State.LastLeaderMoney = money and tonumber(money.Value) or 0
+    local value = State.ServerMoney ~= nil and tonumber(State.ServerMoney) or State.LastLeaderMoney
     -- Brutal probe 1792742021: sandbox money exposes INT64_MIN in the replicated value
     -- to INT64_MIN while normal placement/upgrades continue to succeed.
     -- Match only that sentinel (Luau doubles round it), never arbitrary debt.
@@ -282,6 +309,7 @@ end
 local function GetMoneyText()
     local value = GetMoney()
     if value == math.huge then return "Infinite" end
+    if value % 1 ~= 0 then return (string.format("%.2f",value):gsub("0+$",""):gsub("%.$","")) end
     return string.format("%.0f", value)
 end
 
@@ -1285,7 +1313,7 @@ local function PlayPlace(action, session)
             -- Subscribe before sending: acceptance can arrive before TowerData
             -- replicates. Scope receipts to this one request; never reuse a
             -- previous round's ID or adopt an already existing neighbour.
-            local receiptId, receiptConflict, receiptConnection
+            local receiptId, receiptConflict, receiptConnection, noticeConnection, fundsRejected
             local knownIds = {}
             for tower in pairs(known) do knownIds[tostring(tower.Name)] = true end
             local listening, connection = pcall(function()
@@ -1303,6 +1331,22 @@ local function PlayPlace(action, session)
                 end)
             end)
             if listening then receiptConnection = connection end
+            local noticeOK, notice = pcall(function()
+                return Remotes.Notice.OnClientEvent:Connect(function(data)
+                    local text = type(data)=="table" and tostring(data.Text or "") or tostring(data)
+                    local lower = text:lower()
+                    if lower:find("place",1,true) and (lower:find("cash",1,true) or lower:find("money",1,true))
+                        and (lower:find("need",1,true) or lower:find("enough",1,true) or lower:find("insufficient",1,true)) then
+                        fundsRejected={Text=text,At=os.clock(),Cash=GetMoney()}
+                        -- Observed message reports the shortfall, not full price.
+                        if lower:find("need more cash to place",1,true) then
+                            local missing = tonumber((text:gsub(",",""):match("%$([%d%.]+)")))
+                            if missing then estimatedCost=math.max(estimatedCost,math.ceil(GetMoney()+missing)) end
+                        end
+                    end
+                end)
+            end)
+            if noticeOK then noticeConnection=notice end
             local sent, why = pcall(Remotes.Place.FireServer, Remotes.Place, action.Unit, placement, false)
             local ambiguity
             local success, tower = WaitUntil(function()
@@ -1324,24 +1368,41 @@ local function PlayPlace(action, session)
                 end
                 local found, reason = FindMatchingRuntimeTower(action, known)
                 ambiguity = reason
-                return found
+                if found then return found end
+                if fundsRejected and not receiptId and not ambiguity and os.clock()-fundsRejected.At >= 0.15 then
+                    return "funds_rejected"
+                end
+                return nil
             end, 12, 0.03)
             if receiptConnection then receiptConnection:Disconnect() end
+            if noticeConnection then noticeConnection:Disconnect() end
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if success and typeof(tower) == "Instance" then
                 State.RuntimeHandles[action.Handle] = tower
                 State.UsedRuntimeTowers[tower] = true
+                State.PlacementWait = nil
                 return true
             end
+            if tower == "funds_rejected" and fundsRejected and not receiptId then
+                State.PlacementWait={Handle=action.Handle,RequiredCost=estimatedCost,ServerMessage=fundsRejected.Text}
+                SetStatus("Playback", "Place "..tostring(action.Unit).." | waiting for server funds "..GetMoneyText().."/"..tostring(estimatedCost))
+                local deniedCash = GetMoney()
+                WaitUntil(function()
+                    return not PlaybackAlive(session) or IsGameEnded()
+                        or (GetMoney() >= estimatedCost and GetMoney() ~= deniedCash)
+                end, math.max(0.03,deadline-os.clock()),0.03)
+            else
             -- A FireServer return is not an acceptance receipt. A late reply
             -- must not result in a second paid placement at the same spot.
             return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
+            end
         end
 
         task.wait(0.03)
     end
 
-    return false, "Place timed out"
+    if not PlaybackAlive(session) or IsGameEnded() then return false,"Playback cancelled" end
+    return false, "Place timed out waiting for server funds/acceptance"
 end
 
 local function ResolveHandle(handle)
@@ -1358,11 +1419,42 @@ local function PlayUpgrade(action, session)
     local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
     local requiredCost = math.max(0, tonumber(action.EstimatedCost) or 0)
     local deadline = os.clock() + 180
-    local pending, nextStatus = nil, 0
+    local runtimeId, unit = tostring(tower.Name), tostring(tower:GetAttribute("ID"))
+    local connections, observedLevel, eventLevel = {}, tonumber(tower:GetAttribute("Upgrade")) or 0, nil
+    local function disconnect()
+        for _,connection in ipairs(connections) do connection:Disconnect() end
+        connections={}
+    end
+    local function watch()
+        disconnect()
+        for _,attribute in ipairs({"Upgrade","SellPrice"}) do
+            local ok,connection=pcall(function()
+                return tower:GetAttributeChangedSignal(attribute):Connect(function()
+                    local level=tonumber(tower:GetAttribute("Upgrade")) or 0
+                    observedLevel=math.max(observedLevel,level)
+                    if attribute=="Upgrade" then eventLevel=level end
+                end)
+            end)
+            if ok and connection then table.insert(connections,connection) end
+        end
+    end
+    local function finish(ok,reason)
+        disconnect()
+        if ok then State.UpgradeWait=nil end
+        return ok,reason
+    end
+    watch()
+    local pending, nextStatus, attempts, debugSaved, firstRequestAt = nil, 0, 0, false, nil
     while PlaybackAlive(session) and not IsGameEnded() and os.clock() < deadline do
-        if tower.Parent ~= TowerDataFolder then return false, "Tower disappeared during upgrade" end
-        local level = tonumber(tower:GetAttribute("Upgrade")) or 0
-        if level >= targetLevel then State.UpgradeWait=nil;return true end
+        local live = TowerDataFolder:FindFirstChild(runtimeId)
+        if live and live ~= tower and IsOwnTower(live) and tostring(live:GetAttribute("ID")) == unit then
+            tower=live;State.RuntimeHandles[action.Handle]=live;State.UsedRuntimeTowers[live]=true;watch()
+        end
+        if tower.Parent ~= TowerDataFolder then return finish(false,"Tower disappeared during upgrade") end
+        local rawLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
+        observedLevel=math.max(observedLevel,rawLevel)
+        local level = observedLevel
+        if level >= targetLevel then return finish(true) end
         local cash = GetMoney()
         local price = tonumber(tower:GetAttribute("SellPrice")) or 0
         if pending and level > pending.level then
@@ -1371,31 +1463,44 @@ local function PlayUpgrade(action, session)
             pending, requiredCost = nil, 0
         end
         if pending then
-            pending.spent = pending.spent or cash < pending.cash or price > pending.price
-            -- UpgradeTower has no rejection return. A request sent before the
-            -- server sees the latest cash can be silently ignored. Retry at a
-            -- bounded rate only with unchanged level and no observed spending.
-            -- Once spending is seen, wait for replication instead of resending.
-            if not pending.spent and pending.cash ~= math.huge and os.clock()-pending.at >= 2 and cash >= requiredCost then
+            -- Cash may arrive late from the PREVIOUS placement or another
+            -- unit. Only this tower's sell-price change is strong evidence
+            -- that its upgrade was accepted; cash alone must never latch retry.
+            pending.spent = pending.spent or price > pending.price
+            if cash < pending.lastCash then pending.cashDropAt=os.clock() end
+            pending.lastCash = cash
+            local cashSettled = not pending.cashDropAt or os.clock()-pending.cashDropAt >= 1
+            if not pending.spent and pending.cash ~= math.huge and cashSettled
+                and os.clock()-pending.at >= 2 and cash >= requiredCost then
                 pending = nil
             end
         end
         if not pending and cash >= requiredCost then
-            pending={level=level,cash=cash,price=price,at=os.clock(),spent=false}
+            pending={level=level,cash=cash,lastCash=cash,price=price,at=os.clock(),spent=false}
+            attempts=attempts+1
+            firstRequestAt=firstRequestAt or os.clock()
             local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
-            if not sent then return false, "Upgrade transport failed: " .. tostring(why) end
+            if not sent then return finish(false,"Upgrade transport failed: " .. tostring(why)) end
         end
         State.UpgradeWait={Handle=action.Handle,Level=level,TargetLevel=targetLevel,
-            Cash=cash,RequiredCost=requiredCost,Pending=pending~=nil,Spent=pending and pending.spent or false}
+            RuntimeId=tostring(tower.Name),RawLevel=rawLevel,EventLevel=eventLevel,Cash=cash,RequiredCost=requiredCost,Attempts=attempts,
+            Pending=pending~=nil,Spent=pending and pending.spent or false,
+            PendingAge=pending and os.clock()-pending.at or 0,CashDropAt=pending and pending.cashDropAt or nil}
+        if pending and not debugSaved and firstRequestAt and os.clock()-firstRequestAt >= 4 and type(Hub.ExportDebug)=="function" then
+            debugSaved=true
+            pcall(Hub.ExportDebug,"Upgrade pending >4s: "..tostring(action.Handle).." / server ID "..runtimeId)
+        end
         if os.clock() >= nextStatus then
             nextStatus=os.clock()+0.5
-            SetStatus("Playback", pending and ("Upgrade "..tostring(action.Handle).." | waiting for level confirmation")
-                or string.format("Upgrade %s | waiting for money: %s / %s",tostring(action.Handle),GetMoneyText(),tostring(requiredCost)))
+            local detail = cash < requiredCost and ("money "..GetMoneyText().."/"..tostring(requiredCost))
+                or ("level confirmation | sent "..tostring(attempts))
+            SetStatus("Playback", string.format("Upgrade %s [ID %s] | Lv %d/%d | %s",
+                tostring(action.Handle),tostring(tower.Name),level,targetLevel,detail))
         end
         task.wait(0.03)
     end
-    if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
-    return false, "Upgrade timed out after 180s without confirmed target level"
+    if not PlaybackAlive(session) or IsGameEnded() then return finish(false,"Playback cancelled") end
+    return finish(false,"Upgrade timed out after 180s without confirmed target level")
 end
 
 local function IsAutomaticRecordedTarget(index, action)
@@ -1648,10 +1753,12 @@ local function PlayBoostLink(action, session)
 end
 
 function Hub.ExportDebug(reason)
-    local snapshot = {Version=1,PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
+    local snapshot = {Version=1,Build="skibidi-demo-server-money-20261031",LeaderMoney=State.LastLeaderMoney,
+        ServerMoney=State.ServerMoney,ServerMoneyAge=State.ServerMoneyAt and os.clock()-State.ServerMoneyAt or nil,
+        PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
         Mode=State.PlaybackMode,Wave=GetWave(),Money=GetMoneyText(),ActionIndex=State.PlaybackIndex,
         Action=State.Actions[State.PlaybackIndex or 0],Reason=reason or State.LastPlaybackFailure,Towers={},
-        UpgradeWait=State.UpgradeWait,RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
+        UpgradeWait=State.UpgradeWait,PlacementWait=State.PlacementWait,MoneySource=State.ServerMoney~=nil and "statUpdate" or "leaderstats",RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
         Knock=Hub.Knock and {Message=Hub.Knock.Message,LastAttempt=Hub.Knock.LastAttempt,LastRound=Hub.Knock.LastRound,WebhookResult=Hub.Knock.LastWebhookResult} or nil}
     if TowerDataFolder then for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower) and #snapshot.Towers < 100 then
@@ -1701,7 +1808,7 @@ local function StartPlayback()
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.PlaybackIndex = 0
-    State.UpgradeWait = nil
+    State.UpgradeWait, State.PlacementWait = nil, nil
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.AbilityLastUsed = {}
     State.AbilityAttempts = {}
@@ -4511,6 +4618,27 @@ local Scripted
 local TowerDataFolder
 local TowersFolder
 
+local function BindServerMoney(remote)
+    if State.MoneySyncRemote == remote and State.MoneySyncConnection then return end
+    if State.MoneySyncConnection then State.MoneySyncConnection:Disconnect() end
+    State.MoneySyncRemote, State.MoneySyncConnection = remote, nil
+    State.ServerMoney, State.ServerMoneyAt = nil, nil
+    if not remote then return end
+    local ok, connection = pcall(function()
+        return remote.OnClientEvent:Connect(function(key,value)
+            if State.Running and State.MoneySyncRemote == remote and key == "Money" and tonumber(value) then
+                State.ServerMoney = tonumber(value)
+                State.ServerMoneyAt = os.clock()
+                State.ServerMoneyVersion = (State.ServerMoneyVersion or 0)+1
+            end
+        end)
+    end)
+    if ok and connection then
+        State.MoneySyncConnection = connection
+        table.insert(State.Connections,connection)
+    end
+end
+
 local function RefreshGameObjects()
     local eventFolder = ReplicatedStorage:FindFirstChild("Event")
     local gameFolder = ReplicatedStorage:FindFirstChild("Game")
@@ -4522,6 +4650,9 @@ local function RefreshGameObjects()
     Remotes.Upgrade = eventFolder and eventFolder:FindFirstChild("UpgradeTower")
     Remotes.Sell = eventFolder and eventFolder:FindFirstChild("RemoveTower")
     Remotes.Target = eventFolder and eventFolder:FindFirstChild("ChangeTowerTargetMode")
+    local notificationFolder = ReplicatedStorage:FindFirstChild("Notification")
+    Remotes.Notice = notificationFolder and notificationFolder:FindFirstChild("server")
+    BindServerMoney(eventFolder and eventFolder:FindFirstChild("statUpdate"))
     Remotes.BoostSelect = ReplicatedStorage:FindFirstChild("BoostSelect")
     local towerScript = ReplicatedStorage:FindFirstChild("TowerScript")
     Remotes.Ability = towerScript and towerScript:FindFirstChild("spawnTowerAbility")
@@ -4642,7 +4773,10 @@ end
 local function GetMoney()
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
     local money = leaderstats and leaderstats:FindFirstChild("Money")
-    local value = money and tonumber(money.Value) or 0
+    -- leaderstats lags and rounds (probe: 562 vs server 61.5). Use the
+    -- game's direct Money statUpdate as soon as its first value arrives.
+    State.LastLeaderMoney = money and tonumber(money.Value) or 0
+    local value = State.ServerMoney ~= nil and tonumber(State.ServerMoney) or State.LastLeaderMoney
     -- Brutal probe 1792742021: sandbox money exposes INT64_MIN in the replicated value
     -- to INT64_MIN while normal placement/upgrades continue to succeed.
     -- Match only that sentinel (Luau doubles round it), never arbitrary debt.
@@ -4656,6 +4790,7 @@ end
 local function GetMoneyText()
     local value = GetMoney()
     if value == math.huge then return "Infinite" end
+    if value % 1 ~= 0 then return (string.format("%.2f",value):gsub("0+$",""):gsub("%.$","")) end
     return string.format("%.0f", value)
 end
 
@@ -5659,7 +5794,7 @@ local function PlayPlace(action, session)
             -- Subscribe before sending: acceptance can arrive before TowerData
             -- replicates. Scope receipts to this one request; never reuse a
             -- previous round's ID or adopt an already existing neighbour.
-            local receiptId, receiptConflict, receiptConnection
+            local receiptId, receiptConflict, receiptConnection, noticeConnection, fundsRejected
             local knownIds = {}
             for tower in pairs(known) do knownIds[tostring(tower.Name)] = true end
             local listening, connection = pcall(function()
@@ -5677,6 +5812,22 @@ local function PlayPlace(action, session)
                 end)
             end)
             if listening then receiptConnection = connection end
+            local noticeOK, notice = pcall(function()
+                return Remotes.Notice.OnClientEvent:Connect(function(data)
+                    local text = type(data)=="table" and tostring(data.Text or "") or tostring(data)
+                    local lower = text:lower()
+                    if lower:find("place",1,true) and (lower:find("cash",1,true) or lower:find("money",1,true))
+                        and (lower:find("need",1,true) or lower:find("enough",1,true) or lower:find("insufficient",1,true)) then
+                        fundsRejected={Text=text,At=os.clock(),Cash=GetMoney()}
+                        -- Observed message reports the shortfall, not full price.
+                        if lower:find("need more cash to place",1,true) then
+                            local missing = tonumber((text:gsub(",",""):match("%$([%d%.]+)")))
+                            if missing then estimatedCost=math.max(estimatedCost,math.ceil(GetMoney()+missing)) end
+                        end
+                    end
+                end)
+            end)
+            if noticeOK then noticeConnection=notice end
             local sent, why = pcall(Remotes.Place.FireServer, Remotes.Place, action.Unit, placement, false)
             local ambiguity
             local success, tower = WaitUntil(function()
@@ -5698,24 +5849,41 @@ local function PlayPlace(action, session)
                 end
                 local found, reason = FindMatchingRuntimeTower(action, known)
                 ambiguity = reason
-                return found
+                if found then return found end
+                if fundsRejected and not receiptId and not ambiguity and os.clock()-fundsRejected.At >= 0.15 then
+                    return "funds_rejected"
+                end
+                return nil
             end, 12, 0.03)
             if receiptConnection then receiptConnection:Disconnect() end
+            if noticeConnection then noticeConnection:Disconnect() end
             if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
             if success and typeof(tower) == "Instance" then
                 State.RuntimeHandles[action.Handle] = tower
                 State.UsedRuntimeTowers[tower] = true
+                State.PlacementWait = nil
                 return true
             end
+            if tower == "funds_rejected" and fundsRejected and not receiptId then
+                State.PlacementWait={Handle=action.Handle,RequiredCost=estimatedCost,ServerMessage=fundsRejected.Text}
+                SetStatus("Playback", "Place "..tostring(action.Unit).." | waiting for server funds "..GetMoneyText().."/"..tostring(estimatedCost))
+                local deniedCash = GetMoney()
+                WaitUntil(function()
+                    return not PlaybackAlive(session) or IsGameEnded()
+                        or (GetMoney() >= estimatedCost and GetMoney() ~= deniedCash)
+                end, math.max(0.03,deadline-os.clock()),0.03)
+            else
             -- A FireServer return is not an acceptance receipt. A late reply
             -- must not result in a second paid placement at the same spot.
             return false, ambiguity or (sent and "Placement unconfirmed after 12s; no duplicate retry" or ("Place transport failed: " .. tostring(why)))
+            end
         end
 
         task.wait(0.03)
     end
 
-    return false, "Place timed out"
+    if not PlaybackAlive(session) or IsGameEnded() then return false,"Playback cancelled" end
+    return false, "Place timed out waiting for server funds/acceptance"
 end
 
 local function ResolveHandle(handle)
@@ -5732,11 +5900,42 @@ local function PlayUpgrade(action, session)
     local targetLevel = tonumber(action.ToLevel) or ((tonumber(action.FromLevel) or 0) + 1)
     local requiredCost = math.max(0, tonumber(action.EstimatedCost) or 0)
     local deadline = os.clock() + 180
-    local pending, nextStatus = nil, 0
+    local runtimeId, unit = tostring(tower.Name), tostring(tower:GetAttribute("ID"))
+    local connections, observedLevel, eventLevel = {}, tonumber(tower:GetAttribute("Upgrade")) or 0, nil
+    local function disconnect()
+        for _,connection in ipairs(connections) do connection:Disconnect() end
+        connections={}
+    end
+    local function watch()
+        disconnect()
+        for _,attribute in ipairs({"Upgrade","SellPrice"}) do
+            local ok,connection=pcall(function()
+                return tower:GetAttributeChangedSignal(attribute):Connect(function()
+                    local level=tonumber(tower:GetAttribute("Upgrade")) or 0
+                    observedLevel=math.max(observedLevel,level)
+                    if attribute=="Upgrade" then eventLevel=level end
+                end)
+            end)
+            if ok and connection then table.insert(connections,connection) end
+        end
+    end
+    local function finish(ok,reason)
+        disconnect()
+        if ok then State.UpgradeWait=nil end
+        return ok,reason
+    end
+    watch()
+    local pending, nextStatus, attempts, debugSaved, firstRequestAt = nil, 0, 0, false, nil
     while PlaybackAlive(session) and not IsGameEnded() and os.clock() < deadline do
-        if tower.Parent ~= TowerDataFolder then return false, "Tower disappeared during upgrade" end
-        local level = tonumber(tower:GetAttribute("Upgrade")) or 0
-        if level >= targetLevel then State.UpgradeWait=nil;return true end
+        local live = TowerDataFolder:FindFirstChild(runtimeId)
+        if live and live ~= tower and IsOwnTower(live) and tostring(live:GetAttribute("ID")) == unit then
+            tower=live;State.RuntimeHandles[action.Handle]=live;State.UsedRuntimeTowers[live]=true;watch()
+        end
+        if tower.Parent ~= TowerDataFolder then return finish(false,"Tower disappeared during upgrade") end
+        local rawLevel = tonumber(tower:GetAttribute("Upgrade")) or 0
+        observedLevel=math.max(observedLevel,rawLevel)
+        local level = observedLevel
+        if level >= targetLevel then return finish(true) end
         local cash = GetMoney()
         local price = tonumber(tower:GetAttribute("SellPrice")) or 0
         if pending and level > pending.level then
@@ -5745,31 +5944,44 @@ local function PlayUpgrade(action, session)
             pending, requiredCost = nil, 0
         end
         if pending then
-            pending.spent = pending.spent or cash < pending.cash or price > pending.price
-            -- UpgradeTower has no rejection return. A request sent before the
-            -- server sees the latest cash can be silently ignored. Retry at a
-            -- bounded rate only with unchanged level and no observed spending.
-            -- Once spending is seen, wait for replication instead of resending.
-            if not pending.spent and pending.cash ~= math.huge and os.clock()-pending.at >= 2 and cash >= requiredCost then
+            -- Cash may arrive late from the PREVIOUS placement or another
+            -- unit. Only this tower's sell-price change is strong evidence
+            -- that its upgrade was accepted; cash alone must never latch retry.
+            pending.spent = pending.spent or price > pending.price
+            if cash < pending.lastCash then pending.cashDropAt=os.clock() end
+            pending.lastCash = cash
+            local cashSettled = not pending.cashDropAt or os.clock()-pending.cashDropAt >= 1
+            if not pending.spent and pending.cash ~= math.huge and cashSettled
+                and os.clock()-pending.at >= 2 and cash >= requiredCost then
                 pending = nil
             end
         end
         if not pending and cash >= requiredCost then
-            pending={level=level,cash=cash,price=price,at=os.clock(),spent=false}
+            pending={level=level,cash=cash,lastCash=cash,price=price,at=os.clock(),spent=false}
+            attempts=attempts+1
+            firstRequestAt=firstRequestAt or os.clock()
             local sent, why = pcall(Remotes.Upgrade.FireServer, Remotes.Upgrade, tostring(tower.Name))
-            if not sent then return false, "Upgrade transport failed: " .. tostring(why) end
+            if not sent then return finish(false,"Upgrade transport failed: " .. tostring(why)) end
         end
         State.UpgradeWait={Handle=action.Handle,Level=level,TargetLevel=targetLevel,
-            Cash=cash,RequiredCost=requiredCost,Pending=pending~=nil,Spent=pending and pending.spent or false}
+            RuntimeId=tostring(tower.Name),RawLevel=rawLevel,EventLevel=eventLevel,Cash=cash,RequiredCost=requiredCost,Attempts=attempts,
+            Pending=pending~=nil,Spent=pending and pending.spent or false,
+            PendingAge=pending and os.clock()-pending.at or 0,CashDropAt=pending and pending.cashDropAt or nil}
+        if pending and not debugSaved and firstRequestAt and os.clock()-firstRequestAt >= 4 and type(Hub.ExportDebug)=="function" then
+            debugSaved=true
+            pcall(Hub.ExportDebug,"Upgrade pending >4s: "..tostring(action.Handle).." / server ID "..runtimeId)
+        end
         if os.clock() >= nextStatus then
             nextStatus=os.clock()+0.5
-            SetStatus("Playback", pending and ("Upgrade "..tostring(action.Handle).." | waiting for level confirmation")
-                or string.format("Upgrade %s | waiting for money: %s / %s",tostring(action.Handle),GetMoneyText(),tostring(requiredCost)))
+            local detail = cash < requiredCost and ("money "..GetMoneyText().."/"..tostring(requiredCost))
+                or ("level confirmation | sent "..tostring(attempts))
+            SetStatus("Playback", string.format("Upgrade %s [ID %s] | Lv %d/%d | %s",
+                tostring(action.Handle),tostring(tower.Name),level,targetLevel,detail))
         end
         task.wait(0.03)
     end
-    if not PlaybackAlive(session) or IsGameEnded() then return false, "Playback cancelled" end
-    return false, "Upgrade timed out after 180s without confirmed target level"
+    if not PlaybackAlive(session) or IsGameEnded() then return finish(false,"Playback cancelled") end
+    return finish(false,"Upgrade timed out after 180s without confirmed target level")
 end
 
 local function IsAutomaticRecordedTarget(index, action)
@@ -6022,10 +6234,12 @@ local function PlayBoostLink(action, session)
 end
 
 function Hub.ExportDebug(reason)
-    local snapshot = {Version=1,PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
+    local snapshot = {Version=1,Build="skibidi-demo-server-money-20261031",LeaderMoney=State.LastLeaderMoney,
+        ServerMoney=State.ServerMoney,ServerMoneyAge=State.ServerMoneyAt and os.clock()-State.ServerMoneyAt or nil,
+        PlaceId=game.PlaceId,Profile=State.ProfileName,ProfileVersion=State.ProfileVersion,
         Mode=State.PlaybackMode,Wave=GetWave(),Money=GetMoneyText(),ActionIndex=State.PlaybackIndex,
         Action=State.Actions[State.PlaybackIndex or 0],Reason=reason or State.LastPlaybackFailure,Towers={},
-        UpgradeWait=State.UpgradeWait,RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
+        UpgradeWait=State.UpgradeWait,PlacementWait=State.PlacementWait,MoneySource=State.ServerMoney~=nil and "statUpdate" or "leaderstats",RecorderTrace=State.RecorderTrace,RecorderTraceDropped=State.RecorderTraceDropped,AbilityWait=State.AbilityWait,AbilityAttempts=State.AbilityAttempts,
         Knock=Hub.Knock and {Message=Hub.Knock.Message,LastAttempt=Hub.Knock.LastAttempt,LastRound=Hub.Knock.LastRound,WebhookResult=Hub.Knock.LastWebhookResult} or nil}
     if TowerDataFolder then for _, tower in ipairs(TowerDataFolder:GetChildren()) do
         if IsOwnTower(tower) and #snapshot.Towers < 100 then
@@ -6075,7 +6289,7 @@ local function StartPlayback()
     State.PlaybackFirstActionDone = false
     State.RuntimeHandles = {}
     State.PlaybackIndex = 0
-    State.UpgradeWait = nil
+    State.UpgradeWait, State.PlacementWait = nil, nil
     State.UsedRuntimeTowers = setmetatable({}, { __mode = "k" })
     State.AbilityLastUsed = {}
     State.AbilityAttempts = {}
