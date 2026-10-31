@@ -11,7 +11,7 @@ local Releases = {
     [3913007563] = {Release = "The%20Battle%20Brick", Folder = "BattleBrick_Macros", RequiresCache = false},
     [6272727021] = {Release = "Undertale%20Adventure%20X", Folder = "UndertableAX_Macros", RequiresCache = true},
     [10703226578] = {Release = "Doodle%20Tower%20Defense", Folder = "DoodleTD_Macros", RequiresCache = true},
-    [9994099755] = {Release = "Grow%20A%20Unit%20TD", Folder = "GrowAUnitTD_Macros", RequiresCache = true},
+    [10773807716] = {Release = "Grow%20A%20Unit%20TD", Folder = "GrowAUnitTD_Macros", RequiresCache = true},
     [10768556372] = {Release = "Candy%20Kingdom%20Defense", Folder = "CandyKingdomTD_Macros", RequiresCache = true},
     [7703614594] = {Release = "Garden%20Tower%20Defense", Folder = "GardenTD_Macros", RequiresCache = true},
 }
