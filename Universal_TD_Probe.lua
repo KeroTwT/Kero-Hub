@@ -1,4 +1,4 @@
--- Universal TD Probe v2.6 (Perfect namecall fallback + independent transport observation)
+-- Universal TD Probe v2.7 (standard namecall opt-in; independent direct/OTH observation)
 -- Passive discovery in Normal/Brutal modes and loss-minimising transport/state
 -- correlation in Perfect mode. The probe never calls a game remote itself.
 -- Direct execution defaults to Brutal_Perfect; explicit Mode still overrides it.
@@ -66,9 +66,9 @@ local Config = {
     CaptureModuleInventory = userConfig.CaptureModuleInventory ~= false and isPerfect,
     CaptureInternalModules = userConfig.CaptureInternalModules == true,
     HookBackend = userConfig.HookBackend == "Standard" and "Standard" or userConfig.HookBackend == "OTH" and "OTH" or "Auto",
-    -- Native colon calls can bypass direct function hooks on some executors.
-    -- Perfect enables the standard fallback unless deliberately disabled.
-    AllowStandardNamecall = isPerfect and userConfig.AllowStandardNamecall ~= false,
+    -- Standard namecall interception triggered the observed Skibi detector.
+    -- Keep it explicit opt-in; direct hooks do not guarantee full coverage.
+    AllowStandardNamecall = userConfig.AllowStandardNamecall == true,
     Introspect = userConfig.Introspect == true,
 }
 local LocalPlayer = Players.LocalPlayer
@@ -109,7 +109,7 @@ local Probe = {
     LogicalSequence = 0,
     HookGeneration = tostring(os.clock()) .. ":" .. tostring(math.random()),
     Diagnostics = { attempts = 0, completed = 0, failed = 0, incoming = 0,
-        captureErrors = 0, byPath = {}, revision = "2.5" },
+        captureErrors = 0, byPath = {}, revision = "2.7" },
 }
 Environment.UniversalTDProbe = Probe
 
@@ -1341,7 +1341,7 @@ local function buildSummary(reason)
         droppedEvents = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
         writeErrors = Probe.WriteErrors,
-        coreRevision = "2.6",
+        coreRevision = "2.7",
         hook = Probe.Hook,
         diagnostics = Probe.Diagnostics,
         eventTypes = serialize(Probe.EventTypes),
@@ -1396,7 +1396,7 @@ function Probe.Status()
         mode = Config.Mode,
         hook = serialize(Probe.Hook),
         diagnostics = serialize(Probe.Diagnostics),
-        coreRevision = "2.6",
+        coreRevision = "2.7",
         events = Probe.EventCount,
         dropped = Probe.DroppedEvents,
         encodeErrors = Probe.EncodeErrors,
@@ -1467,7 +1467,7 @@ if type(identify) == "function" then
     if ok then executorInfo.name, executorInfo.version = tostring(name), version and tostring(version) end
 end
 emit("session_started", {
-    coreRevision = "2.6",
+    coreRevision = "2.7",
     executor = executorInfo,
     placeId = game.PlaceId,
     jobId = game.JobId,
@@ -1634,7 +1634,7 @@ task.delay(Config.Duration, function()
 end)
 
 flush()
-print("[Universal TD Probe 2.6] Running in", Config.Mode, "mode.")
+print("[Universal TD Probe 2.7] Running in", Config.Mode, "mode.")
 if Config.CaptureOutgoing then
     local paths = Probe.Hook.paths or {}
     print(
