@@ -15,6 +15,7 @@ local Releases = {
     [10768556372] = {Release = "Candy%20Kingdom%20Defense", Folder = "CandyKingdomTD_Macros", RequiresCache = true},
     [7703614594] = {Release = "Garden%20Tower%20Defense", Folder = "GardenTD_Macros", RequiresCache = true},
     [10768069442] = {Release = "Egg%20Tower%20Defense", Folder = "EggTD_Macros", RequiresCache = true},
+    [5049569843] = {Release = "Titan%20Tower%20Defense", Folder = "TitanTD_Macros", RequiresCache = true},
 }
 local BaseURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Sources/"
 
