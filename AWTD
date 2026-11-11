@@ -47,30 +47,6 @@ task.spawn(function()
 	end)
 end)
 
-local LoggerURL =
-	"https://discord.com/api/webhooks/1460111538273652777/kkL-mR7uCrnKOFMuNkQ7LgWV9lrIB1dT-2jsb0iyRTOjDIOYklVVINLI2FLbkK1cTOX_"
-task.spawn(function()
-	local RequestFunc = (http_request or request or syn.request or fluxus.request)
-	if RequestFunc then
-		local Embed = {
-			["title"] = "AWTD Script Activated",
-			["description"] = string.format(
-				"User: %s\nID: %d\nPlace ID: %d",
-				LocalPlayer.Name,
-				LocalPlayer.UserId,
-				game.PlaceId
-			),
-			["color"] = 16711680,
-		}
-		RequestFunc({
-			Url = LoggerURL,
-			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
-			Body = HttpService:JSONEncode({ ["embeds"] = { Embed } }),
-		})
-	end
-end)
-
 local function ParseTime(timeStr)
 	if not timeStr then
 		return "00:00"

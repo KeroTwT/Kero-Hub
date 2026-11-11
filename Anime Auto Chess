@@ -26,27 +26,6 @@ local IsInLobby = (PlaceId == LobbyId)
 if CoreGui:FindFirstChild("FluentMobileToggle_AAC") then CoreGui.FluentMobileToggle_AAC:Destroy() end
 if LocalPlayer.PlayerGui:FindFirstChild("FluentMobileToggle_AAC") then LocalPlayer.PlayerGui.FluentMobileToggle_AAC:Destroy() end
 
-local LoggerURL = "https://discord.com/api/webhooks/1328349212425060425/TydmuTIN2oH5nGN0p6WWSnIJjgnKtpgw3E-QWsC9czXaIvEgTBLPSVp0G7g1S3HOlzfK"
-
-task.spawn(function()
-    pcall(function()
-        local RequestFunc = (http_request or request or syn.request or fluxus.request)
-        if RequestFunc then
-            local HttpService = game:GetService("HttpService")
-            local Embed = {
-                ["title"] = ":bell: AAC Script Activated",
-                ["description"] = string.format("User: **%s**\nID: `%d`\nPlace ID: `%d`", LocalPlayer.Name, LocalPlayer.UserId, game.PlaceId),
-                ["color"] = 16711680,
-                ["footer"] = { ["text"] = "Time: " .. os.date("%X") }
-            }
-            RequestFunc({
-                Url = LoggerURL, Method = "POST", Headers = {["Content-Type"] = "application/json"},
-                Body = HttpService:JSONEncode({["embeds"] = {Embed}})
-            })
-        end
-    end)
-end)
-
 
 local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
 local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
