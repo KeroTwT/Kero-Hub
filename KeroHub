@@ -1,5 +1,6 @@
 -- Kero Hub | Universal Loader
 local Releases = {
+    [10772095908] = {Release = "8Bit%20Tower%20Defense", Folder = "EightBitTD_Macros", RequiresCache = true},
     [7526264212] = {Release = "Toilet%20Warfare%20Defense", Folder = "ToiletWarfareDefense_Macros", RequiresCache = true},
     [6069634717] = {Release = "Sorcerer%20Tower%20Defense", Folder = "SorcererTD_Macros", RequiresCache = true},
     [10771908014] = {Release = "Dragon%20Tower%20Defense", Folder = "DragonTD_Macros", RequiresCache = true},
