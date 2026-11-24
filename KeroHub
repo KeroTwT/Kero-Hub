@@ -35,7 +35,7 @@ local PlaceReleases = {
 }
 
 if not game:IsLoaded() then game.Loaded:Wait() end
-local release = Releases[game.GameId] or PlaceReleases[game.PlaceId]
+local release = PlaceReleases[game.PlaceId] or Releases[game.GameId]
 if not release then error("Kero Hub: unsupported game.", 0) end
 
 local env = getgenv()
