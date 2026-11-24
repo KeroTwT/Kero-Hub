@@ -29,8 +29,13 @@ local Releases = {
 }
 local BaseURL = "https://raw.githubusercontent.com/KeroTwT/Kero-Hub/refs/heads/main/Sources/"
 
+local PlaceReleases = {
+    [93712201161812] = {Release = "Legacy%20Toilet%20Tower%20Defense", Folder = "LegacyToiletTD_Macros", RequiresCache = true},
+    [131703399727686] = {Release = "Legacy%20Toilet%20Tower%20Defense", Folder = "LegacyToiletTD_Macros", RequiresCache = true},
+}
+
 if not game:IsLoaded() then game.Loaded:Wait() end
-local release = Releases[game.GameId]
+local release = Releases[game.GameId] or PlaceReleases[game.PlaceId]
 if not release then error("Kero Hub: unsupported game.", 0) end
 
 local env = getgenv()
