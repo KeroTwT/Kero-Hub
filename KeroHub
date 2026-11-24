@@ -1,5 +1,6 @@
 -- Kero Hub | Universal Loader
 local Releases = {
+    [4778845442] = {Release = "Toilet%20Tower%20Defense", Folder = "ToiletTD_Macros", RequiresCache = true},
     [7660436108] = {Release = "Anime%20Crusaders%20X", Folder = "AnimeCrusadersX_MacLib_Local", RequiresCache = true},
     [10772478335] = {Release = "Skibidi%20Astro%20TD", Folder = "ToiletAstroTD_Macros", RequiresCache = true},
     [10772095908] = {Release = "8Bit%20Tower%20Defense", Folder = "EightBitTD_Macros", RequiresCache = true},
