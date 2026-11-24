@@ -45,7 +45,7 @@ if env.__KeroLoaderBusy[url] then return end
 env.__KeroLoaderBusy[url] = true
 
 local ok, reason = pcall(function()
-    local source = game:HttpGet(url)
+    local source = game:HttpGet(url, true)
     local run, compileError = loadstring(source, "KeroHubRelease")
     if not run then error(compileError, 0) end
 
